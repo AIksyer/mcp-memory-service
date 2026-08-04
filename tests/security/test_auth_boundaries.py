@@ -15,124 +15,16 @@ Verifies that:
 - The MCP tools/call endpoint enforces per-tool scope checks
 """
 
-import os
-import tempfile
 import uuid
 
 import pytest
-import pytest_asyncio
-from fastapi import HTTPException, status
 from fastapi.testclient import TestClient
 
-from mcp_memory_service.storage.sqlite_vec import SqliteVecMemoryStorage
 from mcp_memory_service.web.dependencies import set_storage
 
-
-@pytest.fixture
-def temp_db():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        yield os.path.join(tmpdir, "test_auth.db")
-
-
-@pytest_asyncio.fixture
-async def initialized_storage(temp_db, monkeypatch):
-    monkeypatch.setenv("MCP_SEMANTIC_DEDUP_ENABLED", "false")
-    storage = SqliteVecMemoryStorage(temp_db)
-    await storage.initialize()
-    yield storage
-    await storage.close()
-
-
-def _make_client(initialized_storage, monkeypatch, *, scope: str | None,
-                 allow_anonymous: bool = False) -> TestClient:
-    """Create a TestClient with specific auth configuration.
-
-    Args:
-        scope: OAuth scope string ("read", "read write", None for unauthenticated)
-        allow_anonymous: If True, sets MCP_ALLOW_ANONYMOUS_ACCESS=true
-
-    Note: We only override ``get_current_user`` and ``require_read_access``.
-    ``require_write_access`` is left to the real implementation so it can
-    enforce per-scope checks against the mocked user.
-    """
-    from mcp_memory_service.web.oauth import middleware
-    monkeypatch.setattr(middleware, "API_KEY", None)
-    monkeypatch.setattr(middleware, "OAUTH_ENABLED", False)
-    monkeypatch.setattr(middleware, "ALLOW_ANONYMOUS_ACCESS", allow_anonymous)
-
-    from mcp_memory_service.web.app import app
-    from mcp_memory_service.web.oauth.middleware import (
-        AuthenticationResult,
-        get_current_user,
-        require_read_access,
-    )
-
-    set_storage(initialized_storage)
-
-    if scope is not None:
-        async def mock_user():
-            return AuthenticationResult(
-                authenticated=True, client_id="test-client",
-                scope=scope, auth_method="test",
-            )
-
-        app.dependency_overrides[get_current_user] = mock_user
-        app.dependency_overrides[require_read_access] = mock_user
-    else:
-        async def reject():
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Authentication required",
-            )
-
-        app.dependency_overrides[get_current_user] = reject
-        app.dependency_overrides[require_read_access] = reject
-
-    return TestClient(app)
-
-
-@pytest.fixture
-def read_only_client(initialized_storage, monkeypatch):
-    client = _make_client(initialized_storage, monkeypatch, scope="read")
-    yield client
-    from mcp_memory_service.web.app import app
-    app.dependency_overrides.clear()
-
-
-@pytest.fixture
-def read_write_client(initialized_storage, monkeypatch):
-    client = _make_client(initialized_storage, monkeypatch, scope="read write")
-    yield client
-    from mcp_memory_service.web.app import app
-    app.dependency_overrides.clear()
-
-
-@pytest.fixture
-def unauthenticated_client(initialized_storage, monkeypatch):
-    client = _make_client(initialized_storage, monkeypatch, scope=None)
-    yield client
-    from mcp_memory_service.web.app import app
-    app.dependency_overrides.clear()
-
-
-@pytest.fixture
-def anonymous_client(initialized_storage, monkeypatch):
-    """Client with anonymous access enabled — no auth overrides, real middleware."""
-    from mcp_memory_service.web.oauth import middleware
-    monkeypatch.setattr(middleware, "API_KEY", None)
-    monkeypatch.setattr(middleware, "OAUTH_ENABLED", False)
-    monkeypatch.setattr(middleware, "ALLOW_ANONYMOUS_ACCESS", True)
-
-    from mcp_memory_service.web.app import app
-
-    set_storage(initialized_storage)
-
-    # Clear any overrides from previous tests so the real middleware runs
-    app.dependency_overrides.clear()
-
-    client = TestClient(app)
-    yield client
-    app.dependency_overrides.clear()
+# Fixtures (temp_db, initialized_storage, authed_client, read_only_client,
+# read_write_client, unauthenticated_client, anonymous_client, _make_client)
+# are provided by tests/security/conftest.py
 
 
 @pytest.mark.integration

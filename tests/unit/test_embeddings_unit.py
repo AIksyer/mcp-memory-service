@@ -240,28 +240,28 @@ class TestEmbeddingsMixinGenerate:
         mixin.embedding_model = MagicMock()
         mixin.embedding_model.encode.return_value = np.array([[0.1, 0.2]])  # Only 2 dims
         mixin.embedding_dimension = 384
-        with pytest.raises((ValueError, RuntimeError)):
+        with pytest.raises(RuntimeError):
             mixin._generate_embedding("test")
 
     def test_generate_embedding_nan_raises(self, tmp_path):
         mixin = self._create_mixin(tmp_path)
         mixin.embedding_model = MagicMock()
         mixin.embedding_model.encode.return_value = np.array([[float("nan")] * 384])
-        with pytest.raises((ValueError, RuntimeError)):
+        with pytest.raises(RuntimeError):
             mixin._generate_embedding("test")
 
     def test_generate_embedding_inf_raises(self, tmp_path):
         mixin = self._create_mixin(tmp_path)
         mixin.embedding_model = MagicMock()
         mixin.embedding_model.encode.return_value = np.array([[float("inf")] * 384])
-        with pytest.raises((ValueError, RuntimeError)):
+        with pytest.raises(RuntimeError):
             mixin._generate_embedding("test")
 
     def test_generate_embedding_empty_raises(self, tmp_path):
         mixin = self._create_mixin(tmp_path)
         mixin.embedding_model = MagicMock()
         mixin.embedding_model.encode.return_value = np.array([[]])
-        with pytest.raises((ValueError, RuntimeError)):
+        with pytest.raises(RuntimeError):
             mixin._generate_embedding("test")
 
 

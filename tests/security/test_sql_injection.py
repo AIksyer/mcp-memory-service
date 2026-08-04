@@ -13,64 +13,12 @@ metadata, tags, search queries, graph parameters) do not corrupt the
 database or leak unintended data.
 """
 
-import os
-import tempfile
 import uuid
 
 import pytest
-import pytest_asyncio
-from fastapi.testclient import TestClient
 
-from mcp_memory_service.storage.sqlite_vec import SqliteVecMemoryStorage
-from mcp_memory_service.web.dependencies import set_storage
-
-
-@pytest.fixture
-def temp_db():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        yield os.path.join(tmpdir, "test_sqli.db")
-
-
-@pytest_asyncio.fixture
-async def initialized_storage(temp_db, monkeypatch):
-    monkeypatch.setenv("MCP_SEMANTIC_DEDUP_ENABLED", "false")
-    storage = SqliteVecMemoryStorage(temp_db)
-    await storage.initialize()
-    yield storage
-    await storage.close()
-
-
-@pytest.fixture
-def authed_client(initialized_storage, monkeypatch):
-    """TestClient with write access and real storage backend."""
-    monkeypatch.setenv("MCP_API_KEY", "")
-    monkeypatch.setenv("MCP_OAUTH_ENABLED", "false")
-    monkeypatch.setenv("MCP_ALLOW_ANONYMOUS_ACCESS", "true")
-
-    from mcp_memory_service.web.app import app
-    from mcp_memory_service.web.oauth.middleware import (
-        AuthenticationResult,
-        get_current_user,
-        require_read_access,
-        require_write_access,
-    )
-
-    set_storage(initialized_storage)
-
-    async def _user():
-        return AuthenticationResult(
-            authenticated=True, client_id="test", scope="read write admin",
-            auth_method="test",
-        )
-
-    app.dependency_overrides[get_current_user] = _user
-    app.dependency_overrides[require_read_access] = _user
-    app.dependency_overrides[require_write_access] = _user
-
-    client = TestClient(app)
-    yield client
-    app.dependency_overrides.clear()
-
+# Fixtures (temp_db, initialized_storage, authed_client) are provided by
+# tests/security/conftest.py
 
 # --- SQL injection payloads ---
 SQLI_PAYLOADS = [
@@ -172,6 +120,48 @@ class TestSQLInjectionInSearch:
             json={"tags": [sqli_tag], "match_all": False},
         )
         assert response.status_code == 200, response.text
+
+
+@pytest.mark.integration
+class TestSQLInjectionInDelete:
+    """DELETE /memories/{content_hash} must sanitize hash parameter."""
+
+    @pytest.mark.parametrize("payload", SQLI_PAYLOADS)
+    def test_delete_sqli_in_hash(self, authed_client, payload):
+        """SQL injection in content_hash path parameter must not corrupt the database."""
+        response = authed_client.delete(f"/api/memories/{payload}")
+        # Should return 200 with success=False (hash not found) or 404 — never 500
+        assert response.status_code in (200, 404), response.text
+        if response.status_code == 200:
+            data = response.json()
+            assert data.get("success") is False
+
+    def test_delete_does_not_drop_table(self, authed_client):
+        """A DROP TABLE injection in hash must not actually drop any table."""
+        # Store a memory first
+        store_resp = authed_client.post(
+            "/api/memories",
+            json={"content": "Memory before delete injection", "tags": ["__test__"]},
+        )
+        assert store_resp.status_code in (200, 201)
+
+        # Attempt DROP TABLE via hash parameter
+        authed_client.delete("/api/memories/'; DROP TABLE memories; --")
+
+        # Verify table still exists — store another memory
+        uid = uuid.uuid4().hex[:8]
+        post_inject = authed_client.post(
+            "/api/memories",
+            json={"content": f"Memory after delete injection {uid}", "tags": ["__test__"]},
+        )
+        assert post_inject.status_code in (200, 201), post_inject.text
+
+        # Search should still work (table not dropped)
+        search = authed_client.post(
+            "/api/search",
+            json={"query": f"Memory after delete injection {uid}", "n_results": 5},
+        )
+        assert search.status_code == 200
 
 
 @pytest.mark.integration

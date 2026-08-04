@@ -97,18 +97,21 @@ class TestHealthEndpoints:
         response = authed_client.get("/api/health/sync-status")
         # sync-status may return 200 or 404 depending on backend (sqlite_vec has no sync)
         assert response.status_code in (200, 404)
+        if response.status_code == 200:
+            data = response.json()
+            assert "status" in data or "syncing" in data or "enabled" in data
 
     def test_memory_stats(self, authed_client):
         response = authed_client.get("/api/memory-stats")
         assert response.status_code == 200
         data = response.json()
-        assert "process_memory" in data or "rss_mb" in data or isinstance(data, dict)
+        assert "process_memory_mb" in data or "rss_mb" in data
 
     def test_clear_caches(self, authed_client):
         response = authed_client.post("/api/clear-caches")
         assert response.status_code == 200
         data = response.json()
-        assert "status" in data or "cleared" in data or isinstance(data, dict)
+        assert "success" in data
 
 
 # --- Configuration endpoint coverage ---
@@ -121,20 +124,28 @@ class TestConfigurationEndpoints:
         response = authed_client.get("/api/config/env")
         assert response.status_code == 200
         data = response.json()
-        assert isinstance(data, dict)
+        assert "categories" in data
+        assert isinstance(data["categories"], list)
 
     def test_get_credentials(self, authed_client):
         response = authed_client.get("/api/config/credentials")
         # May return 200 or 404 if no credentials configured
         assert response.status_code in (200, 404)
+        if response.status_code == 200:
+            data = response.json()
+            assert "api_token_partial" in data or "account_id" in data
 
     def test_test_credentials_no_data(self, authed_client):
-        """Testing credentials without providing them should fail gracefully."""
+        """Testing credentials without providing them should return a result."""
         response = authed_client.post(
             "/api/config/credentials/test",
             json={"api_token": "", "account_id": ""},
         )
-        assert response.status_code in (400, 422, 200)
+        # Endpoint returns 200 with valid=False (graceful failure)
+        assert response.status_code == 200
+        data = response.json()
+        assert "valid" in data
+        assert data["valid"] is False
 
 
 # --- Sync endpoint coverage ---
@@ -147,19 +158,33 @@ class TestSyncEndpoints:
         response = authed_client.get("/api/sync/status")
         # sqlite_vec backend has no sync — may return 200 with disabled or 404
         assert response.status_code in (200, 404)
+        if response.status_code == 200:
+            data = response.json()
+            assert "enabled" in data or "syncing" in data or "status" in data
 
     def test_force_sync(self, authed_client):
         response = authed_client.post("/api/sync/force")
-        # May fail for sqlite_vec (no cloud sync)
-        assert response.status_code in (200, 400, 404, 500)
+        # sqlite_vec has no force_sync → 404; 500 would indicate a bug
+        assert response.status_code in (200, 404)
+        if response.status_code == 200:
+            data = response.json()
+            assert "success" in data or "status" in data
 
     def test_pause_sync(self, authed_client):
         response = authed_client.post("/api/sync/pause")
-        assert response.status_code in (200, 400, 404)
+        # sqlite_vec has no sync → 404; 500 would indicate a bug
+        assert response.status_code in (200, 404)
+        if response.status_code == 200:
+            data = response.json()
+            assert "success" in data or "paused" in data
 
     def test_resume_sync(self, authed_client):
         response = authed_client.post("/api/sync/resume")
-        assert response.status_code in (200, 400, 404)
+        # sqlite_vec has no sync → 404; 500 would indicate a bug
+        assert response.status_code in (200, 404)
+        if response.status_code == 200:
+            data = response.json()
+            assert "success" in data or "resumed" in data
 
 
 # --- Backup endpoint coverage ---
@@ -172,18 +197,22 @@ class TestBackupEndpoints:
         response = authed_client.get("/api/backup/status")
         assert response.status_code == 200
         data = response.json()
-        assert isinstance(data, dict)
+        assert "enabled" in data
+        assert "scheduler_running" in data
 
     def test_backup_list(self, authed_client):
         response = authed_client.get("/api/backup/list")
         assert response.status_code == 200
         data = response.json()
-        assert isinstance(data, dict)
+        assert "backups" in data
+        assert "total_count" in data
 
     def test_trigger_backup(self, authed_client):
         response = authed_client.post("/api/backup/now")
-        # May succeed or fail depending on backup config
-        assert response.status_code in (200, 400, 500)
+        # Backup endpoint always returns 200 (success=True or success=False)
+        assert response.status_code == 200
+        data = response.json()
+        assert "success" in data
 
 
 # --- Events endpoint coverage ---
@@ -196,8 +225,8 @@ class TestEventsEndpoints:
         response = authed_client.get("/api/events/stats")
         assert response.status_code == 200
         data = response.json()
-        assert isinstance(data, dict)
-        assert "total_connections" in data or "connections" in data or isinstance(data, dict)
+        assert "total_connections" in data
+        assert "connections" in data
 
 
 # --- Manage endpoint coverage ---
@@ -210,17 +239,19 @@ class TestManageEndpoints:
         response = authed_client.get("/api/manage/tags/stats")
         assert response.status_code == 200
         data = response.json()
-        assert isinstance(data, dict)
+        assert "tags" in data
+        assert "total_tags" in data
 
     def test_untagged_count(self, authed_client):
         response = authed_client.get("/api/manage/untagged/count")
         assert response.status_code == 200
         data = response.json()
-        assert "count" in data or isinstance(data, dict)
+        assert "count" in data
 
     def test_cleanup_duplicates(self, authed_client):
         response = authed_client.post("/api/manage/cleanup-duplicates")
-        assert response.status_code in (200, 500)
+        # 200 on success, 501 if backend doesn't support cleanup; 500 indicates a bug
+        assert response.status_code in (200, 501)
 
     def test_bulk_delete_no_confirmation(self, authed_client):
         """Bulk delete without proper confirmation should be rejected."""
@@ -228,8 +259,8 @@ class TestManageEndpoints:
             "/api/manage/bulk-delete",
             json={"tags": ["__test__"]},
         )
-        # Should require confirmation count
-        assert response.status_code in (400, 422, 200)
+        # Should require confirmation count — 400 or 422, never 200
+        assert response.status_code in (400, 422)
 
     def test_system_operation_invalid(self, authed_client):
         """Invalid system operation should be rejected."""
@@ -261,13 +292,20 @@ class TestSearchEndpoints:
             json={"tags": ["__test__"], "match_all": False},
         )
         assert response.status_code == 200
+        data = response.json()
+        assert "results" in data
 
     def test_time_search(self, authed_client):
         response = authed_client.post(
             "/api/search/by-time",
             json={"time_expression": "yesterday", "n_results": 5},
         )
-        assert response.status_code in (200, 400, 422)
+        # "yesterday" may or may not be parseable depending on time parser availability
+        assert response.status_code in (200, 422)
+        if response.status_code == 200:
+            data = response.json()
+            assert "results" in data
+            assert "total_found" in data
 
 
 # --- Memories endpoint coverage ---
@@ -279,7 +317,11 @@ class TestMemoriesEndpoints:
     def test_list_memories(self, authed_client):
         response = authed_client.get("/api/memories", params={"limit": 10})
         assert response.status_code == 200
+        data = response.json()
+        assert "memories" in data or "results" in data
 
     def test_list_tags(self, authed_client):
         response = authed_client.get("/api/tags")
         assert response.status_code == 200
+        data = response.json()
+        assert "tags" in data or isinstance(data, list)

@@ -204,7 +204,7 @@ class TestEmbeddingValidationErrors:
         mixin.embedding_dimension = 384
         mixin.enable_cache = False
 
-        with pytest.raises((ValueError, RuntimeError), match="dimension"):
+        with pytest.raises(RuntimeError, match="dimension"):
             mixin._generate_embedding("test")
 
     def test_nan_embedding_raises(self, tmp_path):
@@ -214,7 +214,7 @@ class TestEmbeddingValidationErrors:
         mixin.embedding_dimension = 384
         mixin.enable_cache = False
 
-        with pytest.raises((ValueError, RuntimeError)):
+        with pytest.raises(RuntimeError):
             mixin._generate_embedding("test")
 
     def test_inf_embedding_raises(self, tmp_path):
@@ -224,7 +224,7 @@ class TestEmbeddingValidationErrors:
         mixin.embedding_dimension = 384
         mixin.enable_cache = False
 
-        with pytest.raises((ValueError, RuntimeError)):
+        with pytest.raises(RuntimeError):
             mixin._generate_embedding("test")
 
     def test_negative_inf_embedding_raises(self, tmp_path):
@@ -234,7 +234,7 @@ class TestEmbeddingValidationErrors:
         mixin.embedding_dimension = 384
         mixin.enable_cache = False
 
-        with pytest.raises((ValueError, RuntimeError)):
+        with pytest.raises(RuntimeError):
             mixin._generate_embedding("test")
 
     def test_empty_embedding_raises(self, tmp_path):
@@ -244,7 +244,7 @@ class TestEmbeddingValidationErrors:
         mixin.embedding_dimension = 384
         mixin.enable_cache = False
 
-        with pytest.raises((ValueError, RuntimeError)):
+        with pytest.raises(RuntimeError):
             mixin._generate_embedding("test")
 
     def test_no_model_raises(self, tmp_path):

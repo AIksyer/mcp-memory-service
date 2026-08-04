@@ -647,8 +647,9 @@ class TestRetrieveOperations:
             n_results=5,
             min_confidence=0.99,
         )
-        # With high confidence threshold, likely no results
+        # With high confidence threshold, no results should match
         assert isinstance(results, list)
+        assert len(results) == 0
 
     async def test_retrieve_n_results_limit(self, storage):
         # Store multiple memories
@@ -666,6 +667,7 @@ class TestRetrieveOperations:
     async def test_retrieve_no_results(self, storage):
         results = await storage.retrieve("", n_results=5)
         assert isinstance(results, list)
+        assert len(results) == 0
 
 
 @pytest.mark.asyncio

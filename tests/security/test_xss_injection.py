@@ -13,63 +13,12 @@ and retrieved safely — no execution context, correct Content-Type headers,
 and the payload survives round-trip intact (defense-in-depth, not sanitization).
 """
 
-import os
-import tempfile
 import uuid
 
 import pytest
-import pytest_asyncio
-from fastapi.testclient import TestClient
 
-from mcp_memory_service.storage.sqlite_vec import SqliteVecMemoryStorage
-from mcp_memory_service.web.dependencies import set_storage
-
-
-@pytest.fixture
-def temp_db():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        yield os.path.join(tmpdir, "test_xss.db")
-
-
-@pytest_asyncio.fixture
-async def initialized_storage(temp_db, monkeypatch):
-    monkeypatch.setenv("MCP_SEMANTIC_DEDUP_ENABLED", "false")
-    storage = SqliteVecMemoryStorage(temp_db)
-    await storage.initialize()
-    yield storage
-    await storage.close()
-
-
-@pytest.fixture
-def authed_client(initialized_storage, monkeypatch):
-    monkeypatch.setenv("MCP_API_KEY", "")
-    monkeypatch.setenv("MCP_OAUTH_ENABLED", "false")
-    monkeypatch.setenv("MCP_ALLOW_ANONYMOUS_ACCESS", "true")
-
-    from mcp_memory_service.web.app import app
-    from mcp_memory_service.web.oauth.middleware import (
-        AuthenticationResult,
-        get_current_user,
-        require_read_access,
-        require_write_access,
-    )
-
-    set_storage(initialized_storage)
-
-    async def _user():
-        return AuthenticationResult(
-            authenticated=True, client_id="test", scope="read write admin",
-            auth_method="test",
-        )
-
-    app.dependency_overrides[get_current_user] = _user
-    app.dependency_overrides[require_read_access] = _user
-    app.dependency_overrides[require_write_access] = _user
-
-    client = TestClient(app)
-    yield client
-    app.dependency_overrides.clear()
-
+# Fixtures (temp_db, initialized_storage, authed_client) are provided by
+# tests/security/conftest.py
 
 # --- XSS payloads ---
 XSS_PAYLOADS = [

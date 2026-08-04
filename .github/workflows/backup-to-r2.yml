@@ -74,17 +74,22 @@ jobs:
             echo "⚠️  No backups found — expected for new bucket"
           fi
 
+          # Free tier check — alert at 80% usage (20% headroom remaining)
           USAGE=$(curl -s \
             -X GET "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets/$R2_BUCKET/usage" \
             -H "Authorization: Bearer $CF_API_TOKEN")
           PAYLOAD_SIZE=$(echo "$USAGE" | jq -r '.result.payloadSize // "0"')
           echo ""
-          echo "=== Storage Usage ==="
-          echo "   Payload size: $PAYLOAD_SIZE bytes"
-          if [ "$PAYLOAD_SIZE" -gt 5368709120 ]; then
-            echo "⚠️  Warning: Storage exceeds 5GB (50% of free tier)"
+          echo "=== Free Tier Usage ==="
+          echo "   Storage: $PAYLOAD_SIZE bytes"
+          # R2 free tier: 10GB storage, 1M Class A ops, 10M Class B ops
+          # Alert at 80% (8GB storage)
+          STORAGE_THRESHOLD=8589934592  # 8GB = 80% of 10GB
+          if [ "$PAYLOAD_SIZE" -ge "$STORAGE_THRESHOLD" ]; then
+            echo "⚠️  WARNING: Storage reached 80% of free tier (${PAYLOAD_SIZE} bytes / 10GB)"
+            echo "⚠️  Only 20% headroom remaining — consider reviewing old backups"
           else
-            echo "✅ Storage within free tier"
+            echo "✅ Storage within free tier (<80%)"
           fi
 
       - name: Create issue on failure

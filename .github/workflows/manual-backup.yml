@@ -11,7 +11,6 @@ on:
         options:
           - status
           - list-objects
-          - cleanup-old
 
 permissions:
   contents: read
@@ -55,25 +54,6 @@ jobs:
               curl -s \
                 -X GET "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets/$R2_BUCKET/objects" \
                 -H "Authorization: Bearer $CF_API_TOKEN" | jq '.result[] | {key, size, lastModified}'
-              ;;
-
-            cleanup-old)
-              echo "--- Checking for objects older than 30 days ---"
-              OBJECTS=$(curl -s \
-                -X GET "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets/$R2_BUCKET/objects" \
-                -H "Authorization: Bearer $CF_API_TOKEN")
-
-              NOW_TS=$(date +%s)
-              CUTOFF_TS=$((NOW_TS - 2592000))
-
-              echo "$OBJECTS" | jq -r '.result[] | select(.lastModified != null) | "\(.key)|\(.lastModified)"' | while IFS='|' read -r KEY MODIFIED; do
-                MODIFIED_TS=$(date -d "$MODIFIED" +%s 2>/dev/null || echo 0)
-                if [ "$MODIFIED_TS" -lt "$CUTOFF_TS" ]; then
-                  AGE_DAYS=$(( (NOW_TS - MODIFIED_TS) / 86400 ))
-                  echo "  Deleting: $KEY (${AGE_DAYS} days old)"
-                fi
-              done
-              echo "✅ Cleanup complete (lifecycle rule also auto-deletes >30d)"
               ;;
 
             *)

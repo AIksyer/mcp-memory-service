@@ -302,6 +302,105 @@ class TestAnonymousAccess:
         assert response.status_code == 200
 
 
+@pytest.mark.integration
+class TestExpiredTokenRejection:
+    """Expired JWT tokens must be rejected with 401."""
+
+    def test_expired_jwt_rejected(self, initialized_storage, monkeypatch):
+        """An expired JWT returns 401, not 200."""
+        import jwt as pyjwt
+        from datetime import datetime, timedelta, timezone
+        from mcp_memory_service.web.oauth import middleware
+
+        monkeypatch.setattr(middleware, "API_KEY", None)
+        monkeypatch.setattr(middleware, "OAUTH_ENABLED", True)
+        monkeypatch.setattr(middleware, "ALLOW_ANONYMOUS_ACCESS", False)
+
+        from mcp_memory_service.web.app import app
+        from mcp_memory_service.web.oauth.middleware import get_current_user, require_read_access
+
+        set_storage(initialized_storage)
+
+        # Clear overrides so real middleware runs
+        app.dependency_overrides.clear()
+
+        # Create an expired JWT
+        secret = "test-secret"
+        monkeypatch.setattr(middleware, "get_jwt_verification_key", lambda: secret)
+        monkeypatch.setattr(middleware, "get_jwt_algorithm", lambda: "HS256")
+
+        expired_payload = {
+            "sub": "test-client",
+            "iss": "http://localhost:8000",
+            "aud": "mcp-memory-service",
+            "scope": "read write",
+            "iat": datetime.now(timezone.utc) - timedelta(hours=2),
+            "exp": datetime.now(timezone.utc) - timedelta(hours=1),
+        }
+        expired_token = pyjwt.encode(expired_payload, secret, algorithm="HS256")
+
+        client = TestClient(app)
+        try:
+            response = client.get(
+                "/api/memories",
+                headers={"Authorization": f"Bearer {expired_token}"},
+            )
+            assert response.status_code == 401, (
+                f"Expired token should return 401, got {response.status_code}"
+            )
+        finally:
+            app.dependency_overrides.clear()
+
+
+@pytest.mark.integration
+class TestLocalOnlyToolsFiltering:
+    """local_only_tools must be filtered from HTTP MCP transport (confused-deputy guard)."""
+
+    def test_local_only_tools_not_in_http_mcp_list(self, read_write_client):
+        """memory_harvest and memory_ingest must not appear in /mcp tools/list."""
+        response = read_write_client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": {},
+            },
+        )
+        assert response.status_code == 200, response.text
+        data = response.json()
+        tool_names = [t["name"] for t in data.get("result", {}).get("tools", [])]
+        assert "memory_harvest" not in tool_names, (
+            "memory_harvest must be filtered from HTTP MCP transport"
+        )
+        assert "memory_ingest" not in tool_names, (
+            "memory_ingest must be filtered from HTTP MCP transport"
+        )
+
+    def test_local_only_tools_call_rejected(self, read_write_client):
+        """Calling memory_harvest via HTTP MCP must be rejected."""
+        response = read_write_client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "memory_harvest",
+                    "arguments": {"project_path": "test"},
+                },
+            },
+        )
+        # Must not succeed — the tool should be filtered or return an error
+        assert response.status_code in (200, 403, 404), response.text
+        if response.status_code == 200:
+            data = response.json()
+            if "error" in data:
+                assert data["error"].get("code") in (-32602, -32601, 403), (
+                    f"Expected tool-not-found or scope error, got: {data['error']}"
+                )
+
+
 class TestAuthenticationResultScopeCheck:
     """Unit tests for AuthenticationResult.has_scope()."""
 

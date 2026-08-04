@@ -24,6 +24,7 @@ import pytest
 import pytest_asyncio
 import tempfile
 import os
+import shutil
 from unittest.mock import AsyncMock
 from fastapi.testclient import TestClient
 
@@ -38,10 +39,17 @@ from mcp_memory_service.utils.hashing import generate_content_hash
 
 @pytest.fixture
 def temp_db():
-    """Create a temporary database for testing."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        db_path = os.path.join(tmpdir, "test_graph.db")
-        yield db_path
+    """Create a temporary database for testing.
+
+    Uses mkdtemp + explicit cleanup with ignore_errors=True instead of
+    TemporaryDirectory context manager. On Windows, SQLite file handles
+    may linger briefly after close(), causing PermissionError [WinError 32]
+    when the context manager tries to delete the directory.
+    """
+    tmpdir = tempfile.mkdtemp()
+    db_path = os.path.join(tmpdir, "test_graph.db")
+    yield db_path
+    shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 @pytest_asyncio.fixture

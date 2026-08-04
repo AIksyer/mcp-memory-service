@@ -11,6 +11,7 @@ import pytest
 import asyncio
 import time
 import tempfile
+import shutil
 from datetime import datetime, timedelta
 from typing import List, Dict, Any
 import os
@@ -52,7 +53,8 @@ class TestChronologicalOrdering:
     @pytest.mark.asyncio
     async def test_get_all_memories_chronological_order_sqlite(self):
         """Test that get_all_memories returns memories in chronological order (SQLite)."""
-        with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_dir = tempfile.mkdtemp()
+        try:
             storage = SqliteVecMemoryStorage(os.path.join(tmp_dir, "test.db"))
             await storage.initialize()
 
@@ -76,10 +78,15 @@ class TestChronologicalOrdering:
             actual_order = [int(mem.content.split()[-1]) for mem in retrieved_memories]
             assert actual_order == expected_order, f"Expected order {expected_order}, got {actual_order}"
 
+            await storage.close()
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
     @pytest.mark.asyncio
     async def test_pagination_with_chronological_order_sqlite(self):
         """Test pagination maintains chronological order (SQLite)."""
-        with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_dir = tempfile.mkdtemp()
+        try:
             storage = SqliteVecMemoryStorage(os.path.join(tmp_dir, "test.db"))
             await storage.initialize()
 
@@ -112,10 +119,15 @@ class TestChronologicalOrdering:
             actual_content_order = [mem.content for mem in all_paginated]
             assert actual_content_order == expected_content_order
 
+            await storage.close()
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
     @pytest.mark.asyncio
     async def test_count_all_memories_sqlite(self):
         """Test count_all_memories method (SQLite)."""
-        with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_dir = tempfile.mkdtemp()
+        try:
             storage = SqliteVecMemoryStorage(os.path.join(tmp_dir, "test.db"))
             await storage.initialize()
 
@@ -130,10 +142,15 @@ class TestChronologicalOrdering:
             final_count = await storage.count_all_memories()
             assert final_count == 5
 
+            await storage.close()
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
     @pytest.mark.asyncio
     async def test_empty_storage_handling_sqlite(self):
         """Test handling of empty storage (SQLite)."""
-        with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_dir = tempfile.mkdtemp()
+        try:
             storage = SqliteVecMemoryStorage(os.path.join(tmp_dir, "test.db"))
             await storage.initialize()
 
@@ -149,10 +166,15 @@ class TestChronologicalOrdering:
             count = await storage.count_all_memories()
             assert count == 0
 
+            await storage.close()
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
     @pytest.mark.asyncio
     async def test_offset_beyond_total_sqlite(self):
         """Test offset beyond total records (SQLite)."""
-        with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_dir = tempfile.mkdtemp()
+        try:
             storage = SqliteVecMemoryStorage(os.path.join(tmp_dir, "test.db"))
             await storage.initialize()
 
@@ -163,10 +185,15 @@ class TestChronologicalOrdering:
             memories = await storage.get_all_memories(limit=10, offset=100)
             assert memories == []
 
+            await storage.close()
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
     @pytest.mark.asyncio
     async def test_large_limit_sqlite(self):
         """Test large limit parameter (SQLite)."""
-        with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_dir = tempfile.mkdtemp()
+        try:
             storage = SqliteVecMemoryStorage(os.path.join(tmp_dir, "test.db"))
             await storage.initialize()
 
@@ -177,10 +204,15 @@ class TestChronologicalOrdering:
             memories = await storage.get_all_memories(limit=100, offset=0)
             assert len(memories) == 5  # Should return all 5 memories
 
+            await storage.close()
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
     @pytest.mark.asyncio
     async def test_mixed_timestamps_ordering_sqlite(self):
         """Test ordering with mixed/unsorted timestamps (SQLite)."""
-        with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_dir = tempfile.mkdtemp()
+        try:
             storage = SqliteVecMemoryStorage(os.path.join(tmp_dir, "test.db"))
             await storage.initialize()
 
@@ -210,6 +242,10 @@ class TestChronologicalOrdering:
             actual_timestamps = [mem.created_at for mem in memories]
 
             assert actual_timestamps == expected_order, f"Expected {expected_order}, got {actual_timestamps}"
+
+            await storage.close()
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 class TestAPIChronologicalIntegration:

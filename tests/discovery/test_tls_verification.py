@@ -105,7 +105,7 @@ class TestNoHardcodedVerifySslFalse:
 
         client_path = Path(__file__).parent.parent.parent / \
             "src" / "mcp_memory_service" / "discovery" / "client.py"
-        source = client_path.read_text()
+        source = client_path.read_text(encoding="utf-8")
         tree = ast.parse(source)
 
         violations = []

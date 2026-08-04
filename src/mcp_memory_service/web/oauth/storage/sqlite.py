@@ -479,8 +479,8 @@ class SQLiteOAuthStorage(OAuthStorage):
                 "redirect_uri": row["redirect_uri"],
                 "scope": row["scope"],
                 "expires_at": row["expires_at"],
-                "code_challenge": row.get("code_challenge", None),
-                "code_challenge_method": row.get("code_challenge_method", None),
+                "code_challenge": row["code_challenge"] if row["code_challenge"] else None,
+                "code_challenge_method": row["code_challenge_method"] if row["code_challenge_method"] else None,
             }
 
     async def store_access_token(

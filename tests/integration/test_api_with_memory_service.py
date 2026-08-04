@@ -9,6 +9,7 @@ import pytest
 import pytest_asyncio
 import tempfile
 import os
+import shutil
 from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
 
@@ -37,9 +38,10 @@ async def mock_get_current_user_for_integration():
 @pytest.fixture
 def temp_db():
     """Create a temporary database for testing."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        db_path = os.path.join(tmpdir, "test.db")
-        yield db_path
+    tmpdir = tempfile.mkdtemp()
+    db_path = os.path.join(tmpdir, "test.db")
+    yield db_path
+    shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 @pytest_asyncio.fixture
@@ -48,7 +50,7 @@ async def initialized_storage(temp_db):
     storage = SqliteVecMemoryStorage(temp_db)
     await storage.initialize()
     yield storage
-    storage.close()
+    await storage.close()
 
 
 @pytest.fixture
@@ -564,7 +566,7 @@ async def test_end_to_end_workflow_with_real_storage(temp_db):
         assert get_after_delete["found"] is False
 
     finally:
-        storage.close()
+        await storage.close()
 
 
 # Real HTTP API Integration Tests with TestClient
@@ -634,7 +636,7 @@ async def test_http_api_store_memory_endpoint(temp_db, unique_content):
         app.dependency_overrides.clear()
 
     finally:
-        storage.close()
+        await storage.close()
 
 
 @pytest.mark.asyncio
@@ -887,7 +889,7 @@ async def test_http_api_delete_memory_endpoint(temp_db, unique_content):
         app.dependency_overrides.clear()
 
     finally:
-        storage.close()
+        await storage.close()
 
 
 @pytest.mark.asyncio
@@ -979,7 +981,7 @@ async def test_http_api_error_handling_invalid_json(temp_db, monkeypatch):
         assert response.status_code in [400, 422]
 
     finally:
-        storage.close()
+        await storage.close()
 
 
 @pytest.mark.asyncio
@@ -1035,7 +1037,7 @@ async def test_http_api_client_hostname_header(temp_db, unique_content, monkeypa
         assert data["memory"]["metadata"]["hostname"] == "test-machine"
 
     finally:
-        storage.close()
+        await storage.close()
 
 
 @pytest.mark.asyncio
@@ -1121,4 +1123,4 @@ async def test_http_api_complete_crud_workflow(temp_db, unique_content):
         app.dependency_overrides.clear()
 
     finally:
-        storage.close()
+        await storage.close()

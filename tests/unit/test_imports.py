@@ -40,7 +40,7 @@ def test_server_impl_imports():
     )
     server_impl_path = os.path.abspath(server_impl_path)
 
-    with open(server_impl_path, 'r') as f:
+    with open(server_impl_path, 'r', encoding='utf-8') as f:
         source = f.read()
 
     # Verify critical imports are present in source

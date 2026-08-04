@@ -46,7 +46,7 @@ class TestHealthEndpointSecurity:
 
         health_path = Path(__file__).parent.parent.parent.parent / \
             "src" / "mcp_memory_service" / "web" / "api" / "health.py"
-        source = health_path.read_text()
+        source = health_path.read_text(encoding="utf-8")
         tree = ast.parse(source)
 
         for node in ast.walk(tree):
@@ -72,7 +72,7 @@ class TestNoDatabasePathDisclosure:
 
         health_path = Path(__file__).parent.parent.parent.parent / \
             "src" / "mcp_memory_service" / "web" / "api" / "health.py"
-        source = health_path.read_text()
+        source = health_path.read_text(encoding="utf-8")
 
         # There should be no line that assigns database_path to storage_info
         # (comments referencing it are OK)
@@ -100,7 +100,7 @@ class TestNoSystemFingerprinting:
 
         health_path = Path(__file__).parent.parent.parent.parent / \
             "src" / "mcp_memory_service" / "web" / "api" / "health.py"
-        source = health_path.read_text()
+        source = health_path.read_text(encoding="utf-8")
 
         # Find the system_info dict construction in detailed_health_check
         in_system_info = False
@@ -142,10 +142,11 @@ class TestDefaultHttpHostBinding:
         from pathlib import Path
         config_path = Path(__file__).parent.parent.parent.parent / \
             "src" / "mcp_memory_service" / "config" / "transport.py"
-        source = config_path.read_text()
-        assert "os.getenv('MCP_HTTP_HOST', '127.0.0.1')" in source, (
-            "config.py must default HTTP_HOST to '127.0.0.1'"
-        )
+        source = config_path.read_text(encoding="utf-8")
+        assert (
+            "os.getenv('MCP_HTTP_HOST', '127.0.0.1')" in source
+            or 'os.getenv("MCP_HTTP_HOST", "127.0.0.1")' in source
+        ), "config.py must default HTTP_HOST to '127.0.0.1'"
 
     def test_config_allows_explicit_network_binding(self, monkeypatch):
         """Users can explicitly opt-in to network binding via MCP_HTTP_HOST."""

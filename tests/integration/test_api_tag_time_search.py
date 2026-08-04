@@ -13,6 +13,7 @@ FIXED: Global authentication disabling via tests/integration/conftest.py
 import pytest
 import tempfile
 import os
+import shutil
 import time
 from fastapi.testclient import TestClient
 
@@ -39,9 +40,10 @@ async def mock_get_current_user():
 @pytest.fixture
 def temp_db():
     """Create a temporary database for testing."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        db_path = os.path.join(tmpdir, "test_api_tag_time.db")
-        yield db_path
+    tmpdir = tempfile.mkdtemp()
+    db_path = os.path.join(tmpdir, "test_api_tag_time.db")
+    yield db_path
+    shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 async def create_test_storage_with_data(temp_db):

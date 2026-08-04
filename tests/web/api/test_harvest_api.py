@@ -36,6 +36,9 @@ def project_dir(tmp_path, monkeypatch):
         json.dumps({"type": "user", "message": {"content": "hello world"}}) + "\n"
     )
     monkeypatch.setenv("HOME", str(tmp_path))
+    # On Windows, Path.home() uses USERPROFILE (not HOME); set both so the
+    # endpoint resolves the project dir inside the redirected home tree.
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     yield project
 
 
@@ -194,6 +197,7 @@ def test_harvest_rejects_negative_sessions(authed_client, project_dir):
 def test_harvest_missing_project_dir_returns_404(authed_client, tmp_path, monkeypatch):
     """Non-existent project name under the allowed tree returns 404."""
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     (tmp_path / ".claude" / "projects").mkdir(parents=True)
     response = authed_client.post(
         "/api/harvest",
@@ -213,6 +217,7 @@ def test_harvest_requires_project_path(authed_client):
 def test_harvest_rejects_traversal_attempts(authed_client, tmp_path, monkeypatch, bad_path):
     """Absolute paths and parent-dir traversal are rejected with 400 (CodeQL #383/#384)."""
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     (tmp_path / ".claude" / "projects").mkdir(parents=True)
     response = authed_client.post(
         "/api/harvest",

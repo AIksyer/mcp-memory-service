@@ -84,8 +84,8 @@ class TestConfigDefaults:
         from pathlib import Path
         config_path = Path(__file__).parent.parent.parent / \
             "src" / "mcp_memory_service" / "config" / "transport.py"
-        source = config_path.read_text()
-        assert "os.getenv('MCP_PEER_VERIFY_SSL', 'true')" in source
+        source = config_path.read_text(encoding="utf-8")
+        assert 'os.getenv("MCP_PEER_VERIFY_SSL", "true")' in source
 
     def test_peer_ssl_ca_file_default_is_none(self, monkeypatch):
         """PEER_SSL_CA_FILE defaults to None when env var is not set."""
@@ -105,7 +105,7 @@ class TestNoHardcodedVerifySslFalse:
 
         client_path = Path(__file__).parent.parent.parent / \
             "src" / "mcp_memory_service" / "discovery" / "client.py"
-        source = client_path.read_text()
+        source = client_path.read_text(encoding="utf-8")
         tree = ast.parse(source)
 
         violations = []

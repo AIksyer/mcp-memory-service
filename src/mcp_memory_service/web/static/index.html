@@ -1,0 +1,1685 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="referrer" content="no-referrer">
+    <title data-i18n="meta.title">MCP Memory Service - Dashboard</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧠</text></svg>">
+    <!-- Chart.js for quality analytics visualizations -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <!-- D3.js v7 for force-directed graph visualization (v9.2.0+) -->
+    <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
+    <!-- 3d-force-graph + three (ESM, single shared three instance) for the
+         cinematic 3D knowledge graph with bloom + nebula (Orrery-style PoC).
+         three/webgpu, three/tsl and three/examples/jsm/ must be mapped because
+         3d-force-graph statically imports them. -->
+    <script type="importmap">
+    {
+      "imports": {
+        "three": "https://esm.sh/three@0.184.0",
+        "three/webgpu": "https://esm.sh/three@0.184.0/webgpu?external=three",
+        "three/tsl": "https://esm.sh/three@0.184.0/tsl?external=three",
+        "three/examples/jsm/": "https://esm.sh/three@0.184.0/examples/jsm/",
+        "three/addons/": "https://esm.sh/three@0.184.0/examples/jsm/"
+      }
+    }
+    </script>
+    <script type="module">
+      import ForceGraph3D from 'https://esm.sh/3d-force-graph@1.80.0?external=three';
+      import * as THREE from 'three';
+      import { UnrealBloomPass } from 'https://esm.sh/three@0.184.0/examples/jsm/postprocessing/UnrealBloomPass.js?external=three';
+      window.ForceGraph3D = ForceGraph3D;
+      window.THREE = THREE;
+      window.__UnrealBloomPass = UnrealBloomPass;
+      window.dispatchEvent(new CustomEvent('forcegraph3d-ready'));
+    </script>
+</head>
+<body>
+    <!-- Main Application Container -->
+    <div id="app" class="app-container">
+
+        <!-- Header with Navigation -->
+        <header class="app-header">
+            <div class="header-content">
+                <div class="logo-section">
+                    <h1 class="app-title" data-i18n="header.title">🧠 MCP Memory</h1>
+                    <span id="versionBadge" class="version-badge" data-i18n="header.versionLoading">Loading...</span>
+                </div>
+
+                <!-- SVG Icon Definitions -->
+                <svg style="display: none;" aria-hidden="true">
+                    <defs>
+                        <symbol id="info-icon" viewBox="0 0 24 24">
+                            <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2" fill="none"/>
+                            <path d="M12 8v.01M12 12v4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                        </symbol>
+                    </defs>
+                </svg>
+
+                <!-- Quick Search Bar -->
+                <div class="search-section">
+                    <div class="search-container">
+                        <input type="text"
+                               id="quickSearch"
+                               class="search-input"
+                               data-i18n-placeholder="search.placeholder"
+                               placeholder="🔍 Search your memories..."
+                               autocomplete="off">
+                        <button class="search-btn" type="button" aria-label="Search">
+                            <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
+                                <path d="M21.71 20.29L18 16.61A9 9 0 1 0 16.61 18l3.68 3.68a1 1 0 0 0 1.42-1.42zM11 18a7 7 0 1 1 7-7 7 7 0 0 1-7 7z"/>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Action Buttons -->
+                <div class="action-buttons">
+                    <button id="addMemoryBtn" class="btn btn-primary" title="Add New Memory">
+                        <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
+                            <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/>
+                        </svg>
+                        <span class="btn-text" data-i18n="actions.addMemory">Add Memory</span>
+                    </button>
+                    <button id="themeToggleBtn" class="btn btn-secondary" title="Toggle Dark Mode">
+                        <svg id="sunIcon" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
+                            <circle cx="12" cy="12" r="5"/>
+                            <line x1="12" y1="1" x2="12" y2="3"/>
+                            <line x1="12" y1="21" x2="12" y2="23"/>
+                            <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/>
+                            <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
+                            <line x1="1" y1="12" x2="3" y2="12"/>
+                            <line x1="21" y1="12" x2="23" y2="12"/>
+                            <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/>
+                            <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+                        </svg>
+                        <svg id="moonIcon" class="hidden" width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
+                            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+                        </svg>
+                    </button>
+                    <button id="settingsBtn" class="btn btn-secondary" title="Settings">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M12.647 10.942 11.657 9.953c0.362 -0.553 0.627 -1.18 0.759 -1.847h1.411v-2.4h-1.411c-0.152 -0.666 -0.402 -1.293 -0.759 -1.847l0.989 -0.989L10.971 1.2l-0.989 0.989c-0.553 -0.362 -1.18 -0.627 -1.847 -0.759V0h-2.4v1.411c-0.666 0.152 -1.293 0.402 -1.847 0.759L2.904 1.18 1.21 2.856l0.989 0.989c-0.362 0.553 -0.627 1.18 -0.759 1.847H0.029v2.38h1.411c0.152 0.666 0.402 1.293 0.759 1.847l-0.989 0.989 1.675 1.675 0.989 -0.989c0.553 0.362 1.18 0.627 1.847 0.759V13.763h2.38v-1.411c0.666 -0.152 1.293 -0.402 1.847 -0.759l0.989 0.989zm-5.731 -0.798c-1.788 0 -3.252 -1.464 -3.252 -3.252s1.464 -3.252 3.252 -3.252 3.252 1.445 3.252 3.252 -1.44 3.252 -3.252 3.252"/>
+                            <path d="m22.658 16.217 1.313 -0.514 -0.877 -2.209 -1.313 0.514c-0.382 -0.573 -0.857 -1.048 -1.391 -1.445l0.553 -1.293 -2.189 -0.95 -0.529 1.288c-0.647 -0.132 -1.332 -0.152 -1.998 -0.039l-0.534 -1.293 -2.209 0.877 0.514 1.313c-0.573 0.382 -1.048 0.857 -1.445 1.391l-1.293 -0.553 -0.95 2.189 1.293 0.553c-0.132 0.647 -0.152 1.332 -0.039 1.998l-1.313 0.514 0.877 2.209 1.313 -0.514c0.382 0.573 0.857 1.048 1.391 1.445L13.273 22.991l2.189 0.95 0.553 -1.293c0.647 0.132 1.332 0.152 1.998 0.039l0.514 1.313 2.209 -0.877 -0.514 -1.313c0.573 -0.382 1.048 -0.857 1.445 -1.391l1.293 0.553 0.95 -2.189 -1.293 -0.553c0.132 -0.661 0.152 -1.327 0.039 -2.013M18.318 20.155c-1.675 0.666 -3.561 -0.152 -4.227 -1.827s0.152 -3.561 1.827 -4.227 3.561 0.152 4.227 1.827 -0.152 3.561 -1.827 4.227"/>
+                        </svg>
+                    </button>
+                    <div class="language-selector" aria-label="Language">
+                        <button type="button" class="lang-dropdown-trigger" aria-haspopup="true" aria-expanded="false">
+                            <svg class="lang-icon" width="20" height="20" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 5h12M9 3v2m1.048 9.5A18.022 18.022 0 016.412 9m6.088 9h7M11 21l5-10 5 10M12.751 5C11.783 10.77 8.07 15.61 3 18.129"/>
+                            </svg>
+                            <span class="lang-current" data-i18n="lang.english">English</span>
+                            <svg class="lang-chevron" width="16" height="16" fill="currentColor" viewBox="0 0 20 20">
+                                <path fill-rule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clip-rule="evenodd"/>
+                            </svg>
+                        </button>
+                        <div class="lang-dropdown-menu" role="menu" hidden>
+                            <!-- Dynamically populated by JavaScript -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Navigation -->
+        <nav class="main-nav">
+            <div class="nav-container">
+                <button class="nav-item active" data-view="dashboard" data-i18n="nav.dashboard">
+                    <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
+                        <path d="M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z"/>
+                    </svg>
+                    Dashboard
+                </button>
+                <button class="nav-item" data-view="search" data-i18n="nav.search">
+                    <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
+                        <path d="M21.71 20.29L18 16.61A9 9 0 1 0 16.61 18l3.68 3.68a1 1 0 0 0 1.42-1.42zM11 18a7 7 0 1 1 7-7 7 7 0 0 1-7 7z"/>
+                    </svg>
+                    Search
+                </button>
+                <button class="nav-item" data-view="browse" data-i18n="nav.browse">
+                <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-1 9H9V9h10v2zm-4 4H9v-2h6v2zm4-8H9V5h10v2z"/>
+                </svg>
+                Browse
+                </button>
+                <button class="nav-item" data-view="documents" data-i18n="nav.documents">
+                    <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
+                        <path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20Z"/>
+                    </svg>
+                    Documents
+                </button>
+                <button class="nav-item" data-view="manage" data-i18n="nav.manage">
+                    <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
+                        <path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/>
+                    </svg>
+                    Manage
+                </button>
+                <button class="nav-item" data-view="analytics" data-i18n="nav.analytics">
+                    <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
+                        <path d="M5 9.2h3V19H5zM10.6 5h2.8v14h-2.8zm5.6 8H19v6h-2.8z"/>
+                    </svg>
+                    Analytics
+                </button>
+                <button class="nav-item" data-view="qualityAnalytics" data-i18n="nav.qualityAnalytics">
+                    <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
+                        <path d="M12 2L9.19 8.63L2 9.24L7.46 13.97L5.82 21L12 17.27L18.18 21L16.54 13.97L22 9.24L14.81 8.63L12 2Z"/>
+                    </svg>
+                    Quality
+                </button>
+                <button class="nav-item" data-view="apiDocs" data-i18n="nav.apiDocs">
+                    <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
+                        <path d="M14,17H7V15H14M17,13H7V11H17M17,9H7V7H17M19,3H5C3.89,3 3,3.89 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V5C21,3.89 20.1,3 19,3Z"/>
+                    </svg>
+                    API Docs
+                </button>
+            </div>
+        </nav>
+
+        <!-- Main Content Area -->
+        <main class="main-content">
+            <!-- Dashboard View -->
+            <div id="dashboardView" class="view-container active">
+                <div class="dashboard-grid">
+                    <!-- Welcome Section -->
+                    <section class="welcome-card">
+                        <h2 data-i18n="home.welcome">Welcome to your Memory Dashboard</h2>
+                        <p data-i18n="home.subtitle">Manage your AI memories with semantic search, real-time updates, and intelligent organization.</p>
+                        <div class="quick-stats">
+                            <div class="stat-item">
+                                <span class="stat-number" id="totalMemories">—</span>
+                                <span class="stat-label" data-i18n="stats.total">Total Memories</span>
+                            </div>
+                            <div class="stat-item">
+                                <span class="stat-number" id="recentMemories">—</span>
+                                <span class="stat-label" data-i18n="stats.thisWeek">This Week</span>
+                            </div>
+                            <div class="stat-item">
+                                <span class="stat-number" id="uniqueTags">—</span>
+                                <span class="stat-label" data-i18n="stats.tags">Tags</span>
+                            </div>
+                        </div>
+                    </section>
+
+                    <!-- Recent Memories -->
+                    <section class="recent-memories">
+                        <h3 data-i18n="sections.recentMemories">Recent Memories</h3>
+                        <div id="recentMemoriesList" class="memory-list">
+                            <!-- Dynamic content will be loaded here -->
+                        </div>
+                    </section>
+
+                    <!-- Quick Actions -->
+                    <section class="quick-actions">
+                        <h3 data-i18n="sections.quickActions">Quick Actions</h3>
+                        <div class="action-grid">
+                            <button class="action-card" data-action="quick-search">
+                                <svg width="24" height="24" fill="currentColor" viewBox="0 0 24 24">
+                                    <path d="M21.71 20.29L18 16.61A9 9 0 1 0 16.61 18l3.68 3.68a1 1 0 0 0 1.42-1.42zM11 18a7 7 0 1 1 7-7 7 7 0 0 1-7 7z"/>
+                                </svg>
+                                <span data-i18n="actions.advancedSearch">Advanced Search</span>
+                            </button>
+                            <button class="action-card" data-action="add-memory">
+                                <svg width="24" height="24" fill="currentColor" viewBox="0 0 24 24">
+                                    <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/>
+                                </svg>
+                                <span data-i18n="actions.addMemory">Add Memory</span>
+                            </button>
+                            <button class="action-card" data-action="browse-tags">
+                                <svg width="24" height="24" fill="currentColor" viewBox="0 0 24 24">
+                                    <path d="M17.63 5.84C17.27 5.33 16.67 5 16 5L5 5.01C3.9 5.01 3 5.9 3 7v10c0 1.1.9 1.99 2 1.99L16 19c.67 0 1.27-.33 1.63-.84L22 12l-4.37-6.16z"/>
+                                </svg>
+                                <span data-i18n="actions.browseTags">Browse Tags</span>
+                            </button>
+                            <button class="action-card" data-action="export-data">
+                                <svg width="24" height="24" fill="currentColor" viewBox="0 0 24 24">
+                                    <path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20Z"/>
+                                </svg>
+                                <span data-i18n="actions.exportData">Export Data</span>
+                            </button>
+                        </div>
+
+                        <!-- Compact Sync Control (Hybrid Mode Only) -->
+                        <div id="syncControl" class="sync-control-compact">
+                            <div class="sync-row">
+                                <div class="sync-status">
+                                    <span id="syncStatusDot" class="sync-dot"></span>
+                                    <span id="syncStatusText" class="sync-text-sm">Checking...</span>
+                                </div>
+                                <span id="syncProgress" class="sync-progress-sm"></span>
+                                <div class="sync-buttons-sm">
+                                    <button type="button" id="pauseSyncButton" class="btn-icon-sm" title="Pause sync">
+                                        <svg width="14" height="14" fill="currentColor" viewBox="0 0 24 24">
+                                            <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>
+                                        </svg>
+                                    </button>
+                                    <button type="button" id="resumeSyncButton" class="btn-icon-sm" title="Resume sync">
+                                        <svg width="14" height="14" fill="currentColor" viewBox="0 0 24 24">
+                                            <path d="M8 5v14l11-7z"/>
+                                        </svg>
+                                    </button>
+                                    <button type="button" id="forceSyncButton" class="btn-icon-sm btn-icon-primary" title="Sync now">
+                                        <svg width="14" height="14" fill="currentColor" viewBox="0 0 24 24">
+                                            <path d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46C19.54 15.03 20 13.57 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74C4.46 8.97 4 10.43 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z"/>
+                                        </svg>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+                </div>
+            </div>
+
+            <!-- Search View -->
+            <div id="searchView" class="view-container">
+                <div class="search-layout">
+                    <!-- Advanced Search Panel -->
+                    <aside class="search-filters">
+                        <div class="filters-header">
+                            <h3 data-i18n="search.filters.title">Search Filters
+                                <span class="tooltip" title="Filters work together: combine tags, dates, and types to narrow your search" data-i18n-aria="search.filters.tooltip">
+                                    <svg width="16" height="16" fill="currentColor"><use href="#info-icon"/></svg>
+                                </span>
+                            </h3>
+                            <div class="mode-toggle-compact">
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="liveSearchToggle" checked>
+                                    <span class="slider"></span>
+                                </label>
+                                <span class="tooltip" title="Toggle between live search (updates as you type) and manual search mode" data-i18n-aria="search.filters.modeTooltip">
+                                    <svg width="16" height="16" fill="currentColor" viewBox="0 0 24 24">
+                                        <path d="M13 2L3 14h8l-1 8 10-12h-8l1-8z" fill="currentColor"/>
+                                    </svg>
+                                </span>
+                            </div>
+                        </div>
+
+                        <!-- Search Mode Indicator -->
+                        <div class="search-mode-indicator">
+                            <span class="mode-status">
+                                <span id="searchModeText">Live Search</span> <span data-i18n="search.filters.modeSuffix">mode</span>
+                            </span>
+                        </div>
+
+                        <div class="filter-section">
+                            <label for="tagFilter" data-i18n="search.filters.tags">Tags
+                                <span class="tooltip" title="Enter tags separated by commas (e.g., work, coding, important)" data-i18n-aria="search.filters.tagsTip">
+                                    <svg width="16" height="16" fill="currentColor"><use href="#info-icon"/></svg>
+                                </span>
+                            </label>
+                            <input type="text" id="tagFilter" data-i18n-placeholder="search.filters.tagsPlaceholder" placeholder="e.g., work, coding, important">
+                            <small class="help-text" data-i18n="search.filters.tagsHelp">Separate multiple tags with commas</small>
+                        </div>
+
+                        <div class="filter-section">
+                            <label for="dateFilter" data-i18n="search.filters.date">Date Range
+                                <span class="tooltip" title="Filter memories by when they were created" data-i18n-aria="search.filters.dateTip">
+                                    <svg width="16" height="16" fill="currentColor"><use href="#info-icon"/></svg>
+                                </span>
+                            </label>
+                            <select id="dateFilter">
+                                <option value="" data-i18n="search.filters.date.all">All time</option>
+                                <option value="today" data-i18n="search.filters.date.today">Today</option>
+                                <option value="yesterday" data-i18n="search.filters.date.yesterday">Yesterday</option>
+                                <option value="week" data-i18n="search.filters.date.week">This week</option>
+                                <option value="month" data-i18n="search.filters.date.month">This month</option>
+                                <option value="quarter" data-i18n="search.filters.date.quarter">This quarter</option>
+                                <option value="year" data-i18n="search.filters.date.year">This year</option>
+                            </select>
+                            <small class="help-text" data-i18n="search.filters.dateHelp">Select a time period to filter memories</small>
+                        </div>
+
+                        <div class="filter-section">
+                            <label for="typeFilter" data-i18n="search.filters.type">Content Type
+                                <span class="tooltip" title="Filter by the type of content stored" data-i18n-aria="search.filters.typeTip">
+                                    <svg width="16" height="16" fill="currentColor"><use href="#info-icon"/></svg>
+                                </span>
+                            </label>
+                            <select id="typeFilter">
+                                <option value="" data-i18n="search.filters.type.all">All types</option>
+                                <option value="note" data-i18n="search.filters.type.note">Notes</option>
+                                <option value="code" data-i18n="search.filters.type.code">Code</option>
+                                <option value="reference" data-i18n="search.filters.type.reference">References</option>
+                                <option value="idea" data-i18n="search.filters.type.idea">Ideas</option>
+                            </select>
+                            <small class="help-text" data-i18n="search.filters.typeHelp">Choose the type of memories to show</small>
+                        </div>
+
+                        <!-- Filter Actions -->
+                        <div class="filter-actions">
+                            <button type="button" id="applyFiltersBtn" class="btn btn-primary" data-i18n="actions.search">
+                                <svg width="16" height="16" fill="currentColor" viewBox="0 0 24 24">
+                                    <path d="M21.71 20.29L18 16.61A9 9 0 1 0 16.61 18l3.68 3.68a1 1 0 0 0 1.42-1.42zM11 18a7 7 0 1 1 7-7 7 7 0 0 1-7 7z"/>
+                                </svg>
+                                Search
+                            </button>
+                            <button type="button" id="clearFiltersBtn" class="btn btn-secondary" data-i18n="actions.clearAll">
+                                <svg width="16" height="16" fill="currentColor" viewBox="0 0 24 24">
+                                    <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
+                                </svg>
+                                Clear All
+                            </button>
+                        </div>
+
+                        <!-- Active Filters Display -->
+                        <div id="activeFilters" class="active-filters" style="display: none;">
+                            <h4 data-i18n="search.filters.activeTitle">Active Filters:</h4>
+                            <div id="activeFiltersList" class="filter-pills">
+                                <!-- Dynamic filter pills will be added here -->
+                            </div>
+                        </div>
+                    </aside>
+
+                    <!-- Search Results -->
+                    <div class="search-results">
+                        <div class="search-header">
+                            <h2 data-i18n="search.results.title">Search Results</h2>
+                            <div class="results-meta">
+                                <span id="resultsCount">0 results</span>
+                                <div class="view-options">
+                                    <button class="view-btn active" data-view="grid" data-i18n="search.view.grid">Grid</button>
+                                    <button class="view-btn" data-view="list" data-i18n="search.view.list">List</button>
+                                </div>
+                            </div>
+                        </div>
+                        <div id="searchResultsList" class="memory-grid">
+                            <!-- Dynamic search results will be loaded here -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Documents View -->
+            <div id="documentsView" class="view-container">
+                <div class="documents-layout">
+                    <!-- Document Upload Section -->
+                    <section class="documents-section">
+                        <h2 data-i18n="documents.title">📄 Document Ingestion</h2>
+                        <div class="upload-area">
+                            <div id="dropZone" class="drop-zone">
+                                <div class="drop-zone-content">
+                                    <svg width="48" height="48" fill="currentColor" viewBox="0 0 24 24">
+                                        <path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20Z"/>
+                                    </svg>
+                                    <h3 data-i18n="documents.dropTitle">Drag & drop files here</h3>
+                                    <p data-i18n-html="documents.dropSubtitle">or <button id="fileSelectBtn" class="link-button">browse to select files</button></p>
+                                    <p class="supported-formats" data-i18n="documents.supported">Supported formats: PDF, TXT, MD, JSON</p>
+                                    <input type="file" id="fileInput" multiple accept=".pdf,.txt,.md,.json" style="display: none;">
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Upload Configuration -->
+                        <div class="upload-config">
+                        <div class="config-section">
+                        <label for="docTags" data-i18n="documents.tagsLabel">Tags (comma-separated)</label>
+                        <input type="text" id="docTags" placeholder="e.g., documentation, reference, manual" data-i18n-placeholder="documents.tagsPlaceholder" class="form-control">
+                            <small class="form-help" data-i18n="documents.tagsHelp">Tags will be applied to all files. Use spaces or commas as separators.</small>
+                        </div>
+
+                             <!-- Processing Mode Toggle (shown when multiple files selected) -->
+                             <div class="config-section" id="processingModeSection" style="display: none;">
+                             <label data-i18n="documents.processingMode">Processing Mode <span class="info-icon info-icon-processing" title="Click for processing mode explanation" data-i18n-aria="documents.processingTip">ℹ️</span></label>
+                                 <div class="processing-mode-toggle">
+                                     <button type="button" id="batchModeBtn" class="mode-btn active" data-mode="batch" data-i18n="documents.modeBatch">
+                                          <svg width="16" height="16" fill="currentColor" viewBox="0 0 24 24">
+                                              <path d="M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-1 9H9V9h10v2zm-4 4H9v-2h6v2zm4-8H9V5h10v2z"/>
+                                          </svg>
+                                          Batch Processing
+                                      </button>
+                                     <button type="button" id="individualModeBtn" class="mode-btn" data-mode="individual" data-i18n="documents.modeIndividual">
+                                          <svg width="16" height="16" fill="currentColor" viewBox="0 0 24 24">
+                                              <path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20Z"/>
+                                          </svg>
+                                          Individual Processing
+                                      </button>
+                                 </div>
+                                 <div class="mode-description" id="modeDescription" data-i18n-html="documents.modeDescription">
+                                     <small>All selected files will be processed together with the same tags.</small>
+                                 </div>
+                             </div>
+                            <div class="config-row">
+                                <div class="config-section">
+                                    <label for="chunkSize" data-i18n-html="documents.chunkSizeLabel">
+                                        Chunk Size: <span id="chunkSizeValue">1000</span> chars
+                                        <span class="info-icon" title="Click for chunking recommendations" data-i18n-aria="documents.chunkSizeTip">ℹ️</span>
+                                    </label>
+                                    <input type="range" id="chunkSize" min="500" max="2000" value="1000" step="100" class="form-control">
+                                </div>
+                                <div class="config-section">
+                                    <label for="chunkOverlap" data-i18n-html="documents.chunkOverlapLabel">
+                                        Overlap: <span id="chunkOverlapValue">200</span> chars
+                                        <span class="info-icon info-icon-overlap" title="Click for overlap explanation" data-i18n-aria="documents.chunkOverlapTip">ℹ️</span>
+                                    </label>
+                                    <input type="range" id="chunkOverlap" min="0" max="500" value="200" step="50" class="form-control">
+                                </div>
+                            </div>
+
+                            <!-- Chunking Help Section (collapsible) -->
+                            <div id="chunkingHelpSection" class="chunking-help" style="display: none;">
+                                <div class="help-header">
+                                    <strong data-i18n="documents.chunkHelp.title">📚 Chunking Configuration Guide</strong>
+                                    <button class="close-help" data-action="hideChunkingHelp">×</button>
+                                </div>
+                                <div class="help-content">
+                                    <p class="help-note" data-i18n-html="documents.chunkHelp.note">
+                                        <strong>Note:</strong> Actual chunk sizes may vary as the system respects paragraph boundaries
+                                        to maintain semantic coherence.
+                                    </p>
+
+                                    <div class="help-recommendations">
+                                        <div class="help-option">
+                                            <div class="help-option-header">
+                                                <strong data-i18n="documents.chunkHelp.defaultTitle">✅ Default (1000 chars, 200 overlap)</strong>
+                                                <span class="help-tag" data-i18n="documents.chunkHelp.recommended">Recommended</span>
+                                            </div>
+                                            <p data-i18n-html="documents.chunkHelp.defaultBest"><strong>Best for:</strong> Technical documentation, reference manuals, knowledge bases</p>
+                                            <p data-i18n-html="documents.chunkHelp.defaultWhy"><strong>Why:</strong> Paragraph-aware chunking preserves complete thoughts and context</p>
+                                        </div>
+
+                                        <div class="help-option">
+                                            <div class="help-option-header">
+                                                <strong data-i18n="documents.chunkHelp.smallTitle">🔍 Smaller Chunks (500 chars, 100 overlap)</strong>
+                                            </div>
+                                            <p data-i18n-html="documents.chunkHelp.smallBest"><strong>Best for:</strong> Dense technical docs, code documentation, API references</p>
+                                            <p data-i18n-html="documents.chunkHelp.smallTradeoff"><strong>Trade-off:</strong> More granular retrieval but may split paragraphs more aggressively</p>
+                                        </div>
+
+                                        <div class="help-option">
+                                            <div class="help-option-header">
+                                                <strong data-i18n="documents.chunkHelp.largeTitle">📖 Larger Chunks (2000 chars, 400 overlap)</strong>
+                                            </div>
+                                            <p data-i18n-html="documents.chunkHelp.largeBest"><strong>Best for:</strong> Narrative documents, articles, blogs, long-form content</p>
+                                            <p data-i18n-html="documents.chunkHelp.largeTradeoff"><strong>Trade-off:</strong> Better context but less precise retrieval</p>
+                                        </div>
+                                    </div>
+
+                                    <div class="help-tips">
+                                        <strong data-i18n="documents.chunkHelp.tipsTitle">💡 Tips:</strong>
+                                        <ul>
+                                            <li data-i18n-html="documents.chunkHelp.tipOverlap"><strong>Overlap</strong> helps maintain context across chunk boundaries</li>
+                                            <li data-i18n-html="documents.chunkHelp.tipHigherOverlap"><strong>Higher overlap</strong> = better continuity but more redundancy</li>
+                                            <li data-i18n="documents.chunkHelp.tipTest">Test different settings on a sample document to find optimal configuration</li>
+                                            <li data-i18n="documents.chunkHelp.tipPreserve">Chunks preserve complete sentences and paragraphs when possible</li>
+                                        </ul>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Overlap Help Section (collapsible) -->
+                            <div id="overlapHelpSection" class="chunking-help overlap-help" style="display: none;">
+                                <div class="help-header">
+                                    <strong data-i18n="documents.overlapHelp.title">🔗 Chunk Overlap Explained</strong>
+                                    <button class="close-help" data-action="hideOverlapHelp">×</button>
+                                </div>
+                                <div class="help-content">
+                                    <p class="help-note" data-i18n-html="documents.overlapHelp.note">
+                                        <strong>What is overlap?</strong> Overlap is the number of characters that are duplicated
+                                        between consecutive chunks. This helps maintain context across chunk boundaries.
+                                    </p>
+
+                                    <div class="help-example">
+                                        <strong data-i18n="documents.overlapHelp.visual">Visual Example:</strong>
+                                        <div class="overlap-diagram">
+                                            <div class="chunk-demo">
+                                                <span class="chunk-part unique">Chunk 1 unique content...</span>
+                                                <span class="chunk-part overlap">shared overlap region</span>
+                                            </div>
+                                            <div class="chunk-demo">
+                                                <span class="chunk-part overlap">shared overlap region</span>
+                                                <span class="chunk-part unique">Chunk 2 unique content...</span>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <div class="help-recommendations">
+                                        <div class="help-option">
+                                            <div class="help-option-header">
+                                                <strong data-i18n="documents.overlapHelp.noneTitle">🎯 No Overlap (0 chars)</strong>
+                                            </div>
+                                            <p data-i18n-html="documents.overlapHelp.noneBest"><strong>Best for:</strong> Maximum storage efficiency, no redundancy needed</p>
+                                            <p data-i18n-html="documents.overlapHelp.noneTradeoff"><strong>Trade-off:</strong> Context may be lost at chunk boundaries</p>
+                                        </div>
+
+                                        <div class="help-option">
+                                            <div class="help-option-header">
+                                                <strong data-i18n="documents.overlapHelp.mediumTitle">✅ Medium Overlap (200 chars)</strong>
+                                                <span class="help-tag" data-i18n="documents.chunkHelp.recommended">Recommended</span>
+                                            </div>
+                                            <p data-i18n-html="documents.overlapHelp.mediumBest"><strong>Best for:</strong> Most documents - balances context and efficiency</p>
+                                            <p data-i18n-html="documents.overlapHelp.mediumWhy"><strong>Why:</strong> Preserves 1-2 sentences of context across boundaries</p>
+                                        </div>
+
+                                        <div class="help-option">
+                                            <div class="help-option-header">
+                                                <strong data-i18n="documents.overlapHelp.highTitle">🔄 High Overlap (400+ chars)</strong>
+                                            </div>
+                                            <p data-i18n-html="documents.overlapHelp.highBest"><strong>Best for:</strong> Complex technical content requiring maximum context</p>
+                                            <p data-i18n-html="documents.overlapHelp.highTradeoff"><strong>Trade-off:</strong> More storage and processing, higher redundancy</p>
+                                        </div>
+                                    </div>
+
+                                    <div class="help-tips">
+                                        <strong data-i18n="documents.overlapHelp.tipsTitle">💡 Guidelines:</strong>
+                                        <ul>
+                                            <li data-i18n-html="documents.overlapHelp.tipRule"><strong>Rule of thumb:</strong> Overlap should be 15-25% of chunk size</li>
+                                            <li data-i18n-html="documents.overlapHelp.tipSmall"><strong>Small chunks (500)</strong> → Use 100-150 overlap</li>
+                                            <li data-i18n-html="documents.overlapHelp.tipMedium"><strong>Medium chunks (1000)</strong> → Use 200-250 overlap</li>
+                                            <li data-i18n-html="documents.overlapHelp.tipLarge"><strong>Large chunks (2000)</strong> → Use 400-500 overlap</li>
+                                            <li data-i18n="documents.overlapHelp.tipAccuracy">Higher overlap helps with search accuracy but increases storage</li>
+                                            <li data-i18n="documents.overlapHelp.tipZero">Zero overlap is fine for well-structured documents with clear sections</li>
+                                        </ul>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Processing Mode Help Section (collapsible) -->
+                             <div id="processingModeHelpSection" class="chunking-help processing-mode-help" style="display: none;">
+                                 <div class="help-header">
+                                     <strong>⚙️ Processing Mode Options</strong>
+                                     <button class="close-help" data-action="hideProcessingModeHelp">×</button>
+                                 </div>
+                             <div class="help-content">
+                                     <p class="help-note" data-i18n-html="documents.processingHelp.note">
+                                         <strong>When uploading multiple files,</strong> choose how they should be processed.
+                                         Both modes apply the same tags to all files.
+                                     </p>
+
+                                     <div class="help-recommendations">
+                                         <div class="help-option">
+                                             <div class="help-option-header">
+                                                 <strong data-i18n="documents.processingHelp.batchTitle">📦 Batch Processing</strong>
+                                                 <span class="help-tag" data-i18n="documents.processingHelp.default">Default</span>
+                                             </div>
+                                             <p data-i18n-html="documents.processingHelp.batchWhat"><strong>What it does:</strong> Uploads all files together as one operation</p>
+                                             <p data-i18n-html="documents.processingHelp.batchBest"><strong>Best for:</strong> Similar files, fast bulk processing, when you want files grouped together</p>
+                                             <p data-i18n-html="documents.processingHelp.batchPros"><strong>Pros:</strong> Faster, simpler, single progress indicator</p>
+                                             <p data-i18n-html="documents.processingHelp.batchCons"><strong>Cons:</strong> One file failure can affect the whole batch</p>
+                                         </div>
+
+                                         <div class="help-option">
+                                             <div class="help-option-header">
+                                                 <strong data-i18n="documents.processingHelp.individualTitle">🔄 Individual Processing</strong>
+                                             </div>
+                                             <p data-i18n-html="documents.processingHelp.individualWhat"><strong>What it does:</strong> Uploads each file separately with individual API calls</p>
+                                             <p data-i18n-html="documents.processingHelp.individualBest"><strong>Best for:</strong> Mixed file types, when you want error isolation, or need individual progress tracking</p>
+                                             <p data-i18n-html="documents.processingHelp.individualPros"><strong>Pros:</strong> Better error handling, individual progress, more robust</p>
+                                             <p data-i18n-html="documents.processingHelp.individualCons"><strong>Cons:</strong> Slightly slower due to sequential processing</p>
+                                         </div>
+                                     </div>
+
+                                         <div class="help-tips">
+                                             <strong data-i18n="documents.processingHelp.tipsTitle">💡 When to choose each mode:</strong>
+                                             <ul>
+                                                 <li data-i18n-html="documents.processingHelp.tipBatch"><strong>Batch mode:</strong> When files are similar and you want them processed quickly together</li>
+                                                 <li data-i18n-html="documents.processingHelp.tipIndividual"><strong>Individual mode:</strong> When files might have different processing requirements or you want to ensure all files get processed even if some fail</li>
+                                                 <li data-i18n-html="documents.processingHelp.tipSingle"><strong>Single files:</strong> Always processed individually (no choice needed)</li>
+                                                 <li data-i18n="documents.processingHelp.tipTags">Both modes apply the same tags to all files</li>
+                                             </ul>
+                                         </div>
+                                 </div>
+                             </div>
+
+                             <div class="config-section">
+                                <label for="memoryType" data-i18n="documents.memoryTypeLabel">Memory Type</label>
+                                <select id="memoryType" class="form-control">
+                                    <option value="document" data-i18n="documents.memoryType.document">Document</option>
+                                    <option value="reference" data-i18n="documents.memoryType.reference">Reference</option>
+                                    <option value="note" data-i18n="documents.memoryType.note">Note</option>
+                                </select>
+                             </div>
+                        </div>
+
+                        <!-- Upload Button -->
+                        <div class="upload-actions">
+                            <button id="uploadBtn" class="btn btn-primary" disabled data-i18n="documents.upload">
+                                <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
+                                    <path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20Z"/>
+                                </svg>
+                                Upload & Ingest
+                            </button>
+                        </div>
+                    </section>
+
+                    <!-- Upload Queue/History Section -->
+                    <section class="documents-section">
+                        <h2 data-i18n="documents.historyTitle">📊 Upload History</h2>
+                        <div id="uploadHistory" class="upload-history">
+                            <div class="loading-spinner"></div>
+                            <p data-i18n="documents.historyLoading">Loading upload history...</p>
+                        </div>
+                    </section>
+
+                    <!-- Document Content Search Section -->
+                    <section class="documents-section">
+                        <h2 data-i18n="documents.searchTitle">🔍 Search Ingested Content</h2>
+                        <p class="section-description" data-i18n="documents.searchDesc">Search within your uploaded documents to verify content is indexed</p>
+                        <div class="doc-search-container">
+                            <input type="text"
+                                   id="docSearchInput"
+                                   class="search-input"
+                                   placeholder="Search for content within ingested documents..."
+                                   data-i18n-placeholder="documents.searchPlaceholder">
+                            <button id="docSearchBtn" class="btn btn-primary" data-i18n="documents.searchBtn">Search Documents</button>
+                        </div>
+                        <div id="docSearchResults" class="doc-search-results" style="display: none;">
+                            <div class="search-results-header">
+                                <h3>Search Results</h3>
+                                <span id="docSearchCount" class="results-count">0 results</span>
+                            </div>
+                            <div id="docSearchResultsList" class="search-results-list">
+                                <!-- Results will be populated here -->
+                            </div>
+                        </div>
+                    </section>
+                </div>
+            </div>
+
+            <!-- Other views (Browse, Manage, Analytics) will be added in subsequent phases -->
+            <div id="browseView" class="view-container">
+                <div class="view-header">
+                    <h2 data-i18n="browse.title">Browse by Tags</h2>
+                    <p data-i18n="browse.subtitle">Explore your memories organized by tags</p>
+                </div>
+
+                <div class="browse-content">
+                    <div id="tagsCloudContainer" class="tags-cloud">
+                        <!-- Dynamic tags will be loaded here -->
+                    </div>
+
+                    <div id="taggedMemoriesContainer" class="tagged-memories" style="display: none;">
+                        <div class="section-header">
+                            <h3 id="selectedTagTitle"><span data-i18n="browse.memoriesTagged">Memories tagged with:</span> <span id="selectedTagName"></span></h3>
+                            <button id="clearTagFilter" class="btn btn-secondary" data-i18n="browse.showAllTags">Show All Tags</button>
+                        </div>
+                        <div id="taggedMemoriesList" class="memory-grid">
+                            <!-- Filtered memories will be shown here -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Manage View -->
+            <div id="manageView" class="view-container">
+                <div class="manage-layout">
+                    <!-- Bulk Operations Section -->
+                    <section class="manage-section">
+                        <h2 data-i18n="manage.bulk.title">🧹 Bulk Operations</h2>
+                        <div class="bulk-ops-grid">
+                            <div class="bulk-op-card">
+                                <h3 data-i18n="manage.bulk.deleteTag.title">Delete by Tag</h3>
+                                <p data-i18n="manage.bulk.deleteTag.desc">Remove all memories with a specific tag</p>
+                                <div class="op-controls">
+                                    <select id="deleteTagSelect" class="form-control">
+                                        <option value="" data-i18n="manage.bulk.deleteTag.placeholder">Select tag...</option>
+                                    </select>
+                                    <button id="deleteByTagBtn" class="btn btn-danger" data-i18n="manage.bulk.delete">Delete</button>
+                                </div>
+                            </div>
+
+                            <div class="bulk-op-card">
+                                <h3 data-i18n="manage.bulk.cleanup.title">Cleanup Duplicates</h3>
+                                <p data-i18n="manage.bulk.cleanup.desc">Remove duplicate memories based on content</p>
+                                <div class="op-controls">
+                                    <button id="cleanupDuplicatesBtn" class="btn btn-warning" data-i18n="manage.bulk.cleanup.run">Run Cleanup</button>
+                                </div>
+                            </div>
+
+                            <div class="bulk-op-card">
+                                <h3 data-i18n="manage.bulk.deleteDate.title">Delete by Date</h3>
+                                <p data-i18n="manage.bulk.deleteDate.desc">Remove memories older than a specific date</p>
+                                <div class="op-controls">
+                                    <input type="date" id="deleteDateInput" class="form-control">
+                                    <button id="deleteByDateBtn" class="btn btn-danger" data-i18n="manage.bulk.delete">Delete</button>
+                                </div>
+                            </div>
+
+                            <div id="deleteUntaggedCard" class="bulk-op-card" style="display: none;">
+                                <h3 data-i18n="manage.bulk.deleteUntagged.title">Delete Untagged</h3>
+                                <p>Remove memories without any tags (<span id="untaggedCount">0</span> found)</p>
+                                <div class="op-controls">
+                                    <button id="deleteUntaggedBtn" class="btn btn-danger" data-i18n="manage.bulk.delete">Delete</button>
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+
+                    <!-- Tag Management Section -->
+                    <section class="manage-section">
+                        <h2 data-i18n="manage.tags.title">🏷️ Tag Management</h2>
+                        <div id="tagManagementContainer">
+                            <div class="loading-spinner"></div>
+                            <p data-i18n="manage.tags.loading">Loading tag statistics...</p>
+                        </div>
+                    </section>
+
+                    <!-- System Operations Section -->
+                    <section class="manage-section">
+                        <h2 data-i18n="manage.system.title">⚙️ System Maintenance</h2>
+                        <div class="system-ops-grid">
+                            <div class="system-op-card">
+                                <h3 data-i18n="manage.system.dbOpt.title">Database Optimization</h3>
+                                <p data-i18n="manage.system.dbOpt.desc">Optimize database performance</p>
+                                <button id="optimizeDbBtn" class="btn btn-secondary" disabled data-i18n="manage.system.dbOpt.btn">Optimize DB</button>
+                            </div>
+
+                            <div class="system-op-card">
+                                <h3 data-i18n="manage.system.rebuild.title">Rebuild Search Index</h3>
+                                <p data-i18n="manage.system.rebuild.desc">Rebuild search indexes for better performance</p>
+                                <button id="rebuildIndexBtn" class="btn btn-secondary" disabled data-i18n="manage.system.rebuild.btn">Rebuild Index</button>
+                            </div>
+                        </div>
+                    </section>
+                </div>
+            </div>
+
+            <!-- Analytics View -->
+            <div id="analyticsView" class="view-container">
+                <div class="analytics-layout">
+                    <!-- Key Metrics Cards -->
+                    <section class="analytics-section">
+                        <h2 data-i18n="analytics.keyMetrics">📊 Key Metrics</h2>
+                        <div class="metrics-grid">
+                            <div class="metric-card">
+                                <div class="metric-value" id="analyticsTotalMemories">-</div>
+                                <div class="metric-label" data-i18n="analytics.totalMemories">Total Memories</div>
+                            </div>
+                            <div class="metric-card">
+                                <div class="metric-value" id="analyticsThisWeek">-</div>
+                                <div class="metric-label" data-i18n="analytics.thisWeek">This Week</div>
+                            </div>
+                            <div class="metric-card">
+                                <div class="metric-value" id="analyticsUniqueTags">-</div>
+                                <div class="metric-label" data-i18n="analytics.uniqueTags">Unique Tags</div>
+                            </div>
+                            <div class="metric-card">
+                                <div class="metric-value" id="analyticsDbSize">-</div>
+                                <div class="metric-label" data-i18n="analytics.databaseSize">Database Size</div>
+                            </div>
+                        </div>
+                    </section>
+
+                    <!-- Charts Section -->
+                    <section class="analytics-section">
+                        <h2 data-i18n="analytics.trends">📈 Trends & Charts</h2>
+                        <div class="charts-grid">
+                            <div class="chart-card">
+                                <h3 data-i18n="analytics.growth">Memory Growth Over Time</h3>
+                                <div class="chart-controls">
+                                    <select id="growthPeriodSelect" class="form-control">
+                                        <option value="week" data-i18n="analytics.period.week">Last Week</option>
+                                        <option value="month" selected data-i18n="analytics.period.month">Last Month</option>
+                                        <option value="quarter" data-i18n="analytics.period.quarter">Last Quarter</option>
+                                        <option value="year" data-i18n="analytics.period.year">Last Year</option>
+                                    </select>
+                                </div>
+                                <div id="memoryGrowthChart" class="chart-container">
+                                    <div class="loading-spinner"></div>
+                                    <p data-i18n="analytics.loadingChart">Loading chart...</p>
+                                </div>
+                            </div>
+
+                            <div class="chart-card">
+                                <h3 data-i18n="analytics.tagUsage">Tag Usage Distribution</h3>
+                                <div id="tagUsageChart" class="chart-container">
+                                    <div class="loading-spinner"></div>
+                                    <p data-i18n="analytics.loadingChart">Loading chart...</p>
+                                </div>
+                            </div>
+
+                            <div class="chart-card">
+                                <h3 data-i18n="analytics.memoryTypes">Memory Types Distribution</h3>
+                                <div id="memoryTypesChart" class="chart-container">
+                                    <div class="loading-spinner"></div>
+                                    <p data-i18n="analytics.loadingChart">Loading chart...</p>
+                                </div>
+                            </div>
+
+                                    <div class="chart-card">
+                                    <h3 data-i18n="analytics.heatmap">Activity Heatmap</h3>
+                                    <div class="chart-controls">
+                                    <select id="heatmapPeriodSelect" class="form-control">
+                                    <option value="90" selected data-i18n="analytics.period.90d">Last 90 Days</option>
+                                    <option value="180" data-i18n="analytics.period.180d">Last 6 Months</option>
+                                    <option value="365" data-i18n="analytics.period.year">Last Year</option>
+                                        </select>
+                                        </div>
+                                        <div id="activityHeatmapChart" class="chart-container">
+                                            <div class="loading-spinner"></div>
+                                        <p data-i18n="analytics.loadingHeatmap">Loading heatmap...</p>
+                                    </div>
+                                    </div>
+                            </section>
+
+                            <!-- Knowledge Graph Section (v9.2.0) -->
+                            <section class="analytics-section">
+                                <h2 data-i18n="analytics.knowledgeGraph">🧬 Knowledge Graph</h2>
+                                <p class="section-description" data-i18n="analytics.knowledgeGraphDescription">Explore typed relationships between your memories</p>
+                                <div class="charts-grid">
+                                    <div class="chart-card">
+                                        <h3 data-i18n="analytics.relationshipTypes">Relationship Types</h3>
+                                        <div id="relationshipTypesChart" class="chart-container">
+                                            <div class="loading-spinner"></div>
+                                            <p data-i18n="analytics.loadingChart">Loading chart...</p>
+                                        </div>
+                                    </div>
+
+                                    <div class="chart-card graph-card-large">
+                                        <h3 data-i18n="analytics.graphVisualization">Interactive Graph Visualization</h3>
+                                        <div class="chart-controls">
+                                            <label for="graphLimitSelect">
+                                                <span data-i18n="analytics.graphNodes">Nodes:</span>
+                                                <select id="graphLimitSelect" class="form-control">
+                                                    <option value="100">100</option>
+                                                    <option value="250">250</option>
+                                                    <option value="500">500</option>
+                                                    <option value="1000" selected>1000</option>
+                                                    <option value="2500">2500</option>
+                                                    <option value="5000">5000</option>
+                                                    <option value="10000">All</option>
+                                                </select>
+                                            </label>
+                                            <label for="graphMinConnectionsSelect">
+                                                <span data-i18n="analytics.minConnections">Min Connections:</span>
+                                                <select id="graphMinConnectionsSelect" class="form-control">
+                                                    <option value="1" selected>1</option>
+                                                    <option value="2">2</option>
+                                                    <option value="3">3</option>
+                                                    <option value="5">5</option>
+                                                </select>
+                                            </label>
+                                            <button id="refreshGraphBtn" class="btn btn-secondary">
+                                                <svg width="16" height="16" fill="currentColor" viewBox="0 0 24 24">
+                                                    <path d="M17.65 6.35A7.958 7.958 0 0 0 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0 1 12 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/>
+                                                </svg>
+                                                <span data-i18n="analytics.refresh">Refresh</span>
+                                            </button>
+                                            <button id="graphDimensionBtn" class="btn btn-secondary" title="Toggle 3D / 2D rendering">
+                                                <span id="graphDimensionLabel">3D</span>
+                                            </button>
+                                            <button id="graphRotateBtn" class="btn btn-secondary" title="Pause / resume auto-rotation (3D only)">
+                                                <span id="graphRotateLabel">Pause</span>
+                                            </button>
+                                            <button id="graphFullscreenBtn" class="btn btn-secondary" title="Fullscreen Mode">
+                                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                    <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>
+                                                </svg>
+                                            </button>
+                                        </div>
+                                        <div class="graph-filter-bar">
+                                            <span class="graph-filter-label" data-i18n="analytics.filterByType">Filter by type:</span>
+                                            <div id="graphTypeFilterBar" class="graph-type-pills" title="Click a type to show/hide its nodes"></div>
+                                        </div>
+                                        <div id="graphVisualizationContainer" class="graph-container">
+                                            <div class="loading-spinner"></div>
+                                            <p data-i18n="analytics.loadingGraph">Loading graph...</p>
+                                        </div>
+                                        <div id="graphLegend" class="graph-legend">
+                                            <h4 data-i18n="analytics.legend">Legend</h4>
+                                            <div class="legend-section">
+                                                <span data-i18n="analytics.nodeColors">Node Colors:</span>
+                                                <div class="legend-items">
+                                                    <span class="legend-item"><span class="legend-color node-observation"></span> <span data-i18n="analytics.observation">Observation</span></span>
+                                                    <span class="legend-item"><span class="legend-color node-decision"></span> <span data-i18n="analytics.decision">Decision</span></span>
+                                                    <span class="legend-item"><span class="legend-color node-learning"></span> <span data-i18n="analytics.learning">Learning</span></span>
+                                                    <span class="legend-item"><span class="legend-color node-error"></span> <span data-i18n="analytics.error">Error</span></span>
+                                                    <span class="legend-item"><span class="legend-color node-other"></span> <span data-i18n="analytics.other">Other</span></span>
+                                                </div>
+                                            </div>
+                                            <div class="legend-section">
+                                                <span data-i18n="analytics.edgeTypes">Edge Types:</span>
+                                                <div class="legend-items">
+                                                    <span class="legend-item"><span class="legend-line edge-causes"></span> <span data-i18n="analytics.causes">causes</span></span>
+                                                    <span class="legend-item"><span class="legend-line edge-fixes"></span> <span data-i18n="analytics.fixes">fixes</span></span>
+                                                    <span class="legend-item"><span class="legend-line edge-related"></span> <span data-i18n="analytics.related">related</span></span>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </section>
+
+                            <!-- Detailed Analytics -->
+                            <section class="analytics-section">
+                            <h2 data-i18n="analytics.reports">📋 Detailed Reports</h2>
+                            <div class="reports-grid">
+                            <div class="report-card">
+                            <h3 data-i18n="analytics.topTags">Top Tags</h3>
+                            <div class="chart-controls">
+                            <select id="topTagsPeriodSelect" class="form-control">
+                            <option value="7d" data-i18n="analytics.period.7d">Last 7 Days</option>
+                            <option value="30d" selected data-i18n="analytics.period.30d">Last 30 Days</option>
+                            <option value="90d" data-i18n="analytics.period.90d">Last 90 Days</option>
+                            <option value="all" data-i18n="analytics.period.all">All Time</option>
+                            </select>
+                            </div>
+                            <div id="topTagsList" class="report-content">
+                                     <div class="loading-spinner"></div>
+                                     <p data-i18n="analytics.loading">Loading...</p>
+                                 </div>
+                             </div>
+
+                             <div class="report-card">
+                                 <h3 data-i18n="analytics.recentActivity">Recent Activity</h3>
+                                 <div class="chart-controls">
+                                     <select id="activityGranularitySelect" class="form-control">
+                                         <option value="hourly" data-i18n="analytics.granularity.hour">By Hour</option>
+                                         <option value="daily" selected data-i18n="analytics.granularity.day">By Day</option>
+                                         <option value="weekly" data-i18n="analytics.granularity.week">By Week</option>
+                                     </select>
+                                 </div>
+                                 <div id="recentActivityList" class="report-content">
+                                     <div class="loading-spinner"></div>
+                                     <p data-i18n="analytics.loading">Loading...</p>
+                                 </div>
+                             </div>
+
+                             <div class="report-card">
+                                 <h3 data-i18n="analytics.storage">Storage Report</h3>
+                                 <div id="storageReport" class="report-content">
+                                     <div class="loading-spinner"></div>
+                                     <p data-i18n="analytics.loading">Loading...</p>
+                                 </div>
+                             </div>
+                         </div>
+                     </section>
+                </div>
+            </div>
+
+            <!-- Quality Analytics View -->
+            <div id="qualityAnalyticsView" class="view-container">
+                <div class="quality-analytics-section">
+                    <h2 data-i18n="quality.analytics.title">⭐ Memory Quality Analytics</h2>
+                    <p data-i18n="quality.analytics.subtitle">Track and improve your memory quality with AI-powered scoring</p>
+
+                    <!-- Quality Distribution Summary -->
+                    <div class="quality-summary">
+                        <div class="stat-card">
+                            <div class="stat-value" id="quality-total-memories">-</div>
+                            <div class="stat-label" data-i18n="quality.stats.total">Total Memories</div>
+                        </div>
+
+                        <div class="stat-card stat-high">
+                            <div class="stat-value" id="quality-high-count">-</div>
+                            <div class="stat-label" data-i18n="quality.stats.high">High Quality (≥0.7)</div>
+                        </div>
+
+                        <div class="stat-card stat-medium">
+                            <div class="stat-value" id="quality-medium-count">-</div>
+                            <div class="stat-label" data-i18n="quality.stats.medium">Medium (0.5-0.7)</div>
+                        </div>
+
+                        <div class="stat-card stat-low">
+                            <div class="stat-value" id="quality-low-count">-</div>
+                            <div class="stat-label" data-i18n="quality.stats.low">Low (<0.5)</div>
+                        </div>
+
+                        <div class="stat-card">
+                            <div class="stat-value" id="quality-average-score">-</div>
+                            <div class="stat-label" data-i18n="quality.stats.average">Average Score</div>
+                        </div>
+                    </div>
+
+                    <!-- Distribution Chart -->
+                    <div class="chart-container">
+                        <h3 data-i18n="quality.chart.distribution.title">Quality Score Distribution</h3>
+                        <canvas id="quality-distribution-chart"></canvas>
+                    </div>
+
+                    <!-- Provider Breakdown -->
+                    <div class="chart-container">
+                        <h3 data-i18n="quality.chart.providers.title">Scoring Provider Breakdown</h3>
+                        <canvas id="quality-provider-chart"></canvas>
+                    </div>
+
+                    <!-- Top Performers -->
+                    <div class="top-performers">
+                        <h3 data-i18n="quality.top.title">🏆 Top Quality Memories</h3>
+                        <div id="quality-top-memories-list"></div>
+                    </div>
+
+                    <!-- Bottom Performers (for improvement) -->
+                    <div class="bottom-performers">
+                        <h3 data-i18n="quality.bottom.title">📈 Memories for Improvement</h3>
+                        <div id="quality-bottom-memories-list"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- API Documentation View -->
+            <div id="apiDocsView" class="view-container">
+                <div class="api-docs-header">
+                    <h2 data-i18n="api.title">🔗 API Documentation</h2>
+                    <p data-i18n="api.subtitle">Comprehensive REST API endpoints for MCP Memory Service</p>
+                    <div class="api-docs-links">
+                        <a href="/api/docs" target="_blank" class="btn btn-primary" data-i18n="api.link.swagger">
+                            <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
+                                <path d="M14,17H7V15H14M17,13H7V11H17M17,9H7V7H17M19,3H5C3.89,3 3,3.89 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V5C21,3.89 20.1,3 19,3Z"/>
+                            </svg>
+                            Interactive Swagger UI
+                        </a>
+                        <a href="/api/redoc" target="_blank" class="btn btn-secondary" data-i18n="api.link.redoc">
+                            <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
+                                <path d="M14,17H7V15H14M17,13H7V11H17M17,9H7V7H17M19,3H5C3.89,3 3,3.89 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V5C21,3.89 20.1,3 19,3Z"/>
+                            </svg>
+                            ReDoc Documentation
+                        </a>
+                        <a href="/api-overview" target="_blank" class="btn btn-secondary" data-i18n="api.link.overview">
+                            <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
+                                <path d="M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M12,4A8,8 0 0,1 20,12A8,8 0 0,1 12,20A8,8 0 0,1 4,12A8,8 0 0,1 12,4M11,16.5L18,9.5L16.59,8.09L11,13.67L7.91,10.59L6.5,12L11,16.5Z"/>
+                            </svg>
+                            API Overview Page
+                        </a>
+                    </div>
+                </div>
+
+                <div class="api-endpoints-grid">
+                    <!-- Memory Management -->
+                    <div class="endpoint-section">
+                        <h3 data-i18n="api.section.memory">💾 Memory Management</h3>
+                        <div class="endpoint-list">
+                            <div class="endpoint-item">
+                                <span class="method post">POST</span>
+                                <span class="path">/api/memories</span>
+                                <span class="description" data-i18n="api.memory.store">Store a new memory with automatic embedding generation</span>
+                            </div>
+                            <div class="endpoint-item">
+                                <span class="method get">GET</span>
+                                <span class="path">/api/memories</span>
+                                <span class="description" data-i18n="api.memory.list">List all memories with pagination support</span>
+                            </div>
+                            <div class="endpoint-item">
+                                <span class="method get">GET</span>
+                                <span class="path">/api/memories/{content_hash}</span>
+                                <span class="description" data-i18n="api.memory.get">Retrieve a specific memory by content hash</span>
+                            </div>
+                            <div class="endpoint-item">
+                                <span class="method delete">DELETE</span>
+                                <span class="path">/api/memories/{content_hash}</span>
+                                <span class="description" data-i18n="api.memory.delete">Delete a memory and its embeddings</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Search Operations -->
+                    <div class="endpoint-section">
+                        <h3 data-i18n="api.section.search">🔍 Search Operations</h3>
+                        <div class="endpoint-list">
+                            <div class="endpoint-item">
+                                <span class="method post">POST</span>
+                                <span class="path">/api/search</span>
+                                <span class="description" data-i18n="api.search.semantic">Semantic similarity search using embeddings</span>
+                            </div>
+                            <div class="endpoint-item">
+                                <span class="method post">POST</span>
+                                <span class="path">/api/search/by-tag</span>
+                                <span class="description" data-i18n="api.search.tag">Search memories by tags (AND/OR logic)</span>
+                            </div>
+                            <div class="endpoint-item">
+                                <span class="method post">POST</span>
+                                <span class="path">/api/search/by-time</span>
+                                <span class="description" data-i18n="api.search.time">Natural language time-based queries</span>
+                            </div>
+                            <div class="endpoint-item">
+                                <span class="method get">GET</span>
+                                <span class="path">/api/search/similar/{content_hash}</span>
+                                <span class="description" data-i18n="api.search.similar">Find memories similar to a specific one</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Real-time Events -->
+                    <div class="endpoint-section">
+                        <h3 data-i18n="api.section.events">📡 Real-time Events</h3>
+                        <div class="endpoint-list">
+                            <div class="endpoint-item">
+                                <span class="method get">GET</span>
+                                <span class="path">/api/events</span>
+                                <span class="description" data-i18n="api.events.stream">Subscribe to real-time memory events stream</span>
+                            </div>
+                            <div class="endpoint-item">
+                                <span class="method get">GET</span>
+                                <span class="path">/api/events/stats</span>
+                                <span class="description" data-i18n="api.events.stats">View SSE connection statistics</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Health & Status -->
+                    <div class="endpoint-section">
+                        <h3 data-i18n="api.section.health">🏥 Health & Status</h3>
+                        <div class="endpoint-list">
+                            <div class="endpoint-item">
+                                <span class="method get">GET</span>
+                                <span class="path">/api/health</span>
+                                <span class="description" data-i18n="api.health.quick">Quick health check endpoint</span>
+                            </div>
+                            <div class="endpoint-item">
+                                <span class="method get">GET</span>
+                                <span class="path">/api/health/detailed</span>
+                                <span class="description" data-i18n="api.health.detailed">Detailed health with database statistics</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+
+        <!-- Footer -->
+        <footer class="app-footer">
+            <div class="footer-content">
+                <div class="footer-section">
+                    <h4 data-i18n="footer.docs.title">Documentation</h4>
+                    <ul class="footer-links">
+                        <li><a href="https://codeberg.org/doobidoo/mcp-memory-service/wiki" target="_blank" rel="noopener" data-i18n="footer.docs.wiki">📚 Wiki Home</a></li>
+                        <li><a href="https://codeberg.org/doobidoo/mcp-memory-service/wiki/07-TROUBLESHOOTING" target="_blank" rel="noopener" data-i18n="footer.docs.troubleshoot">🔧 Troubleshooting Guide</a></li>
+                        <li><a href="https://codeberg.org/doobidoo/mcp-memory-service/wiki/07-TROUBLESHOOTING#backend-configuration-issues" target="_blank" rel="noopener" data-i18n="footer.docs.config">⚙️ Configuration Issues</a></li>
+                    </ul>
+                </div>
+
+                <div class="footer-section">
+                    <h4 data-i18n="footer.resources.title">Resources</h4>
+                    <ul class="footer-links">
+                        <li><a href="https://codeberg.org/doobidoo/mcp-memory-service" target="_blank" rel="noopener" data-i18n="footer.resources.repo">
+                            <svg width="16" height="16" fill="currentColor" viewBox="0 0 24 24">
+                                <path d="M2.6,10.59L8.38,4.8L10.07,6.5C9.83,7.35 10.22,8.28 11,8.73V14.27C10.4,14.61 10,15.26 10,16A2,2 0 0,0 12,18A2,2 0 0,0 14,16C14,15.26 13.6,14.61 13,14.27V9.41L15.07,11.5C15,11.65 15,11.82 15,12A2,2 0 0,0 17,14A2,2 0 0,0 19,12A2,2 0 0,0 17,10C16.82,10 16.65,10 16.5,10.07L13.93,7.5C14.19,6.57 13.71,5.55 12.78,5.16C12.35,5 11.9,4.96 11.5,5.07L9.8,3.38L10.59,2.6C11.37,1.81 12.63,1.81 13.41,2.6L21.4,10.59C22.19,11.37 22.19,12.63 21.4,13.41L13.41,21.4C12.63,22.19 11.37,22.19 10.59,21.4L2.6,13.41C1.81,12.63 1.81,11.37 2.6,10.59Z"/>
+                            </svg>
+                            Codeberg Repository
+                        </a></li>
+                        <li><a href="https://doobidoo.github.io" target="_blank" rel="noopener" data-i18n="footer.resources.portfolio">
+                            🌐 Portfolio
+                        </a></li>
+                        <li><a href="/api/docs" target="_blank" data-i18n="footer.resources.apiDoc">
+                            📖 API Documentation
+                        </a></li>
+                    </ul>
+                </div>
+
+                <div class="footer-section">
+                    <h4 data-i18n="footer.about.title">About</h4>
+                    <p class="footer-description" data-i18n="footer.about.desc">
+                        MCP Memory Service - Semantic memory management for AI assistants
+                    </p>
+                    <div class="footer-license">
+                        <svg width="16" height="16" fill="currentColor" viewBox="0 0 24 24">
+                            <path d="M14,17H7V15H14M17,13H7V11H17M17,9H7V7H17M19,3H5C3.89,3 3,3.89 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V5C21,3.89 20.1,3 19,3Z"/>
+                        </svg>
+                        <a href="https://codeberg.org/doobidoo/mcp-memory-service/src/branch/main/LICENSE" target="_blank" rel="noopener" data-i18n="footer.about.license">
+                            Licensed under Apache 2.0
+                        </a>
+                    </div>
+                    <div class="footer-copyright" data-i18n="footer.about.copyright">
+                        © 2024 Heinrich Krupp
+                    </div>
+                </div>
+            </div>
+        </footer>
+
+        <!-- Memory Detail Modal -->
+        <div id="memoryModal" class="modal-overlay">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3 id="modalTitle" data-i18n="modal.memoryDetails.title">Memory Details</h3>
+                    <button class="modal-close" aria-label="Close">
+                        <svg width="24" height="24" fill="currentColor" viewBox="0 0 24 24">
+                            <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
+                        </svg>
+                    </button>
+                </div>
+                <div class="modal-body">
+                    <div id="modalContent">
+                        <!-- Dynamic memory content -->
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-secondary" id="editMemoryBtn" data-i18n="modal.memoryDetails.edit">Edit</button>
+                    <button class="btn btn-danger" id="deleteMemoryBtn" data-i18n="modal.memoryDetails.delete">Delete</button>
+                    <button class="btn btn-primary" id="shareMemoryBtn" data-i18n="modal.memoryDetails.share">Share</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Fullscreen Graph Modal -->
+        <div id="graphFullscreenModal" class="modal-overlay" style="display: none;">
+            <div class="graph-fullscreen-content">
+                <div class="graph-fullscreen-header">
+                    <h3 data-i18n="analytics.graphVisualization">Interactive Graph Visualization</h3>
+                    <div class="graph-fullscreen-controls">
+                        <span id="graphFullscreenNodeCount" class="graph-node-count"></span>
+                        <button class="btn btn-secondary" id="graphFullscreenRotateBtn" title="Pause / resume rotation">
+                            <span id="graphFullscreenRotateLabel">Pause</span>
+                        </button>
+                        <button class="btn btn-secondary" id="graphFullscreenLegendBtn" title="Show / hide legend">Legend</button>
+                        <button class="btn btn-secondary" id="graphExitFullscreenBtn" title="Exit Fullscreen (Esc)">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"/>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+                <div id="graphFullscreenFilterBar" class="graph-type-pills graph-fullscreen-filters" title="Click a type to show/hide its nodes"></div>
+                <div id="graphFullscreenContainer"></div>
+                <div id="graphFullscreenLegend" class="graph-legend graph-legend-overlay"></div>
+            </div>
+        </div>
+
+        <!-- Add Memory Modal -->
+        <div id="addMemoryModal" class="modal-overlay">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3 data-i18n="modal.addMemory.title">Add New Memory</h3>
+                    <button class="modal-close" aria-label="Close">
+                        <svg width="24" height="24" fill="currentColor" viewBox="0 0 24 24">
+                            <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
+                        </svg>
+                    </button>
+                </div>
+                <div class="modal-body">
+                    <form id="addMemoryForm">
+                        <div class="form-group">
+                            <label for="memoryContent" data-i18n="modal.addMemory.contentLabel">Content</label>
+                            <textarea id="memoryContent" rows="6" data-i18n-placeholder="modal.addMemory.contentPlaceholder" placeholder="Enter your memory content..."></textarea>
+                        </div>
+                        <div class="form-group">
+                            <label for="memoryTags" data-i18n="modal.addMemory.tagsLabel">Tags (comma-separated)</label>
+                            <input type="text" id="memoryTags" data-i18n-placeholder="modal.addMemory.tagsPlaceholder" placeholder="e.g., coding, javascript, api">
+                        </div>
+                        <div class="form-group">
+                            <label for="memoryType" data-i18n="modal.addMemory.typeLabel">Type</label>
+                            <select id="memoryType">
+                                <option value="note" data-i18n="modal.addMemory.typeNote">Note</option>
+                                <option value="code" data-i18n="modal.addMemory.typeCode">Code</option>
+                                <option value="reference" data-i18n="modal.addMemory.typeReference">Reference</option>
+                                <option value="idea" data-i18n="modal.addMemory.typeIdea">Idea</option>
+                            </select>
+                        </div>
+                    </form>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-secondary" id="cancelAddBtn" data-i18n="modal.addMemory.cancel">Cancel</button>
+                    <button class="btn btn-primary" id="saveMemoryBtn" data-i18n="modal.addMemory.save">Save Memory</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Settings Modal -->
+        <div id="settingsModal" class="modal-overlay">
+            <div class="modal-content settings-modal-large">
+                <div class="modal-header">
+                    <h3 data-i18n="modal.settings.title">Settings</h3>
+                    <button class="modal-close" aria-label="Close">
+                        <svg width="24" height="24" fill="currentColor" viewBox="0 0 24 24">
+                            <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
+                        </svg>
+                    </button>
+                </div>
+
+                <!-- Tab Navigation -->
+                <div class="settings-tabs">
+                    <button class="settings-tab active" data-tab="preferences">Preferences</button>
+                    <button class="settings-tab" data-tab="credentials">Credentials</button>
+                    <button class="settings-tab" data-tab="environment">Environment</button>
+                    <button class="settings-tab" data-tab="system">System Info</button>
+                    <button class="settings-tab" data-tab="quality">Quality</button>
+                    <button class="settings-tab" data-tab="backup">Backup</button>
+                    <button class="settings-tab" data-tab="server">Server</button>
+                </div>
+
+                <div class="modal-body">
+                    <!-- Preferences Tab -->
+                    <div id="preferencesTab" class="settings-tab-content active">
+                        <form id="settingsForm">
+                        <h4 class="settings-section-heading" data-i18n="modal.settings.preferences">Preferences</h4>
+                        <div class="form-group">
+                            <label for="themeSelect" data-i18n="modal.settings.theme">Theme</label>
+                            <select id="themeSelect">
+                                <option value="light" data-i18n="modal.settings.themeLight">Light</option>
+                                <option value="dark" data-i18n="modal.settings.themeDark">Dark</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="viewDensity" data-i18n="modal.settings.viewDensity">View Density</label>
+                            <select id="viewDensity">
+                                <option value="comfortable" data-i18n="modal.settings.viewDensityComfortable">Comfortable</option>
+                                <option value="compact" data-i18n="modal.settings.viewDensityCompact">Compact</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="previewLines" data-i18n="modal.settings.previewLines">Memory Preview Lines</label>
+                            <input type="number" id="previewLines" min="1" max="10" value="3">
+                        </div>
+
+                        </form>
+                    </div>
+
+                    <!-- Environment Configuration Tab -->
+                    <div id="environmentTab" class="settings-tab-content" style="display: none;">
+                        <div class="env-config-header">
+                            <p class="env-config-description">
+                                View your current environment configuration.
+                                To change settings, edit your .env file and restart the server.
+                            </p>
+                            <button class="btn btn-secondary" id="copyEnvBtn">
+                                <svg width="16" height="16" fill="currentColor" viewBox="0 0 24 24">
+                                    <path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/>
+                                </svg>
+                                Copy Configuration
+                            </button>
+                        </div>
+
+                        <div id="envConfigContainer">
+                            <div class="loading-spinner"></div>
+                        </div>
+                    </div>
+
+                    <!-- System Info Tab -->
+                    <div id="systemTab" class="settings-tab-content" style="display: none;">
+                        <h4 class="settings-section-heading" style="margin-bottom: var(--space-4);" data-i18n="modal.settings.systemInfo">System Information</h4>
+                        <div class="system-info">
+                            <div class="info-row">
+                                <span class="info-label" data-i18n="modal.settings.version">Version:</span>
+                                <span class="info-value" id="settingsVersion" data-i18n="status.loading">Loading...</span>
+                            </div>
+                            <div class="info-row">
+                                <span class="info-label" data-i18n="modal.settings.storageBackend">Storage Backend:</span>
+                                <span class="info-value" id="settingsBackend" data-i18n="status.loading">Loading...</span>
+                            </div>
+                            <div class="info-row">
+                                <span class="info-label" data-i18n="modal.settings.primaryBackend">Primary Backend:</span>
+                                <span class="info-value" id="settingsPrimaryBackend" data-i18n="status.loading">Loading...</span>
+                            </div>
+                            <div class="info-row">
+                                <span class="info-label" data-i18n="modal.settings.embeddingModel">Embedding Model:</span>
+                                <span class="info-value" id="settingsEmbeddingModel" data-i18n="status.loading">Loading...</span>
+                            </div>
+                            <div class="info-row">
+                                <span class="info-label" data-i18n="modal.settings.embeddingDimensions">Embedding Dimensions:</span>
+                                <span class="info-value" id="settingsEmbeddingDim" data-i18n="status.loading">Loading...</span>
+                            </div>
+                            <div class="info-row">
+                                <span class="info-label" data-i18n="modal.settings.databaseSize">Database Size:</span>
+                                <span class="info-value" id="settingsDbSize" data-i18n="status.loading">Loading...</span>
+                            </div>
+                            <div class="info-row">
+                                <span class="info-label" data-i18n="modal.settings.totalMemories">Total Memories:</span>
+                                <span class="info-value" id="settingsTotalMemories" data-i18n="status.loading">Loading...</span>
+                            </div>
+                            <div class="info-row">
+                                <span class="info-label" data-i18n="modal.settings.uptime">Uptime:</span>
+                                <span class="info-value" id="settingsUptime" data-i18n="status.loading">Loading...</span>
+                            </div>
+                        </div>
+
+                        <div id="oauthStatusSection">
+                            <h4 class="settings-section-heading" style="margin-top: var(--space-6); margin-bottom: var(--space-4);" data-i18n="modal.settings.oauthStatus">OAuth Status</h4>
+                            <div class="system-info">
+                                <div class="info-row">
+                                    <span class="info-label" data-i18n="modal.settings.oauthEnabled">OAuth Enabled:</span>
+                                    <span class="info-value" id="settingsOAuthEnabled" data-i18n="status.loading">Loading...</span>
+                                </div>
+                                <div class="info-row" id="oauthBackendRow" style="display: none;">
+                                    <span class="info-label" data-i18n="modal.settings.oauthBackend">OAuth Backend:</span>
+                                    <span class="info-value" id="settingsOAuthBackend">-</span>
+                                </div>
+                                <div class="info-row" id="oauthClientsRow" style="display: none;">
+                                    <span class="info-label" data-i18n="modal.settings.oauthClients">Registered Clients:</span>
+                                    <span class="info-value" id="settingsOAuthClients">-</span>
+                                </div>
+                                <div class="info-row" id="oauthTokensRow" style="display: none;">
+                                    <span class="info-label" data-i18n="modal.settings.oauthTokens">Active Tokens:</span>
+                                    <span class="info-value" id="settingsOAuthTokens">-</span>
+                                </div>
+                            </div>
+                        </div>
+
+                    </div>
+
+                    <!-- Credentials Tab -->
+                    <div id="credentialsTab" class="settings-tab-content" style="display: none;">
+                        <h4 class="settings-section-heading">Cloudflare Credentials</h4>
+                        <p class="settings-description">Saved to <code>.env</code> — shared by the MCP server and HTTP server. A connection test is required before saving.</p>
+                        <div class="credentials-form">
+                            <div class="credential-field">
+                                <label for="cred-api-token">API Token</label>
+                                <div class="token-input-group">
+                                    <input type="password" id="cred-api-token" class="form-control" placeholder="Cloudflare API Token" autocomplete="off" spellcheck="false">
+                                    <button type="button" class="btn-icon toggle-reveal" data-target="cred-api-token" title="Show / Hide">&#128065;</button>
+                                </div>
+                                <small class="form-text">Required. Must have D1:Edit and Vectorize:Edit permissions.</small>
+                            </div>
+                            <div class="credential-field">
+                                <label for="cred-account-id">Account ID</label>
+                                <div class="token-input-group">
+                                    <input type="password" id="cred-account-id" class="form-control" placeholder="Cloudflare Account ID" autocomplete="off" spellcheck="false">
+                                    <button type="button" class="btn-icon toggle-reveal" data-target="cred-account-id" title="Show / Hide">&#128065;</button>
+                                </div>
+                            </div>
+                            <div class="credential-field">
+                                <label for="cred-d1-id">D1 Database ID</label>
+                                <input type="text" id="cred-d1-id" class="form-control" placeholder="D1 Database ID" autocomplete="off" spellcheck="false">
+                            </div>
+                            <div class="credential-field">
+                                <label for="cred-vectorize">Vectorize Index Name</label>
+                                <input type="text" id="cred-vectorize" class="form-control" placeholder="e.g. mcp-memory-index" autocomplete="off" spellcheck="false">
+                            </div>
+                        </div>
+                        <hr class="settings-divider">
+
+                        <h4 class="settings-section-heading">Sync Configuration</h4>
+                        <div class="credential-field">
+                            <label for="cred-sync-owner">Cloudflare Sync Owner</label>
+                            <select id="cred-sync-owner" class="form-select">
+                                <option value="http">HTTP server only (recommended)</option>
+                                <option value="both">Both servers</option>
+                                <option value="mcp">MCP server only</option>
+                            </select>
+                            <small class="form-text">
+                                <strong>HTTP server only</strong> — Claude Desktop uses SQLite-Vec directly (fast, no Cloudflare token needed there).
+                                The HTTP server handles all background sync via <code>.env</code>.<br>
+                                <strong>Both</strong> — each server maintains its own sync queue (legacy default).<br>
+                                <strong>MCP only</strong> — HTTP server skips sync, MCP server syncs.
+                            </small>
+                        </div>
+
+                        <div id="credTestResult" class="cred-test-result" style="display:none;"></div>
+                        <div class="credentials-actions">
+                            <button type="button" id="credTestBtn" class="btn btn-secondary">Test Connection</button>
+                            <button type="button" id="credSaveBtn" class="btn btn-primary" disabled>Save &amp; Restart</button>
+                        </div>
+                        <p class="settings-hint">&#8505;&#65039; Token shown as partial reveal. Use the &#128065; button to see the full value.</p>
+                    </div>
+
+                    <!-- Quality Tab -->
+                    <div id="qualityTab" class="settings-tab-content" style="display: none;">
+                        <h4 class="settings-section-heading" data-i18n="modal.settings.qualitySystem">Quality System</h4>
+                        <div class="quality-settings">
+                            <div class="setting-item">
+                                <label for="quality-provider" data-i18n="settings.quality.provider.label">AI Provider</label>
+                                <select id="quality-provider" class="form-select">
+                                    <option value="local" data-i18n="settings.quality.provider.local">Local SLM (Privacy Mode)</option>
+                                    <option value="groq" data-i18n="settings.quality.provider.groq">Groq API</option>
+                                    <option value="gemini" data-i18n="settings.quality.provider.gemini">Gemini API</option>
+                                    <option value="auto" data-i18n="settings.quality.provider.auto">Auto (All Available)</option>
+                                    <option value="none" data-i18n="settings.quality.provider.none">Implicit Only (No AI)</option>
+                                </select>
+                                <small class="form-text" data-i18n="settings.quality.provider.help">Local SLM provides zero-cost, privacy-preserving quality scoring</small>
+                            </div>
+                            <div class="setting-item">
+                                <label class="checkbox-label">
+                                    <input type="checkbox" id="quality-boost-enabled" checked>
+                                    <span data-i18n="settings.quality.boost.label">Enable Quality-Boosted Search</span>
+                                </label>
+                                <small class="form-text" data-i18n="settings.quality.boost.help">Rerank search results to prioritize high-quality memories</small>
+                            </div>
+                            <div class="setting-info">
+                                <div data-i18n="settings.quality.current.label">Current Provider:</div>
+                                <div id="current-provider-info" class="info-value">
+                                    <strong>Local SLM</strong> (ms-marco-MiniLM-L-6-v2)<br>
+                                    <span class="text-muted">Zero cost &bull; Full privacy &bull; 50-100ms latency</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Backup Tab -->
+                    <div id="backupTab" class="settings-tab-content" style="display: none;">
+                        <h4 class="settings-section-heading" data-i18n="modal.settings.backupRestore">Backup &amp; Restore</h4>
+                        <div class="backup-settings">
+                            <div class="info-row">
+                                <span class="info-label" data-i18n="modal.settings.lastBackup">Last Backup:</span>
+                                <span class="info-value" id="settingsLastBackup" data-i18n="modal.settings.never">Never</span>
+                            </div>
+                            <div class="info-row">
+                                <span class="info-label" data-i18n="modal.settings.backupCount">Backup Count:</span>
+                                <span class="info-value" id="settingsBackupCount">0</span>
+                            </div>
+                            <div class="info-row">
+                                <span class="info-label" data-i18n="modal.settings.nextScheduled">Next Scheduled:</span>
+                                <span class="info-value" id="settingsNextBackup">-</span>
+                            </div>
+                            <div class="backup-actions">
+                                <button type="button" id="backupNowButton" class="btn btn-sm btn-primary" data-i18n="modal.settings.backupNow" onclick="if(window.app) window.app.createBackup()">Create Backup Now</button>
+                                <button type="button" id="viewBackupsButton" class="btn btn-sm btn-secondary" data-i18n="modal.settings.viewBackups" onclick="if(window.app) window.app.openViewBackupsModal()">View Backups</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Server Tab -->
+                    <div id="serverTab" class="settings-tab-content" style="display: none;">
+                        <h4 class="settings-section-heading">Server Management</h4>
+                        <div class="server-management">
+                            <div class="info-row">
+                                <span class="info-label">Server PID:</span>
+                                <span class="info-value" id="settingsServerPid">-</span>
+                            </div>
+                            <div class="info-row">
+                                <span class="info-label">Platform:</span>
+                                <span class="info-value" id="settingsServerPlatform">-</span>
+                            </div>
+                            <div class="info-row">
+                                <span class="info-label">Update Available:</span>
+                                <span class="info-value" id="settingsUpdateAvailable">Not checked yet</span>
+                            </div>
+                            <div class="server-actions">
+                                <button type="button" id="checkUpdatesBtn" class="btn btn-sm btn-secondary">Check for Updates</button>
+                                <button type="button" id="updateServerBtn" class="btn btn-sm btn-primary" style="display:none;">Update &amp; Restart</button>
+                                <button type="button" id="restartServerBtn" class="btn btn-sm btn-warning">Restart Server</button>
+                            </div>
+                            <div id="serverActionStatus" class="server-action-status" style="display:none;">
+                                <div class="action-spinner"></div>
+                                <span id="serverActionText">Processing...</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-secondary" id="cancelSettingsBtn" data-i18n="modal.settings.cancel">Cancel</button>
+                    <button class="btn btn-primary" id="saveSettingsBtn" data-i18n="modal.settings.save">Save Settings</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- View Backups Modal -->
+        <div id="viewBackupsModal" class="modal-overlay">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3>Backup History</h3>
+                    <button class="modal-close" aria-label="Close">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <div id="backupsSummary" class="backup-summary"></div>
+                    <div id="backupsList" class="backups-list">
+                        <p class="loading-text">Loading backups...</p>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" onclick="if(window.app) window.app.closeModal(document.getElementById('viewBackupsModal'))">Close</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Loading Overlay -->
+        <div id="loadingOverlay" class="loading-overlay">
+            <div class="loading-spinner"></div>
+            <p data-i18n="status.loading">Loading...</p>
+        </div>
+
+        <!-- Server Restart Overlay -->
+        <div id="restartOverlay" class="restart-overlay" style="display:none;">
+            <div class="restart-content">
+                <div class="restart-spinner"></div>
+                <h3>Server Restarting...</h3>
+                <p id="restartStatus">Waiting for server to come back online...</p>
+                <p class="restart-countdown">Reconnecting in <span id="restartCountdown">5</span>s</p>
+            </div>
+        </div>
+
+        <!-- Toast Notifications -->
+        <div id="toastContainer" class="toast-container"></div>
+    </div>
+
+    <!-- Connection Status Indicator -->
+    <div id="connectionStatus" class="connection-status">
+        <div class="status-indicator"></div>
+        <span class="status-text" data-i18n="status.connected">Connected</span>
+    </div>
+
+    <!-- Memory Viewer Modal -->
+    <div id="memoryViewerModal" class="modal" style="display: none;">
+        <div class="modal-content memory-viewer-content">
+            <div class="modal-header">
+                <h2 data-i18n="modal.memoryViewer.title">📝 Document Memory Chunks</h2>
+                <button class="modal-close" data-action="closeMemoryViewer">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="document-info">
+                    <h3 id="memoryViewerFilename" data-i18n="status.loading">Loading...</h3>
+                    <p id="memoryViewerStats" class="text-muted">0 chunks found</p>
+                </div>
+                <div class="memory-chunks-container">
+                    <div id="memoryChunksList" class="memory-chunks-list">
+                        <!-- Chunks will be populated here -->
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" data-action="closeMemoryViewer" data-i18n="modal.memoryViewer.close">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Authentication Modal -->
+    <div id="authModal" class="modal-overlay">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>🔐 Authentication Required</h3>
+            </div>
+            <div class="modal-body">
+                <p>The dashboard requires authentication to access memory operations.</p>
+
+                <div class="auth-options">
+                    <div class="auth-option">
+                        <h4>API Key</h4>
+                        <input type="password" id="apiKeyInput" placeholder="Enter your API key" autocomplete="off" spellcheck="false" />
+                        <button id="authWithApiKey" class="btn btn-primary">Authenticate</button>
+                    </div>
+
+                    <div class="auth-option">
+                        <h4>OAuth</h4>
+                        <p>Use OAuth for team collaboration.</p>
+                        <button id="authWithOAuth" class="btn btn-secondary">Login with OAuth</button>
+                    </div>
+                </div>
+
+                <div class="auth-footer">
+                    <p><strong>For local development:</strong> Set <code>MCP_ALLOW_ANONYMOUS_ACCESS=true</code> in your environment. This grants full read+write access without credentials.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js?v=orrery-3d-poc12"></script>
+    <link rel="stylesheet" href="/static/style.css?v=orrery-3d-poc12">
+</body>
+</html>

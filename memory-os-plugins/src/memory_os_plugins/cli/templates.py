@@ -1,0 +1,47 @@
+"""Embedded template content for CLI commands.
+
+Templates are stored as string constants so they work reliably
+after ``pip install`` without depending on external file paths.
+"""
+
+from __future__ import annotations
+
+R2_SYNC_WORKFLOW = """\
+name: Sync Memories to R2
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "memories/**"
+
+permissions:
+  contents: read
+
+jobs:
+  sync-to-r2:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Sync memories to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          aws s3 sync memories/ s3://${{ secrets.R2_BUCKET_NAME }}/memories/ \\
+            --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com \\
+            --delete
+
+      - name: Upload README index
+        if: hashFiles('memories/README.md') != ''
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          aws s3 cp memories/README.md \\
+            s3://${{ secrets.R2_BUCKET_NAME }}/memories/README.md \\
+            --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+"""

@@ -1,0 +1,219 @@
+# Copyright 2024 Heinrich Krupp
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Base classes and interfaces for memory consolidation components."""
+
+import logging
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any
+
+from ..models.memory import Memory
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ConsolidationConfig:
+    """Configuration for consolidation operations."""
+
+    # Decay settings
+    decay_enabled: bool = True
+    retention_periods: dict[str, int] = field(
+        default_factory=lambda: {
+            # Base ontology types (from Phase 0 Ontology Foundation)
+            "decision": 365,  # Strategic choices, architecture decisions
+            "learning": 180,  # Insights, best practices, anti-patterns
+            "pattern": 90,  # Recurring issues, code smells, design patterns
+            "error": 30,  # Bugs, failures, exceptions
+            "observation": 30,  # Code edits, file access, searches, commands
+            # Legacy types for backward compatibility (mapped to new types)
+            "critical": 365,  # Maps to decision
+            "reference": 180,  # Maps to learning
+            "standard": 30,  # Maps to observation
+            "temporary": 7,  # Maps to observation (short-lived)
+        }
+    )
+
+    # Association settings
+    associations_enabled: bool = True
+    min_similarity: float = 0.45  # raw cosine ≈ -0.1 after (sim+1)/2 normalization
+    max_similarity: float = 0.7
+    max_pairs_per_run: int = 100
+
+    # Clustering settings
+    clustering_enabled: bool = True
+    min_cluster_size: int = 5
+    clustering_algorithm: str = "dbscan"  # 'dbscan', 'hierarchical'
+
+    # Compression settings
+    compression_enabled: bool = True
+    max_summary_length: int = 500
+    preserve_originals: bool = True
+
+    # Forgetting settings
+    forgetting_enabled: bool = True
+    relevance_threshold: float = 0.1
+    access_threshold_days: int = 90
+    archive_location: str | None = None
+
+    # Incremental consolidation settings
+    batch_size: int = 500  # Memories to process per consolidation run
+    incremental_mode: bool = True  # Enable oldest-first batch processing
+
+
+@dataclass
+class ConsolidationReport:
+    """Report of consolidation operations performed."""
+
+    time_horizon: str
+    start_time: datetime
+    end_time: datetime
+    memories_processed: int
+    associations_discovered: int = 0
+    clusters_created: int = 0
+    memories_compressed: int = 0
+    memories_archived: int = 0
+    errors: list[str] = field(default_factory=list)
+    performance_metrics: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class MemoryAssociation:
+    """Represents a discovered association between memories."""
+
+    source_memory_hashes: list[str]
+    similarity_score: float
+    connection_type: str
+    discovery_method: str
+    discovery_date: datetime
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class MemoryCluster:
+    """Represents a cluster of semantically related memories."""
+
+    cluster_id: str
+    memory_hashes: list[str]
+    centroid_embedding: list[float]
+    coherence_score: float
+    created_at: datetime
+    theme_keywords: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class ConsolidationBase(ABC):
+    """Abstract base class for consolidation components."""
+
+    def __init__(self, config: ConsolidationConfig):
+        self.config = config
+        self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
+
+    @abstractmethod
+    async def process(self, memories: list[Memory], *args, **kwargs) -> Any:
+        """Process the given memories and return results."""
+        pass
+
+    def _validate_memories(self, memories: list[Memory]) -> bool:
+        """Validate that memories list is valid for processing."""
+        if not memories:
+            self.logger.warning("Empty memories list provided")
+            return False
+
+        for memory in memories:
+            if not hasattr(memory, "content_hash") or not memory.content_hash:
+                self.logger.error(f"Memory missing content_hash: {memory}")
+                return False
+
+        return True
+
+    def _get_memory_age_days(
+        self, memory: Memory, reference_time: datetime | None = None
+    ) -> int:
+        """Get the age of a memory in days.
+
+        Uses the most recent of created_at and updated_at so that content updates
+        effectively 'renew' a memory's age for consolidation purposes (#606).
+        """
+        ref_time = reference_time or datetime.now(timezone.utc)
+        if ref_time.tzinfo is None:
+            ref_time = ref_time.replace(tzinfo=timezone.utc)
+
+        # Determine the best reference timestamp: max(created_at, updated_at)
+        reference_ts = max(
+            filter(None, (memory.created_at, memory.updated_at)), default=None
+        )
+
+        if reference_ts:
+            ref_dt = datetime.fromtimestamp(reference_ts, tz=timezone.utc)
+            return (ref_time - ref_dt).days
+        elif memory.timestamp:
+            ts = memory.timestamp
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            return (ref_time - ts).days
+        else:
+            self.logger.warning(f"Memory {memory.content_hash} has no timestamp")
+            return 0
+
+    def _extract_memory_type(self, memory: Memory) -> str:
+        """Extract the memory type, with fallback to 'standard'."""
+        return memory.memory_type or "standard"
+
+    def _is_protected_memory(self, memory: Memory) -> bool:
+        """Check if a memory is protected from consolidation operations.
+
+        Protected memories include:
+        - Memories with critical/important/reference/permanent tags
+        - Mistake notes with failure_count >= 3 (proven error patterns)
+        """
+        protected_tags = {"critical", "important", "reference", "permanent"}
+        if set(memory.tags).intersection(protected_tags):
+            return True
+
+        # Protect high-value mistake notes (recurring patterns)
+        if memory.memory_type == "mistake":
+            metadata = memory.metadata or {}
+            if isinstance(metadata, str) and metadata.strip():
+                import json
+
+                try:
+                    metadata = json.loads(metadata)
+                except (json.JSONDecodeError, TypeError):
+                    metadata = {}
+
+            if isinstance(metadata, dict) and metadata.get("failure_count", 0) >= 3:
+                return True
+
+        return False
+
+
+class ConsolidationError(Exception):
+    """Base exception for consolidation operations."""
+
+    pass
+
+
+class ConsolidationConfigError(ConsolidationError):
+    """Exception raised for configuration errors."""
+
+    pass
+
+
+class ConsolidationProcessingError(ConsolidationError):
+    """Exception raised during processing operations."""
+
+    pass

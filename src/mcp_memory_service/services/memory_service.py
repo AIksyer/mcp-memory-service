@@ -1,0 +1,1225 @@
+"""
+Memory Service - Shared business logic for memory operations.
+
+This service contains the shared business logic that was previously duplicated
+between mcp_server.py and server.py. It provides a single source of truth for
+all memory operations, eliminating the DRY violation and ensuring consistent behavior.
+"""
+
+import json
+import logging
+import math
+import re
+import sys
+from typing import Any
+
+# Pydantic v2.12 requires typing_extensions.TypedDict on Python < 3.12
+# See: https://errors.pydantic.dev/2.12/u/typed-dict-version
+if sys.version_info < (3, 12):
+    from typing_extensions import NotRequired, TypedDict
+else:
+    from typing import TypedDict
+
+    try:
+        from typing import NotRequired  # Python 3.11+
+    except ImportError:
+        from typing_extensions import NotRequired
+from datetime import datetime
+
+from ..config import (
+    CONTENT_PRESERVE_BOUNDARIES,
+    CONTENT_SPLIT_OVERLAP,
+    ENABLE_AUTO_SPLIT,
+    MCP_QUALITY_BOOST_ENABLED,
+)
+from ..models.memory import Memory
+from ..plugins import PluginContext, PluginRegistry
+from ..quality.async_scorer import async_scorer
+from ..storage.base import MemoryStorage
+from ..utils.content_splitter import split_content
+from ..utils.hashing import generate_content_hash
+
+logger = logging.getLogger(__name__)
+
+
+def _sanitize_log_value(value: str) -> str:
+    """Strip control characters from user-provided values before logging.
+
+    Prevents log injection via newlines, carriage returns, or other
+    control characters embedded in user input (CWE-117).
+    """
+    return value.replace("\n", "\\n").replace("\r", "\\r").replace("\x1b", "\\x1b")
+
+
+# Module-level constants for tag processing
+_MAX_JSON_LENGTH = 4096  # 4KB limit for tag JSON to prevent DoS
+_MAX_TAG_LENGTH = 100  # Maximum length for individual tags
+_MAX_TAGS_PER_MEMORY = 100  # Maximum number of tags per memory
+
+
+def normalize_tags(tags: str | list[str] | None) -> list[str]:
+    """
+    Normalize tags to a consistent list format.
+
+    Applies:
+    - Whitespace stripping
+    - Case normalization (lowercase)
+    - Deduplication
+    - Empty tag removal
+
+    Args:
+        tags: Tags in any supported format (None, string, comma-separated string, or list)
+
+    Returns:
+        List of tag strings, empty list if None or empty string
+    """
+    if tags is None:
+        return []
+
+    # Convert to list if string
+    if isinstance(tags, str):
+        if not tags.strip():
+            return []
+        # Handle JSON-encoded arrays (e.g. '["tag1", "tag2"]' from oneOf schemas)
+        stripped = tags.strip()
+        if stripped.startswith("["):
+            # Prevent DoS via large/deeply nested JSON strings
+            if len(stripped) > _MAX_JSON_LENGTH:
+                logger.warning(
+                    f"Tag JSON string exceeds {_MAX_JSON_LENGTH} bytes, treating as literal string"
+                )
+                tags = [stripped]
+            else:
+                try:
+                    parsed = json.loads(stripped)
+                    if isinstance(parsed, list):
+                        tags = [str(t) for t in parsed]
+                    else:
+                        tags = [stripped]
+                except (json.JSONDecodeError, ValueError, RecursionError):
+                    # RecursionError from deeply nested JSON like [[[[...]]]]
+                    tags = [stripped]
+        # Split by comma if present, otherwise single tag
+        elif "," in tags:
+            tags = [tag.strip() for tag in tags.split(",") if tag.strip()]
+        else:
+            tags = [tags.strip()]
+
+    # Case-normalize, deduplicate, remove empties, sanitize
+    normalized = []
+    seen_lower = set()
+
+    for tag in tags:
+        if not isinstance(tag, str):
+            continue
+
+        tag_stripped = tag.strip()
+        if not tag_stripped:
+            continue
+
+        # CRITICAL: Remove commas from tags to prevent LIKE-based search breakage.
+        # Tags are stored comma-separated in SQLite, so commas within tags would
+        # break the pattern matching logic: LIKE '%,tag,%'
+        # Replace commas with hyphens to preserve semantic meaning.
+        if "," in tag_stripped:
+            tag_stripped = tag_stripped.replace(",", "-")
+            logger.debug(
+                f"Removed comma from tag, replaced with hyphen: {_sanitize_log_value(tag_stripped)}"
+            )
+
+        # Enforce maximum tag length to prevent abuse
+        if len(tag_stripped) > _MAX_TAG_LENGTH:
+            logger.warning(
+                f"Tag exceeds {_MAX_TAG_LENGTH} characters, truncating: {_sanitize_log_value(tag_stripped[:50])}..."
+            )
+            tag_stripped = tag_stripped[:_MAX_TAG_LENGTH]
+
+        tag_lower = tag_stripped.lower()
+
+        # Skip if already seen (case-insensitive deduplication)
+        if tag_lower in seen_lower:
+            continue
+
+        seen_lower.add(tag_lower)
+        normalized.append(tag_lower)  # Store in lowercase
+
+    # Limit total number of tags to prevent DoS
+    if len(normalized) > _MAX_TAGS_PER_MEMORY:
+        logger.warning(
+            f"Too many tags ({len(normalized)}), limiting to {_MAX_TAGS_PER_MEMORY}"
+        )
+        normalized = normalized[:_MAX_TAGS_PER_MEMORY]
+
+    return normalized
+
+
+class MemoryResult(TypedDict):
+    """Type definition for memory operation results."""
+
+    content: str
+    content_hash: str
+    tags: list[str]
+    memory_type: str | None
+    metadata: dict[str, Any] | None
+    created_at: str
+    updated_at: str
+    created_at_iso: str
+    updated_at_iso: str
+
+
+# Store Memory Return Types
+class StoreMemorySingleSuccess(TypedDict):
+    """Return type for successful single memory storage."""
+
+    success: bool
+    memory: MemoryResult
+
+
+class StoreMemoryChunkedSuccess(TypedDict):
+    """Return type for successful chunked memory storage."""
+
+    success: bool
+    memories: list[MemoryResult]
+    total_chunks: int
+    original_hash: str
+    failed_chunks: NotRequired[int]  # Number of chunks that failed to store
+
+
+class StoreMemoryFailure(TypedDict):
+    """Return type for failed memory storage."""
+
+    success: bool
+    error: str
+
+
+# List Memories Return Types
+class ListMemoriesSuccess(TypedDict):
+    """Return type for successful memory listing."""
+
+    memories: list[MemoryResult]
+    page: int
+    page_size: int
+    total: int
+    has_more: bool
+
+
+class ListMemoriesError(TypedDict):
+    """Return type for failed memory listing."""
+
+    success: bool
+    error: str
+    memories: list[MemoryResult]
+    page: int
+    page_size: int
+
+
+# Retrieve Memories Return Types
+class RetrieveMemoriesSuccess(TypedDict):
+    """Return type for successful memory retrieval."""
+
+    memories: list[MemoryResult]
+    query: str
+    count: int
+
+
+class RetrieveMemoriesError(TypedDict):
+    """Return type for failed memory retrieval."""
+
+    memories: list[MemoryResult]
+    query: str
+    error: str
+
+
+# Search by Tag Return Types
+class SearchByTagSuccess(TypedDict):
+    """Return type for successful tag search."""
+
+    memories: list[MemoryResult]
+    tags: list[str]
+    match_type: str
+    count: int
+
+
+class SearchByTagError(TypedDict):
+    """Return type for failed tag search."""
+
+    memories: list[MemoryResult]
+    tags: list[str]
+    error: str
+
+
+# Delete Memory Return Types
+class DeleteMemorySuccess(TypedDict):
+    """Return type for successful memory deletion."""
+
+    success: bool
+    content_hash: str
+
+
+class DeleteMemoryFailure(TypedDict):
+    """Return type for failed memory deletion."""
+
+    success: bool
+    content_hash: str
+    error: str
+
+
+# Health Check Return Types
+class HealthCheckSuccess(TypedDict, total=False):
+    """Return type for successful health check."""
+
+    healthy: bool
+    storage_type: str
+    total_memories: int
+    last_updated: str
+    # Additional fields from storage stats (marked as not required via total=False)
+
+
+class HealthCheckFailure(TypedDict):
+    """Return type for failed health check."""
+
+    healthy: bool
+    error: str
+
+
+class MemoryService:
+    """
+    Shared service for memory operations with consistent business logic.
+
+    This service centralizes all memory-related business logic to ensure
+    consistent behavior across API endpoints and MCP tools, eliminating
+    code duplication and potential inconsistencies.
+    """
+
+    def __init__(self, storage: MemoryStorage):
+        self.storage = storage
+        self._plugin_registry = PluginRegistry(
+            PluginContext(storage=storage, service=self)
+        )
+        self._plugin_registry.discover_and_register()
+
+    async def list_memories(
+        self,
+        page: int = 1,
+        page_size: int = 10,
+        tag: str | None = None,
+        tags: list[str] | None = None,
+        tag_match: str = "any",
+        memory_type: str | None = None,
+        stale_days: int | None = None,
+        store: str | None = "default",
+    ) -> ListMemoriesSuccess | ListMemoriesError:
+        """
+        List memories with pagination and optional filtering.
+
+        This method provides database-level filtering for optimal performance,
+        avoiding the common anti-pattern of loading all records into memory.
+
+        Args:
+            page: Page number (1-based)
+            page_size: Number of memories per page
+            tag: Filter by specific tag (legacy, use tags instead)
+            tags: Filter by list of tags
+            tag_match: "any" to match ANY tag (OR), "all" to match ALL tags (AND)
+            memory_type: Filter by memory type
+            stale_days: Filter to memories not accessed in the last N days.
+                Uses COALESCE(last_accessed, created_at) for memories never read.
+
+        Returns:
+            Dictionary with memories and pagination info
+        """
+        try:
+            # Calculate offset for pagination
+            offset = (page - 1) * page_size
+
+            # Use database-level filtering for optimal performance
+            # Support both legacy single tag and new tags list
+            tags_list = tags if tags else ([tag] if tag else None)
+            memories = await self.storage.get_all_memories(
+                limit=page_size,
+                offset=offset,
+                memory_type=memory_type,
+                tags=tags_list,
+                tag_match=tag_match,
+                stale_days=stale_days,
+                store=store,
+            )
+
+            # Get accurate total count for pagination
+            total = await self.storage.count_all_memories(
+                memory_type=memory_type,
+                tags=tags_list,
+                tag_match=tag_match,
+                stale_days=stale_days,
+                store=store,
+            )
+
+            # Format results for API response
+            results = []
+            for memory in memories:
+                results.append(self._format_memory_response(memory))
+
+            total_pages = math.ceil(total / page_size) if page_size > 0 else 0
+
+            return {
+                "memories": results,
+                "page": page,
+                "page_size": page_size,
+                "total": total,
+                "total_pages": total_pages,
+                "has_more": offset + page_size < total,
+            }
+
+        except Exception as e:
+            logger.exception(f"Unexpected error listing memories: {e}")
+            return {
+                "success": False,
+                "error": f"Failed to list memories: {e!s}",
+                "memories": [],
+                "page": page,
+                "page_size": page_size,
+                "total": 0,
+                "total_pages": 0,
+                "has_more": False,
+            }
+
+    async def store_memory(
+        self,
+        content: str,
+        tags: str | list[str] | None = None,
+        memory_type: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        client_hostname: str | None = None,
+        conversation_id: str | None = None,
+        store: str = "default",
+    ) -> StoreMemorySingleSuccess | StoreMemoryChunkedSuccess | StoreMemoryFailure:
+        """
+        Store a new memory with validation and content processing.
+
+        Accepts tags in multiple formats for maximum flexibility:
+        - None → []
+        - "tag1,tag2,tag3" → ["tag1", "tag2", "tag3"]
+        - "single-tag" → ["single-tag"]
+        - ["tag1", "tag2"] → ["tag1", "tag2"]
+
+        Args:
+            content: The memory content
+            tags: Optional tags for the memory (string, comma-separated string, or list)
+            memory_type: Optional memory type classification
+            metadata: Optional additional metadata (can also contain tags)
+            client_hostname: Optional client hostname for source tagging
+            conversation_id: Optional conversation identifier. When supplied, semantic
+                deduplication is skipped so all turns of the same conversation
+                can be saved independently. Exact hash dedup is always preserved.
+
+        Returns:
+            Dictionary with operation result
+        """
+        try:
+            # Normalize tags from parameter (handles all formats)
+            final_tags = normalize_tags(tags)
+
+            # Extract and normalize metadata.tags if present
+            final_metadata = dict(metadata) if metadata else {}
+            if metadata and "tags" in metadata:
+                metadata_tags = normalize_tags(metadata.get("tags"))
+                # Merge with parameter tags (normalize_tags already deduplicates)
+                final_tags = normalize_tags(
+                    final_tags + metadata_tags
+                )  # Re-normalize after merge
+
+            # Strip keys that have dedicated Memory fields to prevent
+            # them leaking through **self.metadata in to_dict()
+            for key in ("tags", "type"):
+                final_metadata.pop(key, None)
+
+            # Apply hostname tagging if provided (for consistent source tracking)
+            if client_hostname:
+                source_tag = f"source:{client_hostname}"
+                if source_tag not in final_tags:
+                    final_tags.append(source_tag)
+                final_metadata["hostname"] = client_hostname
+
+            # Store conversation_id in metadata for future grouping/retrieval
+            skip_dedup = bool(conversation_id) or (memory_type == "session")
+            if conversation_id:
+                final_metadata["conversation_id"] = conversation_id
+
+            # Generate content hash for deduplication
+            content_hash = generate_content_hash(content)
+
+            # Fire before_store hook to allow plugins to modify tags/metadata
+            pre_store_dict = {
+                "content": content,
+                "content_hash": content_hash,
+                "tags": final_tags,
+                "memory_type": memory_type,
+                "metadata": final_metadata,
+            }
+            modified = await self._plugin_registry.fire("before_store", pre_store_dict)
+            if modified and isinstance(modified, dict):
+                if "tags" in modified:
+                    final_tags = modified["tags"]
+                if "metadata" in modified:
+                    final_metadata = modified["metadata"]
+
+            # Process content if auto-splitting is enabled and content exceeds max length
+            max_length = self.storage.max_content_length
+            if ENABLE_AUTO_SPLIT and max_length and len(content) > max_length:
+                # Split content into chunks
+                chunks = split_content(
+                    content,
+                    max_length=max_length,
+                    preserve_boundaries=CONTENT_PRESERVE_BOUNDARIES,
+                    overlap=CONTENT_SPLIT_OVERLAP,
+                )
+                stored_memories = []
+                failed_chunks = []
+
+                for i, chunk in enumerate(chunks):
+                    chunk_hash = generate_content_hash(chunk)
+                    chunk_metadata = final_metadata.copy()
+                    chunk_metadata["chunk_index"] = i
+                    chunk_metadata["total_chunks"] = len(chunks)
+                    chunk_metadata["original_hash"] = content_hash
+
+                    memory = Memory(
+                        content=chunk,
+                        content_hash=chunk_hash,
+                        tags=final_tags,
+                        memory_type=memory_type,
+                        metadata=chunk_metadata,
+                    )
+
+                    success, message = await self.storage.store(
+                        memory, skip_semantic_dedup=skip_dedup, store=store
+                    )
+                    if success:
+                        stored_memories.append(self._format_memory_response(memory))
+                        # Queue chunk for AI quality scoring if enabled
+                        if MCP_QUALITY_BOOST_ENABLED:
+                            try:
+                                await async_scorer.score_memory(
+                                    memory, query="", storage=self.storage
+                                )
+                            except Exception as e:
+                                logger.debug(
+                                    f"Background quality scoring for chunk failed silently: {e}"
+                                )
+                    else:
+                        failed_chunks.append({"index": i, "reason": message})
+
+                # If NO chunks were stored, return failure
+                if not stored_memories:
+                    reasons = ", ".join({fc["reason"] for fc in failed_chunks})
+                    return {
+                        "success": False,
+                        "error": f"Failed to store all {len(chunks)} chunks: {reasons}",
+                    }
+
+                # If SOME chunks were stored, return partial success
+                for mem_dict in stored_memories:
+                    await self._plugin_registry.fire("on_store", mem_dict)
+
+                return {
+                    "success": True,
+                    "memories": stored_memories,
+                    "total_chunks": len(chunks),
+                    "original_hash": content_hash,
+                    "failed_chunks": len(failed_chunks),
+                }
+            else:
+                # Store as single memory
+                memory = Memory(
+                    content=content,
+                    content_hash=content_hash,
+                    tags=final_tags,
+                    memory_type=memory_type,
+                    metadata=final_metadata,
+                )
+
+                success, message = await self.storage.store(
+                    memory, skip_semantic_dedup=skip_dedup, store=store
+                )
+
+                if success:
+                    # Queue for AI quality scoring if enabled
+                    if MCP_QUALITY_BOOST_ENABLED:
+                        try:
+                            await async_scorer.score_memory(
+                                memory, query="", storage=self.storage
+                            )
+                        except Exception as e:
+                            logger.debug(
+                                f"Background quality scoring queued (or failed silently): {e}"
+                            )
+
+                    # Entity linking: extract entities and create shares_entity edges
+                    await self._maybe_link_entities(memory)
+
+                    await self._plugin_registry.fire(
+                        "on_store", self._format_memory_response(memory)
+                    )
+
+                    return {
+                        "success": True,
+                        "memory": self._format_memory_response(memory),
+                    }
+                else:
+                    return {"success": False, "error": message}
+
+        except ValueError as e:
+            # Handle validation errors specifically
+            logger.warning(f"Validation error storing memory: {e}")
+            return {"success": False, "error": f"Invalid memory data: {e!s}"}
+        except ConnectionError as e:
+            # Handle storage connectivity issues
+            logger.error(f"Storage connection error: {e}")
+            return {"success": False, "error": f"Storage connection failed: {e!s}"}
+        except Exception as e:
+            # Handle unexpected errors
+            logger.exception(f"Unexpected error storing memory: {e}")
+            return {"success": False, "error": f"Failed to store memory: {e!s}"}
+
+    async def retrieve_memories(
+        self,
+        query: str,
+        n_results: int = 10,
+        tags: list[str] | None = None,
+        memory_type: str | None = None,
+    ) -> RetrieveMemoriesSuccess | RetrieveMemoriesError:
+        """
+        Retrieve memories by semantic search with optional filtering.
+
+        Args:
+            query: Search query string
+            n_results: Maximum number of results
+            tags: Optional tag filtering
+            memory_type: Optional memory type filtering
+
+        Returns:
+            Dictionary with search results
+        """
+        try:
+            # Retrieve memories using semantic search
+            # Note: storage.retrieve() only supports query and n_results
+            # We'll filter by tags/type after retrieval if needed
+            memories = await self.storage.retrieve(query=query, n_results=n_results)
+
+            # Apply optional post-filtering
+            filtered_memories = memories
+            if tags or memory_type:
+                filtered_memories = []
+                for query_result in memories:
+                    # Filter by tags if specified
+                    if tags:
+                        memory_tags = query_result.memory.tags or []
+                        if not any(tag in memory_tags for tag in tags):
+                            continue
+
+                    # Filter by memory_type if specified
+                    if memory_type:
+                        mem_type = query_result.memory.memory_type or ""
+                        if mem_type != memory_type:
+                            continue
+
+                    filtered_memories.append(query_result)
+
+            results = []
+            for result in filtered_memories:
+                # Extract Memory object from MemoryQueryResult and add similarity score
+                memory_dict = self._format_memory_response(result.memory)
+                memory_dict["similarity_score"] = result.relevance_score
+                results.append(memory_dict)
+
+                # Queue for background AI quality scoring if enabled
+                if MCP_QUALITY_BOOST_ENABLED:
+                    try:
+                        await async_scorer.score_memory(
+                            result.memory, query=query, storage=self.storage
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            f"Background quality scoring for retrieved memory failed silently: {e}"
+                        )
+
+            modified = await self._plugin_registry.fire("on_retrieve", query, results)
+            if isinstance(modified, list):
+                results = modified
+
+            return {"memories": results, "query": query, "count": len(results)}
+
+        except Exception as e:
+            logger.error(f"Error retrieving memories: {e}")
+            return {
+                "memories": [],
+                "query": query,
+                "error": f"Failed to retrieve memories: {e!s}",
+            }
+
+    async def search_by_tag(
+        self, tags: str | list[str], match_all: bool = False
+    ) -> SearchByTagSuccess | SearchByTagError:
+        """
+        Search memories by tags with flexible matching options.
+
+        Args:
+            tags: Tag or list of tags to search for
+            match_all: If True, memory must have ALL tags; if False, ANY tag
+
+        Returns:
+            Dictionary with matching memories
+        """
+        try:
+            # Normalize tags to list (handles all formats including comma-separated)
+            tags = normalize_tags(tags)
+
+            # Search using database-level filtering
+            # Note: Using search_by_tag from base class (singular)
+            memories = await self.storage.search_by_tag(tags=tags)
+
+            # Format results
+            results = []
+            for memory in memories:
+                results.append(self._format_memory_response(memory))
+
+            # Determine match type description
+            match_type = "ALL" if match_all else "ANY"
+
+            return {
+                "memories": results,
+                "tags": tags,
+                "match_type": match_type,
+                "count": len(results),
+            }
+
+        except Exception as e:
+            logger.error(f"Error searching by tags: {e}")
+            return {
+                "memories": [],
+                "tags": tags if isinstance(tags, list) else [tags],
+                "error": f"Failed to search by tags: {e!s}",
+            }
+
+    async def get_memory_by_hash(self, content_hash: str) -> dict[str, Any]:
+        """
+        Retrieve a specific memory by its content hash using O(1) direct lookup.
+
+        Args:
+            content_hash: The content hash of the memory
+
+        Returns:
+            Dictionary with memory data or error
+        """
+        try:
+            # Use direct O(1) lookup via storage.get_by_hash()
+            memory = await self.storage.get_by_hash(content_hash)
+
+            if memory:
+                return {"memory": self._format_memory_response(memory), "found": True}
+            else:
+                return {"found": False, "content_hash": content_hash}
+
+        except Exception as e:
+            logger.error(f"Error getting memory by hash: {e}")
+            return {
+                "found": False,
+                "content_hash": content_hash,
+                "error": f"Failed to get memory: {e!s}",
+            }
+
+    async def delete_memory(
+        self, content_hash: str
+    ) -> DeleteMemorySuccess | DeleteMemoryFailure:
+        """
+        Delete a memory by its content hash.
+
+        Args:
+            content_hash: The content hash of the memory to delete
+
+        Returns:
+            Dictionary with operation result
+        """
+        try:
+            success, message = await self.storage.delete(content_hash)
+            if success:
+                await self._plugin_registry.fire("on_delete", content_hash)
+                return {"success": True, "content_hash": content_hash}
+            else:
+                return {
+                    "success": False,
+                    "content_hash": content_hash,
+                    "error": message,
+                }
+
+        except Exception as e:
+            logger.error(f"Error deleting memory: {e}")
+            return {
+                "success": False,
+                "content_hash": content_hash,
+                "error": f"Failed to delete memory: {e!s}",
+            }
+
+    async def health_check(self) -> HealthCheckSuccess | HealthCheckFailure:
+        """
+        Perform a health check on the memory storage system.
+
+        Returns:
+            Dictionary with health status and statistics
+        """
+        try:
+            stats = await self.storage.get_stats()
+            return {
+                "healthy": True,
+                "storage_type": stats.get("backend", "unknown"),
+                "total_memories": stats.get("total_memories", 0),
+                "last_updated": datetime.now().isoformat(),
+                **stats,
+            }
+
+        except Exception as e:
+            logger.error(f"Health check failed: {e}")
+            return {"healthy": False, "error": f"Health check failed: {e!s}"}
+
+    async def _maybe_link_entities(self, memory: Memory) -> None:
+        """Extract entities and create shares_entity edges if linking is enabled."""
+        from ..reasoning.entity_linker import EntityLinker, is_entity_linking_enabled
+
+        if not is_entity_linking_enabled():
+            return
+
+        try:
+            from ..reasoning.entities import EntityExtractor
+            from ..server.handlers.graph import get_graph_storage
+
+            graph = await get_graph_storage()
+            if not graph:
+                return
+
+            extractor = EntityExtractor(
+                domain_extractors=EntityExtractor.get_domain_extractors()
+            )
+            entities = extractor.extract_entities(memory.content, memory.metadata)
+            if not entities:
+                return
+
+            # Store entity links (has_entity edges)
+            entity_names = []
+            for ent in entities:
+                await graph.store_entity_link(
+                    memory.content_hash, ent.name, ent.entity_type
+                )
+                entity_names.append(ent.name)
+
+            # Create shares_entity edges between memories with common entities
+            linker = EntityLinker()
+            await linker.link_by_entities(memory.content_hash, entity_names, graph)
+        except Exception as e:
+            logger.debug(f"Entity linking failed silently: {e}")
+
+    def _format_memory_response(self, memory: Memory) -> MemoryResult:
+        """
+        Format a memory object for API response.
+
+        Args:
+            memory: The memory object to format
+
+        Returns:
+            Formatted memory dictionary
+        """
+        return {
+            "content": memory.content,
+            "content_hash": memory.content_hash,
+            "tags": memory.tags,
+            "memory_type": memory.memory_type,
+            "metadata": memory.metadata,
+            "created_at": memory.created_at,
+            "updated_at": memory.updated_at,
+            "created_at_iso": memory.created_at_iso,
+            "updated_at_iso": memory.updated_at_iso,
+        }
+
+    # ─── Mistake Notes ────────────────────────────────────────────────
+
+    async def mistake_note_add(
+        self,
+        error_pattern: str,
+        context_signature: str,
+        incorrect_action: str,
+        correct_action: str,
+    ) -> dict[str, Any]:
+        """
+        Record a mistake pattern for error replay.
+
+        Stores as a regular memory with memory_type='mistake'. If a similar
+        pattern already exists (above dedup threshold), increments failure_count
+        instead of creating a duplicate.
+
+        Args:
+            error_pattern: The error pattern or message
+            context_signature: Context where the error occurred
+            incorrect_action: What was done incorrectly
+            correct_action: What should have been done instead
+
+        Returns:
+            Dictionary with operation result
+        """
+        import os
+
+        from ..config import MCP_MISTAKE_NOTE_DEDUP_THRESHOLD
+
+        # A mistake note's value is its remediation. Reject empty correct_action —
+        # JSON-schema `required` enforces presence, not non-emptiness (issue #1055).
+        if not (correct_action or "").strip():
+            return {
+                "status": "error",
+                "message": "correct_action must not be empty — a mistake note requires a remediation, not just an error pattern",
+            }
+
+        ERROR_WEIGHT = float(os.getenv("MCP_ERROR_WEIGHT", "3.0"))
+        LEARNING_RATE = float(os.getenv("MCP_LEARNING_RATE", "0.1"))
+        FRUSTRATION_THRESHOLD = float(os.getenv("MCP_FRUSTRATION_THRESHOLD", "5.0"))
+
+        content = (
+            f"Pattern: {error_pattern}\n"
+            f"Context: {context_signature}\n"
+            f"Wrong: {incorrect_action}\n"
+            f"Right: {correct_action}"
+        )
+
+        try:
+            # Check for existing similar mistake note
+            existing = await self.retrieve_memories(
+                query=f"{error_pattern} {context_signature}",
+                n_results=3,
+                memory_type="mistake",
+            )
+
+            if existing.get("memories"):
+                for mem in existing["memories"]:
+                    score = mem.get("similarity_score", 0)
+                    if score >= MCP_MISTAKE_NOTE_DEDUP_THRESHOLD:
+                        # Increment failure_count on existing note
+                        content_hash = mem["content_hash"]
+                        old_meta = mem.get("metadata") or {}
+                        if isinstance(old_meta, str):
+                            old_meta = json.loads(old_meta) if old_meta else {}
+                        count = old_meta.get("failure_count", 1) + 1
+                        old_meta["failure_count"] = count
+
+                        # P4: Update confidence and frustration
+                        old_meta["confidence"] = min(
+                            1.0,
+                            old_meta.get("confidence", 0.5)
+                            + LEARNING_RATE * ERROR_WEIGHT,
+                        )
+                        old_meta["frustration_score"] = (
+                            old_meta.get("frustration_score", 0.0) + 1.0
+                        )
+                        old_meta["is_avoid_rule"] = (
+                            old_meta["frustration_score"] >= FRUSTRATION_THRESHOLD
+                        )
+
+                        await self.storage.update_memory_metadata(
+                            content_hash=content_hash,
+                            updates={"metadata": old_meta},
+                            preserve_timestamps=False,
+                        )
+                        return {
+                            "status": "updated",
+                            "content_hash": content_hash,
+                            "failure_count": count,
+                            "message": f"Existing mistake note updated (seen {count} times)",
+                        }
+
+            # No match — store new mistake note with initial confidence/frustration
+            initial_meta = {
+                "failure_count": 1,
+                "confidence": 0.5,
+                "frustration_score": 1.0,
+                "is_avoid_rule": False,
+            }
+            result = await self.store_memory(
+                content=content,
+                tags="mistake-note,error-replay",
+                memory_type="mistake",
+                metadata=initial_meta,
+            )
+
+            if not result.get("success"):
+                # Handle race condition: store's semantic dedup rejected, but we can
+                # still increment the existing note it found (#1034)
+                error_msg = str(result.get("error", ""))
+                existing_hash = None
+                match = re.search(
+                    r"semantically similar to ([a-f0-9]+)", error_msg, re.IGNORECASE
+                )
+                if match:
+                    existing_hash = match.group(1)
+                elif "exact match" in error_msg.lower():
+                    # Compute hash from content for exact match case
+                    from ..utils.hashing import generate_content_hash
+
+                    existing_hash = generate_content_hash(content)
+
+                if existing_hash:
+                    existing = await self.storage.get_by_hash(existing_hash)
+                    if existing:
+                        old_meta = existing.metadata or {}
+                        if isinstance(old_meta, str):
+                            old_meta = json.loads(old_meta) if old_meta else {}
+                        count = old_meta.get("failure_count", 1) + 1
+                        old_meta["failure_count"] = count
+                        old_meta["confidence"] = min(
+                            1.0,
+                            old_meta.get("confidence", 0.5)
+                            + LEARNING_RATE * ERROR_WEIGHT,
+                        )
+                        old_meta["frustration_score"] = (
+                            old_meta.get("frustration_score", 0.0) + 1.0
+                        )
+                        old_meta["is_avoid_rule"] = (
+                            old_meta["frustration_score"] >= FRUSTRATION_THRESHOLD
+                        )
+                        await self.storage.update_memory_metadata(
+                            content_hash=existing_hash,
+                            updates={"metadata": old_meta},
+                            preserve_timestamps=False,
+                        )
+                        return {
+                            "status": "updated",
+                            "content_hash": existing_hash,
+                            "failure_count": count,
+                            "message": f"Existing mistake note updated (seen {count} times)",
+                        }
+                return {"status": "error", "message": f"Failed to store: {result}"}
+
+            content_hash = ""
+            if isinstance(result, dict):
+                mem = result.get("memory", {})
+                if isinstance(mem, dict):
+                    content_hash = mem.get("content_hash", "")
+                elif not content_hash:
+                    content_hash = result.get("content_hash", "")
+            return {
+                "status": "created",
+                "content_hash": content_hash,
+                "failure_count": 1,
+                "message": "New mistake note recorded",
+            }
+
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    async def mistake_note_search(
+        self,
+        query: str,
+        limit: int = 5,
+    ) -> dict[str, Any]:
+        """
+        Search mistake notes by semantic similarity.
+
+        Args:
+            query: Search query (error message, context, or task description)
+            limit: Maximum number of results
+
+        Returns:
+            Dictionary with matching mistake notes
+        """
+        try:
+            result = await self.retrieve_memories(
+                query=query,
+                n_results=limit,
+                memory_type="mistake",
+            )
+
+            notes = []
+            for mem in result.get("memories", []):
+                meta = mem.get("metadata") or {}
+                if isinstance(meta, str):
+                    meta = json.loads(meta) if meta else {}
+                notes.append(
+                    {
+                        "content_hash": mem["content_hash"],
+                        "content": mem["content"],
+                        "similarity": mem.get("similarity_score", 0),
+                        "failure_count": meta.get("failure_count", 1),
+                        "metadata": meta,
+                        "updated_at": mem.get("updated_at"),
+                    }
+                )
+
+            return {"notes": notes, "count": len(notes)}
+
+        except Exception as e:
+            return {"notes": [], "count": 0, "error": str(e)}
+
+    async def mistake_note_update(
+        self,
+        content_hash: str,
+        failure_count: int | None = None,
+        error_pattern: str | None = None,
+        context_signature: str | None = None,
+        incorrect_action: str | None = None,
+        correct_action: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Update fields of an existing mistake note.
+
+        Args:
+            content_hash: Hash of the mistake note to update
+            failure_count: New failure count (optional)
+            error_pattern: Updated error pattern (optional)
+            context_signature: Updated context (optional)
+            incorrect_action: Updated incorrect action (optional)
+            correct_action: Updated correct action (optional)
+
+        Returns:
+            Dictionary with operation result
+        """
+        # Don't allow an existing note's remediation to be blanked (issue #1055).
+        if correct_action is not None and not correct_action.strip():
+            return {
+                "status": "error",
+                "message": "correct_action must not be empty — a mistake note requires a remediation, not just an error pattern",
+            }
+
+        try:
+            mem = await self.storage.get_by_hash(content_hash)
+            if not mem:
+                return {
+                    "status": "error",
+                    "message": f"No memory found with hash {content_hash}",
+                }
+
+            mem_type = getattr(mem, "memory_type", None) or (mem.metadata or {}).get(
+                "type"
+            )
+            if mem_type != "mistake":
+                return {
+                    "status": "error",
+                    "message": f"Memory {content_hash} is not a mistake note (type={mem_type})",
+                }
+
+            content_changed = any(
+                f is not None
+                for f in [
+                    error_pattern,
+                    context_signature,
+                    incorrect_action,
+                    correct_action,
+                ]
+            )
+
+            if content_changed:
+                # Content update requires delete + re-store (hash changes with content)
+                current = _parse_mistake_content(mem.content)
+                new_content = (
+                    f"Pattern: {error_pattern or current['error_pattern']}\n"
+                    f"Context: {context_signature or current['context_signature']}\n"
+                    f"Wrong: {incorrect_action or current['incorrect_action']}\n"
+                    f"Right: {correct_action or current['correct_action']}"
+                )
+                meta = mem.metadata if isinstance(mem.metadata, dict) else {}
+                if failure_count is not None:
+                    meta["failure_count"] = failure_count
+
+                # Store new version FIRST to prevent data loss if store fails
+                result = await self.store_memory(
+                    content=new_content,
+                    tags="mistake-note,error-replay",
+                    memory_type="mistake",
+                    metadata=meta,
+                )
+                if not (isinstance(result, dict) and result.get("success")):
+                    return {
+                        "status": "error",
+                        "message": f"Failed to store updated note: {result}",
+                    }
+
+                new_hash = ""
+                m = result.get("memory", {})
+                new_hash = m.get("content_hash", "") if isinstance(m, dict) else ""
+
+                # Only delete old after new is safely stored
+                await self.delete_memory(content_hash)
+                return {"status": "updated", "content_hash": new_hash or content_hash}
+
+            # Metadata-only update (failure_count)
+            if failure_count is not None:
+                meta = mem.metadata if isinstance(mem.metadata, dict) else {}
+                meta["failure_count"] = failure_count
+                success, msg = await self.storage.update_memory_metadata(
+                    content_hash=content_hash,
+                    updates={"metadata": meta},
+                    preserve_timestamps=False,
+                )
+                if not success:
+                    return {
+                        "status": "error",
+                        "message": f"Metadata update failed: {msg}",
+                    }
+                return {"status": "updated", "content_hash": content_hash}
+
+            return {"status": "error", "message": "No fields to update"}
+
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    async def mistake_note_delete(self, content_hash: str) -> dict[str, Any]:
+        """
+        Delete a mistake note by content hash.
+
+        Args:
+            content_hash: Hash of the mistake note to delete
+
+        Returns:
+            Dictionary with operation result
+        """
+        try:
+            mem = await self.storage.get_by_hash(content_hash)
+            if not mem:
+                return {
+                    "status": "error",
+                    "message": f"No memory found with hash {content_hash}",
+                }
+
+            mem_type = getattr(mem, "memory_type", None) or (mem.metadata or {}).get(
+                "type"
+            )
+            if mem_type != "mistake":
+                return {
+                    "status": "error",
+                    "message": f"Memory {content_hash} is not a mistake note (type={mem_type})",
+                }
+
+            result = await self.delete_memory(content_hash)
+            if not (isinstance(result, dict) and result.get("success")):
+                return {
+                    "status": "error",
+                    "message": f"Delete failed: {result.get('error', 'unknown')}",
+                }
+            return {"status": "deleted", "content_hash": content_hash}
+
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+
+def _parse_mistake_content(content: str) -> dict[str, str]:
+    """Parse structured mistake note content into fields."""
+    fields = {
+        "error_pattern": "",
+        "context_signature": "",
+        "incorrect_action": "",
+        "correct_action": "",
+    }
+    for line in content.split("\n"):
+        if line.startswith("Pattern: "):
+            fields["error_pattern"] = line[9:]
+        elif line.startswith("Context: "):
+            fields["context_signature"] = line[9:]
+        elif line.startswith("Wrong: "):
+            fields["incorrect_action"] = line[7:]
+        elif line.startswith("Right: "):
+            fields["correct_action"] = line[7:]
+    return fields

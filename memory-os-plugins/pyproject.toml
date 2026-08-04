@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "memory-os-plugins"
+version = "0.1.0"
+description = "Git sync and cloud backup plugins for mcp-memory-service"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "mcp-memory-service>=11.5.0",
+    "click>=8.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+r2 = [
+    "boto3>=1.34.0",
+]
+
+[project.entry-points."mcp_memory_service.plugins"]
+git_sync = "memory_os_plugins.git_sync.plugin:register"
+r2_backup = "memory_os_plugins.r2_backup.plugin:register"
+
+[project.scripts]
+memory-os = "memory_os_plugins.cli.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/memory_os_plugins"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

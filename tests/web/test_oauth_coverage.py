@@ -84,6 +84,7 @@ def oauth_client_app(initialized_storage, monkeypatch):
 
     # Force reimport of config and app to pick up OAuth enabled
     import importlib
+
     import mcp_memory_service.config
     importlib.reload(mcp_memory_service.config)
     import mcp_memory_service.web.app
@@ -206,8 +207,9 @@ class TestOAuthMiddleware:
         assert not result.has_scope("read")
 
     def test_authentication_result_require_scope_raises(self):
-        from mcp_memory_service.web.oauth.middleware import AuthenticationResult
         from fastapi import HTTPException
+
+        from mcp_memory_service.web.oauth.middleware import AuthenticationResult
 
         result = AuthenticationResult(
             authenticated=True, client_id="test", scope="read",
@@ -229,15 +231,17 @@ class TestOAuthMiddleware:
         assert validate_jwt_token(None) is None
 
     def test_authenticate_bearer_token_invalid(self):
-        from mcp_memory_service.web.oauth.middleware import authenticate_bearer_token
         import asyncio
+
+        from mcp_memory_service.web.oauth.middleware import authenticate_bearer_token
 
         result = asyncio.run(authenticate_bearer_token("invalid-token"))
         assert result.authenticated is False
 
     def test_authenticate_bearer_token_empty(self):
-        from mcp_memory_service.web.oauth.middleware import authenticate_bearer_token
         import asyncio
+
+        from mcp_memory_service.web.oauth.middleware import authenticate_bearer_token
 
         result = asyncio.run(authenticate_bearer_token(""))
         assert result.authenticated is False
@@ -249,8 +253,9 @@ class TestOAuthModels:
     """Cover web/oauth/models.py data structures."""
 
     def test_registered_client_model(self):
-        from mcp_memory_service.web.oauth.models import RegisteredClient
         import time
+
+        from mcp_memory_service.web.oauth.models import RegisteredClient
 
         client = RegisteredClient(
             client_id="test-id",
@@ -267,8 +272,9 @@ class TestOAuthModels:
         assert "authorization_code" in client.grant_types
 
     def test_registered_client_secret_redacted(self):
-        from mcp_memory_service.web.oauth.models import RegisteredClient
         import time
+
+        from mcp_memory_service.web.oauth.models import RegisteredClient
 
         client = RegisteredClient(
             client_id="test-id",

@@ -17,9 +17,8 @@ Tests:
 import os
 import tempfile
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
-import pytest
 from click.testing import CliRunner
 
 from mcp_memory_service.cli.main import cli
@@ -134,7 +133,7 @@ class TestCLILifecycle:
         assert "8000" in url
 
     def test_base_url_https(self):
-        from mcp_memory_service.cli.lifecycle import _base_url, _is_https_enabled
+        from mcp_memory_service.cli.lifecycle import _base_url
         # _is_https_enabled checks env vars
         with patch.dict(os.environ, {"MCP_HTTPS_ENABLED": "true"}):
             url = _base_url("example.com", 443)

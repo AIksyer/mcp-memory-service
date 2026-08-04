@@ -10,8 +10,6 @@ Tests cover:
 - Storage shared utilities: _tags_to_string, _string_to_tags, _safe_json_loads
 """
 
-import os
-import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -19,16 +17,6 @@ import pytest
 
 from mcp_memory_service.compat import _sanitize_log_value
 from mcp_memory_service.utils.hashing import generate_content_hash
-from mcp_memory_service.storage.shared import (
-    _tags_to_string,
-    _string_to_tags,
-    _safe_json_loads,
-    _escape_like,
-    _embedding_cache_get,
-    _embedding_cache_put,
-    _embedding_cache_size,
-)
-
 
 # ---------------------------------------------------------------------------
 # _sanitize_log_value tests
@@ -299,6 +287,7 @@ class TestSystemInfo:
 
     def test_str_returns_json(self):
         import json as json_mod
+
         from mcp_memory_service.utils.system_detection import SystemInfo
 
         info = SystemInfo()
@@ -307,7 +296,7 @@ class TestSystemInfo:
         assert "os" in parsed
 
     def test_detect_architecture(self):
-        from mcp_memory_service.utils.system_detection import SystemInfo, Architecture
+        from mcp_memory_service.utils.system_detection import Architecture, SystemInfo
 
         info = SystemInfo()
         assert info._detect_architecture() in [
@@ -345,7 +334,9 @@ class TestSystemDetectionFunctions:
     """Tests for module-level system detection functions."""
 
     def test_get_system_info_singleton(self):
-        from mcp_memory_service.utils.system_detection import get_system_info, SystemInfo
+        from mcp_memory_service.utils.system_detection import (
+            get_system_info,
+        )
 
         info1 = get_system_info()
         info2 = get_system_info()
@@ -358,7 +349,9 @@ class TestSystemDetectionFunctions:
         assert device in ["cuda", "mps", "cpu"]
 
     def test_get_optimal_embedding_settings(self):
-        from mcp_memory_service.utils.system_detection import get_optimal_embedding_settings
+        from mcp_memory_service.utils.system_detection import (
+            get_optimal_embedding_settings,
+        )
 
         settings = get_optimal_embedding_settings()
         assert "model_name" in settings
@@ -392,7 +385,10 @@ class TestAcceleratorDetection:
         assert isinstance(result, bool)
 
     def test_detect_accelerator_valid_value(self):
-        from mcp_memory_service.utils.system_detection import SystemInfo, AcceleratorType
+        from mcp_memory_service.utils.system_detection import (
+            AcceleratorType,
+            SystemInfo,
+        )
 
         info = SystemInfo()
         assert info.accelerator in [
@@ -414,7 +410,9 @@ class TestDocumentProcessing:
     """Tests for document_processing.py functions."""
 
     def test_create_memory_from_chunk_basic(self):
-        from mcp_memory_service.utils.document_processing import create_memory_from_chunk
+        from mcp_memory_service.utils.document_processing import (
+            create_memory_from_chunk,
+        )
         from mcp_memory_service.utils.hashing import generate_content_hash
 
         chunk = MagicMock()
@@ -431,7 +429,9 @@ class TestDocumentProcessing:
         assert memory.memory_type == "document"
 
     def test_create_memory_from_chunk_with_context_tags(self):
-        from mcp_memory_service.utils.document_processing import create_memory_from_chunk
+        from mcp_memory_service.utils.document_processing import (
+            create_memory_from_chunk,
+        )
 
         chunk = MagicMock()
         chunk.content = "Content"
@@ -447,7 +447,9 @@ class TestDocumentProcessing:
         assert "file_type:md" in tags
 
     def test_create_memory_from_chunk_with_chunk_metadata_tags_str(self):
-        from mcp_memory_service.utils.document_processing import create_memory_from_chunk
+        from mcp_memory_service.utils.document_processing import (
+            create_memory_from_chunk,
+        )
 
         chunk = MagicMock()
         chunk.content = "Content"
@@ -462,7 +464,9 @@ class TestDocumentProcessing:
         assert "tag3" in memory.tags
 
     def test_create_memory_from_chunk_with_chunk_metadata_tags_list(self):
-        from mcp_memory_service.utils.document_processing import create_memory_from_chunk
+        from mcp_memory_service.utils.document_processing import (
+            create_memory_from_chunk,
+        )
 
         chunk = MagicMock()
         chunk.content = "Content"
@@ -476,7 +480,9 @@ class TestDocumentProcessing:
         assert "list_tag2" in memory.tags
 
     def test_create_memory_from_chunk_with_extra_metadata(self):
-        from mcp_memory_service.utils.document_processing import create_memory_from_chunk
+        from mcp_memory_service.utils.document_processing import (
+            create_memory_from_chunk,
+        )
 
         chunk = MagicMock()
         chunk.content = "Content"
@@ -491,7 +497,9 @@ class TestDocumentProcessing:
         assert memory.metadata.get("extra_key") == "extra_value"
 
     def test_create_memory_from_chunk_none_metadata(self):
-        from mcp_memory_service.utils.document_processing import create_memory_from_chunk
+        from mcp_memory_service.utils.document_processing import (
+            create_memory_from_chunk,
+        )
 
         chunk = MagicMock()
         chunk.content = "Content"
@@ -505,7 +513,9 @@ class TestDocumentProcessing:
         assert memory.content == "Content"
 
     def test_create_memory_from_chunk_custom_memory_type(self):
-        from mcp_memory_service.utils.document_processing import create_memory_from_chunk
+        from mcp_memory_service.utils.document_processing import (
+            create_memory_from_chunk,
+        )
 
         chunk = MagicMock()
         chunk.content = "Content"
@@ -519,7 +529,9 @@ class TestDocumentProcessing:
         assert memory.memory_type == "decision"
 
     def test_create_memory_from_chunk_deduplicates_tags(self):
-        from mcp_memory_service.utils.document_processing import create_memory_from_chunk
+        from mcp_memory_service.utils.document_processing import (
+            create_memory_from_chunk,
+        )
 
         chunk = MagicMock()
         chunk.content = "Content"

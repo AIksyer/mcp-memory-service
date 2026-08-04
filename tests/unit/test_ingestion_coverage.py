@@ -17,13 +17,10 @@ Tests:
 import asyncio
 import csv
 import json
-import os
-import tempfile
-from pathlib import Path
-
-import pytest
 
 from mcp_memory_service.ingestion.chunker import ChunkingStrategy, TextChunker
+from mcp_memory_service.ingestion.csv_loader import CSVLoader
+from mcp_memory_service.ingestion.json_loader import JSONLoader
 from mcp_memory_service.ingestion.registry import (
     get_loader_for_file,
     get_supported_extensions,
@@ -31,10 +28,7 @@ from mcp_memory_service.ingestion.registry import (
     list_registered_loaders,
     register_loader,
 )
-from mcp_memory_service.ingestion.csv_loader import CSVLoader
-from mcp_memory_service.ingestion.json_loader import JSONLoader
 from mcp_memory_service.ingestion.text_loader import TextLoader
-
 
 # --- TextChunker tests ---
 

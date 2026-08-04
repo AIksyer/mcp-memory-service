@@ -12,21 +12,14 @@ Tests cover:
 - Association CRUD: get, delete, count
 """
 
-import asyncio
-import json
-import sqlite3
-import tempfile
-from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch
 
 import pytest
 
-from mcp_memory_service.storage.graph import GraphStorage, normalize_entity_id
 from mcp_memory_service.models.ontology import (
     is_symmetric_relationship,
     validate_relationship,
 )
-
+from mcp_memory_service.storage.graph import GraphStorage, normalize_entity_id
 
 # ---------------------------------------------------------------------------
 # normalize_entity_id tests

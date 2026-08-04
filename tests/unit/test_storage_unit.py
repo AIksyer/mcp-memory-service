@@ -11,16 +11,17 @@ Tests cover:
 """
 
 import asyncio
-import os
 import sqlite3
-import tempfile
-import threading
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import numpy as np
 import pytest
 
+from mcp_memory_service.storage.migration_runner import MigrationRunner
+from mcp_memory_service.storage.mixins.base import (
+    BaseMixin,
+    deserialize_embedding,
+)
 from mcp_memory_service.storage.shared import (
     _EMBEDDING_CACHE_MAX,
     _embedding_cache_get,
@@ -31,14 +32,6 @@ from mcp_memory_service.storage.shared import (
     _string_to_tags,
     _tags_to_string,
 )
-from mcp_memory_service.storage.migration_runner import MigrationRunner
-from mcp_memory_service.storage.mixins.base import (
-    SQLITE_VEC_AVAILABLE,
-    BaseMixin,
-    deserialize_embedding,
-    _sanitize_log_value as base_sanitize,
-)
-
 
 # ---------------------------------------------------------------------------
 # Shared utility tests
@@ -679,7 +672,7 @@ class TestSqliteVecStorageIntegration:
             tags=["test", "whitebox"],
             memory_type="observation",
         )
-        success, msg = await storage_instance.store(memory)
+        success, _msg = await storage_instance.store(memory)
         assert success is True
 
         results = await storage_instance.retrieve(content, n_results=1)
@@ -720,7 +713,7 @@ class TestSqliteVecStorageIntegration:
         assert await storage_instance.is_deleted(memory.content_hash) is False
 
         # Soft delete
-        success, msg = await storage_instance.delete(memory.content_hash)
+        success, _msg = await storage_instance.delete(memory.content_hash)
         assert success is True
 
         # Should now be deleted
@@ -843,7 +836,7 @@ class TestSqliteVecStorageIntegration:
         )
         storage_instance.conn.commit()
 
-        count, msg = await storage_instance.cleanup_duplicates()
+        count, _msg = await storage_instance.cleanup_duplicates()
         assert count >= 0  # Should not crash
 
     async def test_get_stats(self, storage_instance):
@@ -913,7 +906,7 @@ class TestSqliteVecStorageIntegration:
         )
         await storage_instance.store(memory)
 
-        success, msg = await storage_instance.update_memory_metadata(
+        success, _msg = await storage_instance.update_memory_metadata(
             memory.content_hash,
             {"tags": ["updated_tag"], "metadata": {"key": "value"}},
         )

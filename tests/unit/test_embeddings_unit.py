@@ -8,24 +8,20 @@ Tests cover:
 """
 
 import hashlib
-import json
-import os
 import struct
-import tempfile
-from unittest.mock import MagicMock, patch, AsyncMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 
 from mcp_memory_service.storage.mixins.embeddings import (
+    _DIMENSION_CACHE,
     _EMBEDDING_CACHE,
     _MODEL_CACHE,
-    _DIMENSION_CACHE,
     _HashEmbeddingModel,
     clear_model_caches,
     get_model_cache_stats,
 )
-
 
 # ---------------------------------------------------------------------------
 # _HashEmbeddingModel tests
@@ -290,7 +286,7 @@ class TestHashFallbackAllowed:
     def test_force_refused(self, tmp_path, monkeypatch):
         monkeypatch.setenv("MCP_MEMORY_ALLOW_HASH_EMBEDDINGS", "0")
         mixin = _create_embeddings_mixin(tmp_path)
-        with pytest.raises(RuntimeError, match="hash.*embedding"):
+        with pytest.raises(RuntimeError, match=r"hash.*embedding"):
             mixin._hash_fallback_allowed()
 
     def test_force_refused_false(self, tmp_path, monkeypatch):
@@ -328,7 +324,7 @@ class TestGetExistingDbEmbeddingDimension:
         mixin.conn = sqlite3.connect(str(tmp_path / "test.db"))
         # Simulate the DDL that vec0 would have (stored in sqlite_master)
         # We can't create a real vec0 table, so we mock the query result
-        cursor = mixin.conn.execute("CREATE TABLE memory_embeddings (placeholder TEXT)")
+        mixin.conn.execute("CREATE TABLE memory_embeddings (placeholder TEXT)")
         # Insert a mock row into sqlite_master (can't modify, so mock instead)
         mixin.conn.close()
 
@@ -394,6 +390,7 @@ class TestSafeTarExtract:
 
     def test_blocks_path_traversal(self, tmp_path):
         import tarfile
+
         from mcp_memory_service.embeddings.onnx_embeddings import _safe_tar_extract
 
         # Create a tar with a path traversal entry
@@ -415,6 +412,7 @@ class TestSafeTarExtract:
 
     def test_blocks_absolute_path(self, tmp_path):
         import tarfile
+
         from mcp_memory_service.embeddings.onnx_embeddings import _safe_tar_extract
 
         tar_path = tmp_path / "evil2.tar"
@@ -435,6 +433,7 @@ class TestSafeTarExtract:
 
     def test_allows_normal_extraction(self, tmp_path):
         import tarfile
+
         from mcp_memory_service.embeddings.onnx_embeddings import _safe_tar_extract
 
         tar_path = tmp_path / "safe.tar"
@@ -657,6 +656,7 @@ class TestExternalEmbeddingModelVerifyConnection:
 
     def test_timeout_raises_connection_error(self, monkeypatch):
         import requests as req
+
         from mcp_memory_service.embeddings.external_api import ExternalEmbeddingModel
 
         with patch("mcp_memory_service.embeddings.external_api.requests.post") as mock_post:
@@ -674,6 +674,7 @@ class TestExternalEmbeddingModelVerifyConnection:
 
     def test_connection_error_raises(self, monkeypatch):
         import requests as req
+
         from mcp_memory_service.embeddings.external_api import ExternalEmbeddingModel
 
         with patch("mcp_memory_service.embeddings.external_api.requests.post") as mock_post:

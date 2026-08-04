@@ -62,9 +62,9 @@ def _make_client(initialized_storage, monkeypatch, *, scope: str | None,
 
     from mcp_memory_service.web.app import app
     from mcp_memory_service.web.oauth.middleware import (
+        AuthenticationResult,
         get_current_user,
         require_read_access,
-        AuthenticationResult,
     )
 
     set_storage(initialized_storage)
@@ -199,10 +199,10 @@ class TestReadOnlyScope:
         response = read_only_client.delete(
             "/api/memories/nonexistent-hash-12345"
         )
-        assert response.status_code in (401, 403, 404), response.text
-        # If it's 404, the auth passed but the resource wasn't found —
-        # that means the write-scope gate didn't fire. This is acceptable
-        # only if the endpoint uses require_write_access which would 403 first.
+        assert response.status_code in (401, 403), (
+            f"Read-only scope should not be able to delete, got {response.status_code}. "
+            f"If 404, the write-scope gate didn't fire before the resource lookup."
+        )
 
 
 @pytest.mark.integration
@@ -308,8 +308,10 @@ class TestExpiredTokenRejection:
 
     def test_expired_jwt_rejected(self, initialized_storage, monkeypatch):
         """An expired JWT returns 401, not 200."""
-        import jwt as pyjwt
         from datetime import datetime, timedelta, timezone
+
+        import jwt as pyjwt
+
         from mcp_memory_service.web.oauth import middleware
 
         monkeypatch.setattr(middleware, "API_KEY", None)
@@ -317,7 +319,6 @@ class TestExpiredTokenRejection:
         monkeypatch.setattr(middleware, "ALLOW_ANONYMOUS_ACCESS", False)
 
         from mcp_memory_service.web.app import app
-        from mcp_memory_service.web.oauth.middleware import get_current_user, require_read_access
 
         set_storage(initialized_storage)
 

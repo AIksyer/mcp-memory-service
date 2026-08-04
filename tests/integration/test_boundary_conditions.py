@@ -29,7 +29,6 @@ from fastapi.testclient import TestClient
 from mcp_memory_service.storage.sqlite_vec import SqliteVecMemoryStorage
 from mcp_memory_service.web.dependencies import set_storage
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -308,6 +307,7 @@ class TestConcurrentAccess:
         """
         import httpx
         from httpx import ASGITransport
+
         from mcp_memory_service.web.app import app
 
         contents = [
@@ -337,6 +337,7 @@ class TestConcurrentAccess:
         """Concurrent search and store don't conflict."""
         import httpx
         from httpx import ASGITransport
+
         from mcp_memory_service.web.app import app
 
         # First store something to search for

@@ -9,15 +9,12 @@ Tests cover:
 """
 
 import time
-import json
 from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch
 
 import pytest
 
 from mcp_memory_service.models.memory import Memory, MemoryQueryResult
 from mcp_memory_service.utils.hashing import generate_content_hash
-
 
 # ---------------------------------------------------------------------------
 # Memory __post_init__ tests
@@ -588,7 +585,7 @@ class TestStoreOperations:
         # Temporarily remove connection
         original_conn = storage.conn
         storage.conn = None
-        success, msg = await storage.store(mem)
+        success, _msg = await storage.store(mem)
         assert success is False
         storage.conn = original_conn
 
@@ -598,7 +595,7 @@ class TestStoreOperations:
             content_hash=generate_content_hash("Skip dedup test content"),
             tags=["test"],
         )
-        success, msg = await storage.store(mem, skip_semantic_dedup=True)
+        success, _msg = await storage.store(mem, skip_semantic_dedup=True)
         assert success is True
 
     async def test_store_with_metadata(self, storage):
@@ -608,7 +605,7 @@ class TestStoreOperations:
             tags=["test"],
             metadata={"source": "unit-test", "priority": 5},
         )
-        success, msg = await storage.store(mem)
+        success, _msg = await storage.store(mem)
         assert success is True
 
         retrieved = await storage.get_by_hash(mem.content_hash)
@@ -620,7 +617,7 @@ class TestStoreOperations:
 
         mem = Memory(content="", content_hash="")
         # Should handle gracefully
-        success, msg = await storage.store(mem)
+        success, _msg = await storage.store(mem)
         # Empty content_hash should not crash
         assert isinstance(success, bool)
 
@@ -715,7 +712,7 @@ class TestDeleteOperations:
         await storage.store(mem1)
         await storage.store(mem2)
 
-        count, msg = await storage.delete_by_tag("del_tag_test")
+        count, _msg = await storage.delete_by_tag("del_tag_test")
         assert count >= 2
 
     async def test_delete_by_tags(self, storage):
@@ -732,12 +729,12 @@ class TestDeleteOperations:
         await storage.store(mem1)
         await storage.store(mem2)
 
-        count, msg, hashes = await storage.delete_by_tags(["multi_del_a", "multi_del_b"])
+        count, _msg, hashes = await storage.delete_by_tags(["multi_del_a", "multi_del_b"])
         assert count >= 2
         assert len(hashes) >= 2
 
     async def test_delete_by_tag_nonexistent(self, storage):
-        count, msg = await storage.delete_by_tag("nonexistent_tag_xyz")
+        count, _msg = await storage.delete_by_tag("nonexistent_tag_xyz")
         assert count == 0
 
 
@@ -746,7 +743,7 @@ class TestConsolidateOperations:
     """Tests for consolidation-related operations."""
 
     async def test_cleanup_duplicates_no_duplicates(self, storage):
-        count, msg = await storage.cleanup_duplicates()
+        count, _msg = await storage.cleanup_duplicates()
         assert count == 0
 
     async def test_update_memory(self, storage):

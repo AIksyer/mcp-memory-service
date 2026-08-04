@@ -12,30 +12,26 @@ Tests cover:
 """
 
 import asyncio
-import json
-import os
 import sqlite3
 import sys
-import tempfile
-import threading
-import time
-from pathlib import Path
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 
-from mcp_memory_service.models.memory import Memory, MemoryQueryResult
+from mcp_memory_service.compat import _sanitize_log_value
+from mcp_memory_service.models.memory import Memory
 from mcp_memory_service.storage.mixins.base import BaseMixin, deserialize_embedding
 from mcp_memory_service.storage.mixins.embeddings import (
-    _HashEmbeddingModel,
     _EMBEDDING_CACHE,
     _MODEL_CACHE,
 )
-from mcp_memory_service.storage.shared import _safe_json_loads, _tags_to_string, _string_to_tags
+from mcp_memory_service.storage.shared import (
+    _safe_json_loads,
+    _string_to_tags,
+    _tags_to_string,
+)
 from mcp_memory_service.utils.hashing import generate_content_hash
-from mcp_memory_service.compat import _sanitize_log_value
-
 
 # ---------------------------------------------------------------------------
 # Database locked / busy recovery
@@ -355,7 +351,7 @@ class TestSQLiteConstraintViolations:
         assert success1
 
         # Second store should return False, not raise
-        success2, msg = await storage.store(mem)
+        success2, _msg = await storage.store(mem)
         assert success2 is False
 
     async def test_store_batch_with_duplicate(self, storage):
@@ -414,7 +410,7 @@ class TestConnectionEdgeCases:
 
         # Operations after close should handle gracefully
         mem = Memory(content="test", content_hash="abc")
-        success, msg = await storage.store(mem)
+        success, _msg = await storage.store(mem)
         assert success is False
 
 
@@ -505,13 +501,8 @@ class TestUnicodeHandling:
             content_hash=generate_content_hash(content),
             tags=["null_test"],
         )
-        # Should not crash
-        try:
-            success, _ = await storage.store(mem)
-            assert isinstance(success, bool)
-        except Exception:
-            # Some backends may reject null bytes — that's acceptable
-            pass
+        success, _ = await storage.store(mem)
+        assert success is True
 
     async def test_store_control_chars_in_tags(self, storage):
         content = "Control char tags"
@@ -573,19 +564,14 @@ class TestMemoryBoundaryConditions:
 
     def test_from_dict_missing_content_hash(self):
         data = {"content": "test"}
-        # Should handle missing hash gracefully (may default or raise)
-        try:
-            mem = Memory.from_dict(data)
-            assert mem.content == "test"
-        except (KeyError, TypeError):
-            pass  # Acceptable behavior
+        # from_dict accesses data["content_hash"] directly, so missing key raises KeyError
+        with pytest.raises(KeyError):
+            Memory.from_dict(data)
 
     def test_from_dict_empty_dict(self):
-        try:
-            mem = Memory.from_dict({})
-            assert mem.tags == ["untagged"]
-        except (KeyError, TypeError):
-            pass  # Acceptable if content is required
+        # from_dict accesses data["content"] directly, so empty dict raises KeyError
+        with pytest.raises(KeyError):
+            Memory.from_dict({})
 
     def test_credibility_boundary_zero(self):
         mem = Memory(content="test", content_hash="hash")
@@ -719,7 +705,6 @@ class TestFactoryErrorPaths:
 
         monkeypatch.setenv("MCP_MEMORY_STORAGE_BACKEND", "hybrid")
 
-        import sys
         import types
 
         class BrokenModule(types.ModuleType):

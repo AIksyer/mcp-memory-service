@@ -1,0 +1,325 @@
+# OAuth 2.1 Dynamic Client Registration Setup
+
+This guide explains how to configure and use OAuth 2.1 Dynamic Client Registration with MCP Memory Service to enable Claude Code HTTP transport integration.
+
+## Overview
+
+The MCP Memory Service now supports OAuth 2.1 Dynamic Client Registration (DCR) as specified in RFC 7591. This enables:
+
+- **Claude Code HTTP Transport**: Direct integration with Claude Code's team collaboration features
+- **Automated Client Registration**: Clients can register themselves without manual configuration
+- **Secure Authentication**: JWT-based access tokens with proper scope validation
+- **Backward Compatibility**: Existing API key authentication continues to work
+
+## Quick Start
+
+### 1. Enable OAuth
+
+Set the OAuth environment variable:
+
+```bash
+export MCP_OAUTH_ENABLED=true
+```
+
+### 2. Start the Server
+
+```bash
+# Start with OAuth enabled
+memory launch
+
+# Or with HTTPS (recommended for production)
+export MCP_HTTPS_ENABLED=true
+export MCP_SSL_CERT_FILE=/path/to/cert.pem
+export MCP_SSL_KEY_FILE=/path/to/key.pem
+memory launch
+```
+
+### 3. Test OAuth Endpoints
+
+```bash
+# Test the OAuth implementation
+python tests/integration/test_oauth_flow.py http://localhost:8000
+```
+
+## Configuration
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MCP_OAUTH_ENABLED` | `true` | Enable/disable OAuth 2.1 endpoints |
+| `MCP_OAUTH_SECRET_KEY` | Auto-generated | JWT signing key (set for persistence) |
+| `MCP_OAUTH_ISSUER` | Auto-detected | OAuth issuer URL |
+| `MCP_OAUTH_ACCESS_TOKEN_EXPIRE_MINUTES` | `60` | Access token lifetime |
+| `MCP_OAUTH_AUTHORIZATION_CODE_EXPIRE_MINUTES` | `10` | Authorization code lifetime |
+| `MCP_OAUTH_REFRESH_TOKEN_EXPIRE_DAYS` | `30` | Refresh token lifetime (issued only when `offline_access` scope is requested) |
+
+### Example Configuration
+
+```bash
+# Production configuration
+export MCP_OAUTH_ENABLED=true
+export MCP_OAUTH_SECRET_KEY="your-secure-secret-key-here"
+export MCP_OAUTH_ISSUER="https://your-domain.com"
+export MCP_HTTPS_ENABLED=true
+
+# Development configuration
+export MCP_OAUTH_ENABLED=true
+export MCP_OAUTH_ISSUER="http://localhost:8000"  # Match server port
+```
+
+## OAuth Endpoints
+
+### Discovery Endpoints
+
+- `GET /.well-known/oauth-authorization-server/mcp` - OAuth server metadata
+- `GET /.well-known/openid-configuration/mcp` - OpenID Connect discovery
+
+### OAuth Flow Endpoints
+
+- `POST /oauth/register` - Dynamic client registration
+- `GET /oauth/authorize` - Authorization endpoint
+- `POST /oauth/token` - Token endpoint
+
+### Management Endpoints
+
+- `GET /oauth/clients/{client_id}` - Client information (debugging)
+
+## Claude Code Integration
+
+### Automatic Setup
+
+Claude Code will automatically discover and register with the OAuth server:
+
+1. **Discovery**: Claude Code requests `/.well-known/oauth-authorization-server/mcp`
+2. **Registration**: Automatically registers as an OAuth client
+3. **Authorization**: Redirects user for authorization (auto-approved in MVP)
+4. **Token Exchange**: Exchanges authorization code for access token
+5. **API Access**: Uses Bearer token for all HTTP transport requests
+
+### Manual Configuration
+
+If needed, you can manually configure Claude Code:
+
+```json
+{
+  "memoryService": {
+    "protocol": "http",
+    "http": {
+      "endpoint": "http://localhost:8000",  # Use actual server endpoint
+      "oauth": {
+        "enabled": true,
+        "discoveryUrl": "http://localhost:8000/.well-known/oauth-authorization-server/mcp"
+      }
+    }
+  }
+}
+```
+
+## API Authentication
+
+### Bearer Token Authentication
+
+All API endpoints support Bearer token authentication:
+
+```bash
+# Get access token via OAuth flow
+export ACCESS_TOKEN="your-jwt-access-token"
+
+# Use Bearer token for API requests
+curl -H "Authorization: Bearer $ACCESS_TOKEN" \
+     http://localhost:8000/api/memories
+```
+
+### Scope-Based Authorization
+
+The OAuth system supports four scopes:
+
+- **`read`**: Access to read-only endpoints
+- **`write`**: Access to create/update endpoints
+- **`admin`**: Access to administrative endpoints
+- **`offline_access`**: Opt-in signal that the client wants a `refresh_token` alongside the access token (see below). Does not grant additional permissions on its own.
+
+### Refresh Tokens
+
+The token endpoint supports the `refresh_token` grant so long-lived sessions can renew an access token without re-driving the authorization flow.
+
+**To receive a `refresh_token`, include `offline_access` in the `scope` parameter of the authorization request.** Clients that don't request it keep the existing single-token response — this behavior is opt-in to stay compatible with existing integrations.
+
+```bash
+# Authorization request — note offline_access in scope
+GET /oauth/authorize?response_type=code
+    &client_id=...
+    &redirect_uri=...
+    &scope=read%20write%20offline_access
+    &code_challenge=...&code_challenge_method=S256
+```
+
+The token response then includes `refresh_token`:
+
+```json
+{
+  "access_token": "eyJhbGc...",
+  "token_type": "Bearer",
+  "expires_in": 3600,
+  "refresh_token": "q8Oj...48-byte-opaque...",
+  "scope": "read write offline_access"
+}
+```
+
+**Renewing an access token:**
+
+```bash
+curl -X POST http://localhost:8000/oauth/token \
+     -u "<client_id>:<client_secret>" \
+     -d "grant_type=refresh_token" \
+     -d "refresh_token=q8Oj..."
+```
+
+Public clients (registered with `token_endpoint_auth_method=none`) omit the `-u` credentials; the refresh token itself is the binding.
+
+**Rotation (OAuth 2.1 §4.3.1):** every successful refresh issues a new `refresh_token` AND revokes the one that was presented. A stolen refresh token is therefore single-use — if both the legitimate client and an attacker try to use it, one succeeds and the other gets `invalid_grant`. Always store the latest `refresh_token` from each response.
+
+**Scope on refresh:** the `scope` parameter is optional and may only be a subset of the originally granted scope; requesting a broader scope returns `invalid_scope`.
+
+### API Key Authentication (OAuth-Free)
+
+API key authentication works without OAuth enabled, perfect for single-user deployments or when you don't need team collaboration features:
+
+```bash
+# Configure API key
+export MCP_API_KEY="your-secret-key"
+export MCP_OAUTH_ENABLED=false  # OAuth not required
+export MCP_ALLOW_ANONYMOUS_ACCESS=false  # Require authentication
+
+# Start server
+memory launch
+
+# Option 1: X-API-Key header (recommended, more secure)
+curl -H "X-API-Key: your-secret-key" \
+     http://localhost:8000/api/memories
+
+# Option 2: Query parameter (convenient, less secure - avoid in production)
+curl "http://localhost:8000/api/memories?api_key=your-secret-key"
+
+# Option 3: Bearer token (backward compatible)
+curl -H "Authorization: Bearer your-secret-key" \
+     http://localhost:8000/api/memories
+```
+
+**When to use API Key vs OAuth:**
+- **API Key**: Single-user deployments, scripts, local development
+- **OAuth**: Team collaboration, Claude Code HTTP transport, multi-user access
+
+## Security Considerations
+
+### Production Deployment
+
+1. **Use HTTPS**: Always enable HTTPS in production
+2. **Set Secret Key**: Provide a secure `MCP_OAUTH_SECRET_KEY`
+3. **Secure Storage**: Consider persistent client storage for production
+4. **Rate Limiting**: Implement rate limiting on OAuth endpoints
+
+### OAuth 2.1 Compliance
+
+The implementation follows OAuth 2.1 security requirements:
+
+- HTTPS required for non-localhost URLs
+- Secure client credential generation
+- JWT access tokens with proper validation
+- Authorization code expiration
+- Proper redirect URI validation
+
+## Troubleshooting
+
+### Common Issues
+
+**OAuth endpoints return 404**:
+- Ensure `MCP_OAUTH_ENABLED=true`
+- Restart the server after configuration changes
+
+**Claude Code connection fails**:
+- Check HTTPS configuration for production
+- Verify OAuth discovery endpoint responds correctly
+- Check server logs for OAuth errors
+
+**Invalid token errors**:
+- Verify `MCP_OAUTH_SECRET_KEY` is consistent
+- Check token expiration times
+- Ensure proper JWT format
+
+### Debug Commands
+
+```bash
+# Test OAuth discovery
+curl http://localhost:8000/.well-known/oauth-authorization-server/mcp
+
+# Test client registration
+curl -X POST http://localhost:8000/oauth/register \
+     -H "Content-Type: application/json" \
+     -d '{"client_name": "Test Client"}'
+
+# Check server logs
+tail -f logs/mcp-memory-service.log | grep -i oauth
+```
+
+## API Reference
+
+### Client Registration Request
+
+```json
+{
+  "client_name": "My Application",
+  "redirect_uris": ["https://myapp.com/callback"],
+  "grant_types": ["authorization_code"],
+  "response_types": ["code"],
+  "scope": "read write"
+}
+```
+
+### Client Registration Response
+
+```json
+{
+  "client_id": "mcp_client_abc123",
+  "client_secret": "secret_xyz789",
+  "redirect_uris": ["https://myapp.com/callback"],
+  "grant_types": ["authorization_code"],
+  "response_types": ["code"],
+  "token_endpoint_auth_method": "client_secret_basic"
+}
+```
+
+### Token Response
+
+```json
+{
+  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "token_type": "Bearer",
+  "expires_in": 3600,
+  "scope": "read write"
+}
+```
+
+## Development
+
+### Running Tests
+
+```bash
+# Basic OAuth functionality test
+python tests/integration/test_oauth_flow.py
+
+# Full test suite
+pytest tests/ -k oauth
+
+# Manual testing with curl
+./scripts/test_oauth_flow.sh
+```
+
+### Adding New Scopes
+
+1. Update scope definitions in `oauth/models.py`
+2. Add scope validation in `oauth/middleware.py`
+3. Apply scope requirements to endpoints using `require_scope()`
+
+For more information, see the [OAuth 2.1 specification](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1) and [RFC 7591](https://datatracker.ietf.org/doc/html/rfc7591).

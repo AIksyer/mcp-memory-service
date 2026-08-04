@@ -1,0 +1,11 @@
+# Codely CLI auto-save and config (should never be committed)
+.codely-cli/
+
+# Codegraph index
+.codegraph/
+
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/

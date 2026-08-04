@@ -1,0 +1,406 @@
+# Copyright 2024 Heinrich Krupp
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Abstract base class for OAuth 2.1 storage backends.
+
+Defines the interface that all OAuth storage implementations must follow.
+"""
+
+import hashlib
+import secrets
+from abc import ABC, abstractmethod
+
+from ..models import RegisteredClient
+
+_SECRET_HASH_PREFIX = "sha256$"
+
+
+def hash_client_secret(secret: str) -> str:
+    """Hash a client secret for storage at rest (SHA-256, prefixed)."""
+    digest = hashlib.sha256(secret.encode("utf-8")).hexdigest()
+    return f"{_SECRET_HASH_PREFIX}{digest}"
+
+
+def is_hashed_secret(stored: str) -> bool:
+    """Return True if ``stored`` is already a hashed secret (vs legacy plaintext)."""
+    return isinstance(stored, str) and stored.startswith(_SECRET_HASH_PREFIX)
+
+
+def verify_client_secret(stored: str, provided: str) -> bool:
+    """
+    Constant-time check of ``provided`` against a ``stored`` client secret.
+
+    Handles both hashed values and legacy plaintext rows written before secrets
+    were hashed at rest. Callers should upgrade legacy rows on a successful
+    match (see ``authenticate_client`` implementations).
+    """
+    if not stored or not provided:
+        return False
+    if is_hashed_secret(stored):
+        return secrets.compare_digest(hash_client_secret(provided), stored)
+    # Legacy plaintext row — compare in constant time, caller upgrades on match.
+    return secrets.compare_digest(provided, stored)
+
+
+class OAuthStorage(ABC):
+    """
+    Abstract base class for OAuth 2.1 storage backends.
+
+    Provides interface for storing and retrieving OAuth clients, authorization codes,
+    and access tokens. Concrete implementations can use different storage backends
+    (in-memory, SQLite, etc.).
+    """
+
+    @abstractmethod
+    async def store_client(self, client: RegisteredClient) -> None:
+        """
+        Store a registered OAuth client.
+
+        Args:
+            client: RegisteredClient instance containing client metadata
+
+        Raises:
+            Exception: If storage operation fails
+        """
+        pass
+
+    @abstractmethod
+    async def get_client(self, client_id: str) -> RegisteredClient | None:
+        """
+        Retrieve a registered OAuth client by client ID.
+
+        Args:
+            client_id: OAuth client identifier
+
+        Returns:
+            RegisteredClient instance if found, None otherwise
+
+        Raises:
+            Exception: If retrieval operation fails
+        """
+        pass
+
+    @abstractmethod
+    async def authenticate_client(self, client_id: str, client_secret: str) -> bool:
+        """
+        Authenticate a client using client_id and client_secret.
+
+        Args:
+            client_id: OAuth client identifier
+            client_secret: OAuth client secret
+
+        Returns:
+            True if authentication succeeds, False otherwise
+
+        Raises:
+            Exception: If authentication operation fails
+        """
+        pass
+
+    @abstractmethod
+    async def store_authorization_code(
+        self,
+        code: str,
+        client_id: str,
+        redirect_uri: str | None = None,
+        scope: str | None = None,
+        expires_in: int | None = None,
+        code_challenge: str | None = None,
+        code_challenge_method: str | None = None,
+    ) -> None:
+        """
+        Store an authorization code for the authorization code flow.
+
+        Args:
+            code: Authorization code value
+            client_id: OAuth client identifier
+            redirect_uri: Redirect URI associated with this authorization
+            scope: Space-separated list of granted scopes
+            expires_in: Expiration time in seconds (None uses default)
+
+        Raises:
+            Exception: If storage operation fails
+        """
+        pass
+
+    @abstractmethod
+    async def get_authorization_code(self, code: str) -> dict | None:
+        """
+        Retrieve and consume an authorization code (one-time use).
+
+        Authorization codes are single-use tokens. This method should:
+        1. Retrieve the code data
+        2. Validate it hasn't expired
+        3. Remove it from storage (consume)
+
+        Args:
+            code: Authorization code value
+
+        Returns:
+            Dict with keys: client_id, redirect_uri, scope, expires_at
+            None if code not found or expired
+
+        Raises:
+            Exception: If retrieval operation fails
+        """
+        pass
+
+    @abstractmethod
+    async def store_access_token(
+        self,
+        token: str,
+        client_id: str,
+        scope: str | None = None,
+        expires_in: int | None = None,
+    ) -> None:
+        """
+        Store an access token.
+
+        Args:
+            token: Access token value
+            client_id: OAuth client identifier
+            scope: Space-separated list of granted scopes
+            expires_in: Expiration time in seconds (None uses default)
+
+        Raises:
+            Exception: If storage operation fails
+        """
+        pass
+
+    @abstractmethod
+    async def get_access_token(self, token: str) -> dict | None:
+        """
+        Retrieve access token information if valid.
+
+        Should validate token hasn't expired and clean up expired tokens.
+
+        Args:
+            token: Access token value
+
+        Returns:
+            Dict with keys: client_id, scope, expires_at
+            None if token not found or expired
+
+        Raises:
+            Exception: If retrieval operation fails
+        """
+        pass
+
+    @abstractmethod
+    async def revoke_access_token(self, token: str) -> bool:
+        """
+        Revoke an access token (remove from storage).
+
+        Args:
+            token: Access token value to revoke
+
+        Returns:
+            True if token was revoked, False if token not found
+
+        Raises:
+            Exception: If revocation operation fails
+        """
+        pass
+
+    @abstractmethod
+    async def store_refresh_token(
+        self,
+        token: str,
+        client_id: str,
+        scope: str | None = None,
+        expires_in: int | None = None,
+        parent_token: str | None = None,
+    ) -> None:
+        """
+        Store a refresh token.
+
+        Args:
+            token: Refresh token value
+            client_id: OAuth client identifier
+            scope: Space-separated list of granted scopes
+            expires_in: Expiration time in seconds (None uses default)
+            parent_token: Previous refresh token this one replaces (rotation chain)
+
+        Raises:
+            Exception: If storage operation fails
+        """
+        pass
+
+    @abstractmethod
+    async def get_refresh_token(self, token: str) -> dict | None:
+        """
+        Retrieve refresh token information if valid.
+
+        Returns None when the token is unknown, expired, or revoked. Does NOT
+        consume the token; rotation is performed by the caller via
+        :meth:`revoke_refresh_token` once a replacement has been issued.
+
+        Args:
+            token: Refresh token value
+
+        Returns:
+            Dict with keys: client_id, scope, expires_at, parent_token
+            None if token not found, expired, or revoked
+        """
+        pass
+
+    @abstractmethod
+    async def revoke_refresh_token(self, token: str) -> bool:
+        """
+        Revoke a refresh token (mark as unusable, keep record for audit).
+
+        Used for OAuth 2.1 §4.3.1 rotation: the caller invalidates the
+        previously-presented refresh token after issuing its replacement.
+
+        Args:
+            token: Refresh token value to revoke
+
+        Returns:
+            True if a live token was revoked, False if unknown/already revoked
+        """
+        pass
+
+    @abstractmethod
+    async def delete_refresh_token(self, token: str) -> bool:
+        """
+        Delete a refresh token record outright.
+
+        Intended for explicit logout / client deregistration flows where
+        audit history is not required.
+
+        Args:
+            token: Refresh token value
+
+        Returns:
+            True if a record was removed, False otherwise
+        """
+        pass
+
+    @abstractmethod
+    async def revoke_refresh_token_chain(self, token: str) -> int:
+        """
+        Revoke every refresh token in the same rotation chain.
+
+        Compromise mitigation per OAuth 2.1 §4.3.1: when a replay of an
+        already-revoked refresh token is detected, the authorization
+        server cannot tell whether the legitimate client or an attacker
+        presented the stale token, so it revokes the entire family rooted
+        at the same initial issuance.
+
+        Args:
+            token: Any refresh token in the chain (typically the replayed one)
+
+        Returns:
+            Number of previously-live tokens revoked by this call.
+            Already-revoked or unknown tokens do not count.
+        """
+        pass
+
+    @abstractmethod
+    async def cleanup_expired(self) -> dict[str, int]:
+        """
+        Clean up expired authorization codes, access tokens, and refresh tokens.
+
+        This method should be called periodically to prevent storage bloat.
+
+        Returns:
+            Dict with keys: expired_codes_cleaned, expired_tokens_cleaned,
+            expired_refresh_tokens_cleaned
+
+        Raises:
+            Exception: If cleanup operation fails
+        """
+        pass
+
+    @abstractmethod
+    async def close(self) -> None:
+        """
+        Clean up storage resources (connections, file handles, etc.).
+
+        Should be called when shutting down the OAuth server.
+
+        Raises:
+            Exception: If cleanup operation fails
+        """
+        pass
+
+    # Token generation methods (not storage-specific, but part of interface)
+    def generate_client_id(self) -> str:
+        """
+        Generate a unique client ID.
+
+        Returns:
+            Unique client identifier string
+        """
+        import secrets
+
+        return f"mcp_client_{secrets.token_urlsafe(16)}"
+
+    def generate_client_secret(self) -> str:
+        """
+        Generate a secure client secret.
+
+        Returns:
+            Secure random client secret string
+        """
+        import secrets
+
+        return secrets.token_urlsafe(32)
+
+    def generate_authorization_code(self) -> str:
+        """
+        Generate a secure authorization code.
+
+        Returns:
+            Secure random authorization code string
+        """
+        import secrets
+
+        return secrets.token_urlsafe(32)
+
+    def generate_access_token(self) -> str:
+        """
+        Generate a secure access token.
+
+        Returns:
+            Secure random access token string
+        """
+        import secrets
+
+        return secrets.token_urlsafe(32)
+
+    def generate_refresh_token(self) -> str:
+        """
+        Generate a secure refresh token.
+
+        Refresh tokens use more entropy than access tokens because they are
+        long-lived (days/weeks), DB-backed, and a key target for replay.
+
+        Returns:
+            Secure random refresh token string
+        """
+        import secrets
+
+        return secrets.token_urlsafe(48)
+
+    # Optional statistics method
+    async def get_stats(self) -> dict:
+        """
+        Get storage statistics (optional, implementation-specific).
+
+        Returns:
+            Dict with backend-specific statistics
+        """
+        return {}

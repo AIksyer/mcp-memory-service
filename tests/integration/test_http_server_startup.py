@@ -61,8 +61,11 @@ def test_all_api_routes_registered():
     """
     from mcp_memory_service.web.app import app
 
-    # Get all registered routes
-    routes = [route.path for route in app.routes]
+    # Collect route paths from the OpenAPI schema — this reliably includes
+    # all paths with their full prefixes regardless of FastAPI internals
+    # (newer versions wrap included routers in _IncludedRouter objects).
+    openapi_schema = app.openapi()
+    routes = list(openapi_schema.get("paths", {}).keys())
 
     # Essential routes that should always be present
     essential_routes = [

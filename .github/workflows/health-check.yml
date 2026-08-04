@@ -1,0 +1,78 @@
+name: R2 Health Check
+
+on:
+  schedule:
+    - cron: '11 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  health-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: R2 bucket health check
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
+        run: |
+          set -euo pipefail
+          echo "=== R2 Health Check ==="
+          echo "Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo ""
+
+          # 1. Verify bucket exists
+          BUCKET_INFO=$(curl -s \
+            -X GET "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets/$R2_BUCKET" \
+            -H "Authorization: Bearer $CF_API_TOKEN")
+
+          SUCCESS=$(echo "$BUCKET_INFO" | jq -r '.success')
+          if [ "$SUCCESS" != "true" ]; then
+            echo "❌ Bucket $R2_BUCKET not accessible"
+            echo "$BUCKET_INFO" | jq .
+            exit 1
+          fi
+
+          echo "✅ Bucket: $R2_BUCKET"
+          echo "   Created: $(echo "$BUCKET_INFO" | jq -r '.result.creation_date')"
+          echo "   Location: $(echo "$BUCKET_INFO" | jq -r '.result.location')"
+
+          # 2. Check usage
+          USAGE=$(curl -s \
+            -X GET "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets/$R2_BUCKET/usage" \
+            -H "Authorization: Bearer $CF_API_TOKEN")
+
+          PAYLOAD_SIZE=$(echo "$USAGE" | jq -r '.result.payloadSize // "0"')
+          OBJECT_COUNT=$(echo "$USAGE" | jq -r '.result.objectCount // "0"')
+          echo ""
+          echo "=== Usage ==="
+          echo "   Objects: $OBJECT_COUNT"
+          echo "   Payload: $PAYLOAD_SIZE bytes"
+
+          # 3. Check lifecycle rules
+          LIFECYCLE=$(curl -s \
+            -X GET "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets/$R2_BUCKET/lifecycle" \
+            -H "Authorization: Bearer $CF_API_TOKEN")
+
+          LIFECYCLE_SUCCESS=$(echo "$LIFECYCLE" | jq -r '.success')
+          if [ "$LIFECYCLE_SUCCESS" = "true" ]; then
+            RULE_COUNT=$(echo "$LIFECYCLE" | jq -r '.result.rules | length')
+            echo ""
+            echo "=== Lifecycle Rules ($RULE_COUNT) ==="
+            echo "$LIFECYCLE" | jq -r '.result.rules[] | "   - \(.id) (enabled: \(.enabled))"'
+          fi
+
+          # 4. Free tier check
+          echo ""
+          echo "=== Free Tier Status ==="
+          PAYLOAD_GB=$(echo "scale=2; $PAYLOAD_SIZE / 1073741824" | bc 2>/dev/null || echo "0")
+          if [ "$PAYLOAD_SIZE" -lt 10737418240 ]; then
+            echo "✅ Storage: ${PAYLOAD_GB}GB / 10GB (free tier)"
+          else
+            echo "❌ Storage: ${PAYLOAD_GB}GB exceeds 10GB free tier!"
+          fi
+
+          echo ""
+          echo "✅ Health check complete"

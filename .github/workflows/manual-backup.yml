@@ -1,0 +1,86 @@
+name: Manual Backup Trigger
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Backup action to perform'
+        required: true
+        default: 'status'
+        type: choice
+        options:
+          - status
+          - list-objects
+          - cleanup-old
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Perform backup action
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
+          ACTION: ${{ github.event.inputs.action }}
+        run: |
+          set -euo pipefail
+          echo "=== Manual Backup: $ACTION ==="
+          echo "Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo ""
+
+          case "$ACTION" in
+            status)
+              echo "--- Bucket Status ---"
+              curl -s \
+                -X GET "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets/$R2_BUCKET" \
+                -H "Authorization: Bearer $CF_API_TOKEN" | jq .
+              echo ""
+              echo "--- Usage ---"
+              curl -s \
+                -X GET "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets/$R2_BUCKET/usage" \
+                -H "Authorization: Bearer $CF_API_TOKEN" | jq .
+              echo ""
+              echo "--- Lifecycle Rules ---"
+              curl -s \
+                -X GET "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets/$R2_BUCKET/lifecycle" \
+                -H "Authorization: Bearer $CF_API_TOKEN" | jq .
+              ;;
+
+            list-objects)
+              echo "--- Objects in bucket ---"
+              curl -s \
+                -X GET "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets/$R2_BUCKET/objects" \
+                -H "Authorization: Bearer $CF_API_TOKEN" | jq '.result[] | {key, size, lastModified}'
+              ;;
+
+            cleanup-old)
+              echo "--- Checking for objects older than 30 days ---"
+              OBJECTS=$(curl -s \
+                -X GET "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets/$R2_BUCKET/objects" \
+                -H "Authorization: Bearer $CF_API_TOKEN")
+
+              NOW_TS=$(date +%s)
+              CUTOFF_TS=$((NOW_TS - 2592000))
+
+              echo "$OBJECTS" | jq -r '.result[] | select(.lastModified != null) | "\(.key)|\(.lastModified)"' | while IFS='|' read -r KEY MODIFIED; do
+                MODIFIED_TS=$(date -d "$MODIFIED" +%s 2>/dev/null || echo 0)
+                if [ "$MODIFIED_TS" -lt "$CUTOFF_TS" ]; then
+                  AGE_DAYS=$(( (NOW_TS - MODIFIED_TS) / 86400 ))
+                  echo "  Deleting: $KEY (${AGE_DAYS} days old)"
+                fi
+              done
+              echo "✅ Cleanup complete (lifecycle rule also auto-deletes >30d)"
+              ;;
+
+            *)
+              echo "Unknown action: $ACTION"
+              exit 1
+              ;;
+          esac
+
+          echo ""
+          echo "✅ Action '$ACTION' completed"

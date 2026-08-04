@@ -1,0 +1,102 @@
+name: R2 Backup Verify
+
+on:
+  schedule:
+    - cron: '17 9 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  verify-backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check R2 bucket freshness
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
+        run: |
+          set -euo pipefail
+          echo "=== R2 Backup Freshness Check ==="
+          echo "Bucket: $R2_BUCKET"
+          echo "Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo ""
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X GET "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets/$R2_BUCKET/objects" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "❌ Failed to list R2 objects (HTTP $HTTP_CODE)"
+            echo "$BODY"
+            exit 1
+          fi
+
+          SUCCESS=$(echo "$BODY" | jq -r '.success')
+          if [ "$SUCCESS" != "true" ]; then
+            echo "❌ R2 API returned failure"
+            echo "$BODY" | jq .
+            exit 1
+          fi
+
+          RESULT=$(echo "$BODY" | jq -r '.result')
+          OBJECT_COUNT=$(echo "$RESULT" | jq 'if type == "array" then length else 0 end')
+
+          echo "✅ R2 bucket accessible"
+          echo "   Object count: $OBJECT_COUNT"
+
+          if [ "$OBJECT_COUNT" -gt 0 ]; then
+            echo ""
+            echo "=== Recent backups ==="
+            echo "$RESULT" | jq -r '.[] | "  - \(.key) (\(.size // "unknown") bytes, modified: \(.lastModified // "unknown"))"' | head -10
+
+            LATEST=$(echo "$RESULT" | jq -r '[.[].lastModified // empty] | sort | .[-1] // empty')
+            if [ -n "$LATEST" ]; then
+              LATEST_TS=$(date -d "$LATEST" +%s 2>/dev/null || echo 0)
+              NOW_TS=$(date +%s)
+              AGE_HOURS=$(( (NOW_TS - LATEST_TS) / 3600 ))
+              echo ""
+              echo "   Latest backup: $LATEST ($AGE_HOURS hours ago)"
+              if [ "$AGE_HOURS" -gt 48 ]; then
+                echo "⚠️  Warning: Latest backup is $AGE_HOURS hours old (>48h threshold)"
+              else
+                echo "✅ Backup freshness OK"
+              fi
+            fi
+          else
+            echo "⚠️  No backups found — expected for new bucket"
+          fi
+
+          USAGE=$(curl -s \
+            -X GET "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets/$R2_BUCKET/usage" \
+            -H "Authorization: Bearer $CF_API_TOKEN")
+          PAYLOAD_SIZE=$(echo "$USAGE" | jq -r '.result.payloadSize // "0"')
+          echo ""
+          echo "=== Storage Usage ==="
+          echo "   Payload size: $PAYLOAD_SIZE bytes"
+          if [ "$PAYLOAD_SIZE" -gt 5368709120 ]; then
+            echo "⚠️  Warning: Storage exceeds 5GB (50% of free tier)"
+          else
+            echo "✅ Storage within free tier"
+          fi
+
+      - name: Create issue on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: 'R2 Backup Verification Failed',
+              body: 'The R2 backup verification workflow failed. Check: ' +
+                    `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              labels: ['backup', 'alert']
+            });

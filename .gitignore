@@ -1,0 +1,41 @@
+# Codely CLI auto-save and config (should never be committed)
+.codely-cli/
+
+# Codegraph index
+.codegraph/
+
+# Environment files — contain secrets, never commit
+.env
+.env.local
+.env.*.local
+
+# Codely CLI project memory — contains deployment URLs and local config
+CODELY.md
+
+# Wrangler local state — contains account cache
+.wrangler/
+
+# Wrangler config — contains personal domain, copy from .example
+cloudflare/worker/mcp-lb/wrangler.toml
+
+# Memory service runtime logs
+mem-log/
+
+# AI-generated design docs (private, not for public release)
+design/
+
+# AI-generated task output (ephemeral, not for public release)
+task-output.md
+
+# Codely CLI project memory — contains deployment URLs and local config
+# (already listed above, keeping for clarity)
+
+# Pyscn security scan cache
+.pyscn/
+.ruff_cache/
+
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/

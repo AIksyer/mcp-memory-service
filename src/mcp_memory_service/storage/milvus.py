@@ -1,0 +1,3709 @@
+# Copyright 2024 Heinrich Krupp
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Milvus storage backend for MCP Memory Service.
+
+Uses the pymilvus MilvusClient API. Supports three deployment targets that
+share the same code path:
+
+  * Milvus Lite (default):       uri="./milvus.db"
+  * Self-hosted Milvus server:    uri="http://localhost:19530"
+  * Zilliz Cloud:                 uri="https://xxx.zillizcloud.com", token="..."
+
+Design notes:
+  * AUTOINDEX + COSINE metric, so the same schema works on Lite, server and Cloud.
+  * Primary key is the memory's content_hash. This gives O(1) lookup and makes
+    cleanup_duplicates a no-op (the PK itself enforces uniqueness).
+  * Tags are stored as a comma-delimited string with leading and trailing
+    commas (",python,web,"). Exact tag match is done with
+    ``tags like "%,<tag>,%"`` which is supported by Milvus 2.4+ and Milvus Lite.
+  * Metadata is stored as a JSON string in a VARCHAR field.
+  * Deletion is a hard delete — Milvus does not provide efficient filtering of
+    tombstones during ANN search, so there is no tombstone/soft-delete here.
+"""
+
+import asyncio
+import json
+import logging
+import math
+import os
+import time
+import traceback
+from datetime import date, datetime, timedelta, timezone
+from typing import Any
+
+# Disable wandb BEFORE importing sentence-transformers — same rationale as
+# sqlite_vec.py (Issue #311). Safe to set even when transformers is unused.
+os.environ.setdefault("WANDB_DISABLED", "true")
+os.environ.setdefault("WANDB_MODE", "disabled")
+
+try:
+    from pymilvus import DataType, MilvusClient
+
+    PYMILVUS_AVAILABLE = True
+except ImportError:
+    PYMILVUS_AVAILABLE = False
+    MilvusClient = None  # type: ignore
+    DataType = None  # type: ignore
+    logging.getLogger(__name__).warning(
+        "pymilvus not available. Install with: pip install pymilvus milvus-lite"
+    )
+
+# BM25 full-text search support (Milvus 2.5+).
+# Function / FunctionType were added in pymilvus ≥ 2.5; older versions lack them.
+try:
+    from pymilvus import Function, FunctionType  # type: ignore[attr-defined]
+
+    _BM25_IMPORTS_AVAILABLE = True
+except ImportError:
+    _BM25_IMPORTS_AVAILABLE = False
+    Function = None  # type: ignore
+    FunctionType = None  # type: ignore
+
+# Hybrid search helpers (also Milvus 2.5+).
+try:
+    from pymilvus import AnnSearchRequest, RRFRanker  # type: ignore[attr-defined]
+
+    _HYBRID_SEARCH_AVAILABLE = True
+except ImportError:
+    _HYBRID_SEARCH_AVAILABLE = False
+    AnnSearchRequest = None  # type: ignore
+    RRFRanker = None  # type: ignore
+
+try:
+    from sentence_transformers import SentenceTransformer
+
+    SENTENCE_TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    SENTENCE_TRANSFORMERS_AVAILABLE = False
+    SentenceTransformer = None  # type: ignore
+
+from ..models.memory import Memory, MemoryQueryResult
+from .base import MemoryStorage
+from .shared import (
+    _embedding_cache_get,
+    _embedding_cache_put,
+    _escape_like,
+    _safe_json_loads,
+    _sanitize_log_value,
+    _string_to_tags,
+    _tags_to_string,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# -- Module-level caches / constants -----------------------------------------
+
+# Embedding model cache, keyed by model name. Shared across MilvusMemoryStorage
+# instances in the same process so that repeated factory creations (e.g., tests)
+# don't reload a multi-hundred-MB model.
+_MODEL_CACHE: dict[str, Any] = {}
+_DIMENSION_CACHE: dict[str, int] = {}
+
+# Milvus VARCHAR hard cap. We leave a small safety margin so overhead fields
+# (metadata JSON keys etc.) don't push past the Milvus-side limit.
+_MILVUS_VARCHAR_MAX = 65535
+_CONTENT_MAX_LEN = _MILVUS_VARCHAR_MAX - 256
+_TAGS_MAX_LEN = 8192
+_ISO_MAX_LEN = 64
+_MEMORY_TYPE_MAX_LEN = 128
+_ID_MAX_LEN = 128
+
+# Milvus per-call limit ceiling.
+_MILVUS_MAX_LIMIT = 16384
+
+# Reciprocal Rank Fusion smoothing constant for hybrid search.
+# k=60 is the standard default from the RRF paper (Cormack et al., 2009).
+RRF_RANKER_K = 60
+
+# Defensive caps — mirror sqlite_vec semantics to prevent DoS-style large requests.
+_MAX_TAGS_FOR_SEARCH = 100
+
+
+# -- Storage implementation --------------------------------------------------
+
+
+class MilvusMemoryStorage(MemoryStorage):
+    """Milvus-backed storage implementation.
+
+    Parameters
+    ----------
+    uri : str
+        Milvus endpoint. ``./milvus.db`` (default) uses Milvus Lite (single
+        local file, no external dependencies). An HTTP(S) URL points at a
+        self-hosted Milvus or a Zilliz Cloud endpoint.
+    token : Optional[str]
+        Authentication token. Required for Zilliz Cloud; optional for
+        self-hosted Milvus with auth enabled; ignored by Milvus Lite.
+    collection_name : str
+        Name of the Milvus collection that holds the memories. A new
+        collection is created on ``initialize()`` if it does not already exist.
+    embedding_model : str
+        SentenceTransformer model name. ``all-MiniLM-L6-v2`` (384-dim) by
+        default — matches the rest of the project.
+    """
+
+    @property
+    def max_content_length(self) -> int | None:
+        return _CONTENT_MAX_LEN
+
+    @property
+    def supports_chunking(self) -> bool:
+        return True
+
+    def __init__(
+        self,
+        uri: str = "./milvus.db",
+        token: str | None = None,
+        collection_name: str = "mcp_memory",
+        embedding_model: str = "all-MiniLM-L6-v2",
+    ):
+        if not PYMILVUS_AVAILABLE:
+            raise ImportError(
+                "pymilvus is required for MilvusMemoryStorage. "
+                "Install with: pip install 'mcp-memory-service[milvus]'"
+            )
+
+        self.uri = uri
+        self.token = token
+        self.collection_name = collection_name
+        self.embedding_model_name = embedding_model
+
+        self.client: MilvusClient | None = None
+        self.embedding_model = None
+        self.embedding_dimension = 384  # default for all-MiniLM-L6-v2
+        self._initialized = False
+
+        # Whether the live collection has a ``content_lower`` field. New
+        # collections always do; pre-existing collections from older versions
+        # may not. ``get_by_exact_content`` falls back to a client-side scan
+        # when this is False. Set in ``_ensure_collection``.
+        self._has_content_lower = False
+
+        # Whether the collection has a BM25 function index on ``content``.
+        # New collections get one automatically; pre-existing collections
+        # without the ``sparse_vector`` field fall back to vector-only search.
+        self._has_bm25 = False
+
+        # Whether the access-tracking side-collection exists. Set during
+        # initialize() by _ensure_access_collection().
+        self._has_access_collection = False
+        self._access_collection: str = f"{self.collection_name}_access"
+
+        # Whether this storage is backed by Milvus Lite (embedded daemon) as
+        # opposed to a remote Milvus server or Zilliz Cloud endpoint. We
+        # mirror pymilvus's own heuristic (``uri.endswith('.db')``) — see
+        # pymilvus/client/connection_manager.py. Only the Lite code path
+        # reconnects on a dead channel, because Milvus Lite's daemon
+        # subprocess becomes unreachable after roughly 60s of idle
+        # (upstream issue https://github.com/milvus-io/milvus-lite/issues/334).
+        # Remote backends don't have that problem and must fail fast instead.
+        self._is_lite = bool(self.uri and self.uri.endswith(".db"))
+
+        # Single lock per storage instance. Every CRUD call acquires this
+        # once in :meth:`_call_client`. pymilvus's sync gRPC channel is not
+        # safe under concurrent access from multiple worker threads against
+        # Milvus Lite, and every write_lock holder also holds the sole right
+        # to invoke the client — one lock is both enough and necessary.
+        self._write_lock = asyncio.Lock()
+
+        # Semantic deduplication — mirrors sqlite_vec knobs/env vars so
+        # backends behave identically from the service layer's perspective.
+        self.semantic_dedup_enabled = (
+            os.getenv("MCP_SEMANTIC_DEDUP_ENABLED", "true").lower() == "true"
+        )
+        self.semantic_dedup_time_window = int(
+            os.getenv("MCP_SEMANTIC_DEDUP_TIME_WINDOW_HOURS", "24")
+        )
+        self.semantic_dedup_threshold = float(
+            os.getenv("MCP_SEMANTIC_DEDUP_THRESHOLD", "0.85")
+        )
+
+        # For a Lite-style file URI, make sure the parent directory exists.
+        # For HTTP(S) URIs we skip this — the path component is not a filesystem path.
+        if not self.uri.startswith(("http://", "https://")):
+            parent = os.path.dirname(self.uri)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+
+        logger.info(
+            "Initialized MilvusMemoryStorage (uri=%s, collection=%s)",
+            self.uri,
+            self.collection_name,
+        )
+
+    # -- Initialization ------------------------------------------------------
+
+    async def initialize(self) -> None:
+        """Connect to Milvus, load the embedding model, and ensure the collection exists."""
+        if self._initialized:
+            return
+
+        await self._initialize_embedding_model()
+        await asyncio.to_thread(self._connect_client)
+        await asyncio.to_thread(self._ensure_collection)
+        await asyncio.to_thread(self._ensure_access_collection)
+
+        self._initialized = True
+        logger.info(
+            "MilvusMemoryStorage ready (collection=%s, dim=%s)",
+            self.collection_name,
+            self.embedding_dimension,
+        )
+
+    def _connect_client(self) -> None:
+        kwargs: dict[str, Any] = {"uri": self.uri}
+        if self.token:
+            kwargs["token"] = self.token
+        self.client = MilvusClient(**kwargs)
+
+    def _ensure_collection(self) -> None:
+        """Create the collection if it does not already exist.
+
+        If a collection with the same name exists but has a different vector
+        dimension, we log a warning rather than mutating it — the caller must
+        decide whether to drop and rebuild.
+        """
+        assert self.client is not None
+
+        if self.client.has_collection(collection_name=self.collection_name):
+            self._validate_existing_collection()
+            return
+
+        schema = self.client.create_schema(
+            auto_id=False,
+            enable_dynamic_field=False,
+        )
+        schema.add_field(
+            field_name="id",
+            datatype=DataType.VARCHAR,
+            is_primary=True,
+            max_length=_ID_MAX_LEN,
+        )
+        schema.add_field(
+            field_name="vector",
+            datatype=DataType.FLOAT_VECTOR,
+            dim=self.embedding_dimension,
+        )
+        schema.add_field(
+            field_name="content",
+            datatype=DataType.VARCHAR,
+            max_length=_MILVUS_VARCHAR_MAX,
+            enable_analyzer=True,
+        )
+        # Lower-cased mirror of ``content``. Populated on every insert/upsert
+        # so that ``get_by_exact_content`` can push a case-insensitive
+        # substring filter down to Milvus (its ``like`` operator is
+        # case-sensitive and has no escape syntax, so we match against the
+        # pre-lowered mirror instead of scanning rows in Python).
+        schema.add_field(
+            field_name="content_lower",
+            datatype=DataType.VARCHAR,
+            max_length=_MILVUS_VARCHAR_MAX,
+        )
+        schema.add_field(
+            field_name="tags",
+            datatype=DataType.VARCHAR,
+            max_length=_TAGS_MAX_LEN,
+        )
+        schema.add_field(
+            field_name="memory_type",
+            datatype=DataType.VARCHAR,
+            max_length=_MEMORY_TYPE_MAX_LEN,
+        )
+        schema.add_field(
+            field_name="metadata",
+            datatype=DataType.VARCHAR,
+            max_length=_MILVUS_VARCHAR_MAX,
+        )
+        schema.add_field(field_name="created_at", datatype=DataType.DOUBLE)
+        schema.add_field(field_name="updated_at", datatype=DataType.DOUBLE)
+        schema.add_field(
+            field_name="created_at_iso",
+            datatype=DataType.VARCHAR,
+            max_length=_ISO_MAX_LEN,
+        )
+        schema.add_field(
+            field_name="updated_at_iso",
+            datatype=DataType.VARCHAR,
+            max_length=_ISO_MAX_LEN,
+        )
+
+        index_params = self.client.prepare_index_params()
+        index_params.add_index(
+            field_name="vector",
+            index_type="AUTOINDEX",
+            metric_type="COSINE",
+        )
+
+        # BM25 full-text search: add sparse vector field + BM25 function
+        # for new collections when pymilvus supports it (≥ 2.5).
+        if _BM25_IMPORTS_AVAILABLE:
+            try:
+                schema.add_field(
+                    field_name="sparse_vector",
+                    datatype=DataType.SPARSE_FLOAT_VECTOR,
+                )
+                bm25_function = Function(
+                    name="bm25_fn",
+                    input_field_names=["content"],
+                    output_field_names=["sparse_vector"],
+                    function_type=FunctionType.BM25,
+                )
+                schema.add_function(bm25_function)
+                index_params.add_index(
+                    field_name="sparse_vector",
+                    index_type="SPARSE_INVERTED_INDEX",
+                    metric_type="BM25",
+                )
+                self._has_bm25 = True
+                logger.info(
+                    "BM25 full-text search enabled for new collection '%s'",
+                    self.collection_name,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to add BM25 function to collection '%s' — "
+                    "using vector-only search: %s",
+                    self.collection_name,
+                    exc,
+                )
+                self._has_bm25 = False
+
+        self.client.create_collection(
+            collection_name=self.collection_name,
+            schema=schema,
+            index_params=index_params,
+        )
+        self._has_content_lower = True
+        logger.info(
+            "Created Milvus collection '%s' (dim=%s)",
+            self.collection_name,
+            self.embedding_dimension,
+        )
+
+    @staticmethod
+    def _extract_vector_dim(info: dict[str, Any]) -> int | None:
+        """Return the vector field dimension from a ``describe_collection`` payload."""
+        for field in info.get("fields", []):
+            if field.get("name") != "vector":
+                continue
+            params = field.get("params") or {}
+            raw = (
+                params.get("dim") if params.get("dim") is not None else field.get("dim")
+            )
+            try:
+                return int(raw) if raw is not None else None
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def _validate_existing_collection(self) -> None:
+        """Warn if the on-disk collection's vector dim disagrees with our model.
+
+        Also detects whether the collection has the ``content_lower`` field
+        that ``get_by_exact_content`` relies on for server-side filtering.
+        Collections created before this field was introduced fall back to a
+        client-side scan; a warning is logged once on connection.
+        """
+        assert self.client is not None
+        try:
+            info = self.client.describe_collection(collection_name=self.collection_name)
+        except Exception as exc:  # describe may fail on very old servers
+            logger.debug("describe_collection failed (ignored): %s", exc)
+            return
+
+        dim = self._extract_vector_dim(info)
+        if dim is not None and dim != self.embedding_dimension:
+            logger.warning(
+                "Existing Milvus collection '%s' uses dim=%s but the current "
+                "embedding model produces dim=%s. Retrieval will fail until the "
+                "dimensions match. Drop the collection or switch embedding models.",
+                self.collection_name,
+                dim,
+                self.embedding_dimension,
+            )
+
+        field_names = {f.get("name") for f in info.get("fields", [])}
+        self._has_content_lower = "content_lower" in field_names
+        if not self._has_content_lower:
+            logger.warning(
+                "Collection '%s' lacks the 'content_lower' field — "
+                "get_by_exact_content will fall back to a slower client-side "
+                "scan. Recreate the collection to pick up server-side filtering.",
+                self.collection_name,
+            )
+
+        # Detect BM25 capability by checking for sparse_vector field
+        self._has_bm25 = "sparse_vector" in field_names
+        if not self._has_bm25:
+            logger.warning(
+                "BM25 full-text search unavailable for collection '%s' — "
+                "using vector-only search",
+                self.collection_name,
+            )
+
+    def _ensure_access_collection(self) -> None:
+        """Create the access-tracking side-collection if it does not exist.
+
+        Schema mirrors the ``_graph`` collection pattern: a lightweight
+        scalar collection with a dummy vector field for Zilliz Cloud
+        compatibility.
+        """
+        assert self.client is not None
+
+        if self.client.has_collection(collection_name=self._access_collection):
+            self._has_access_collection = True
+            logger.info(
+                "Reusing existing access collection '%s'",
+                self._access_collection,
+            )
+            return
+
+        schema = self.client.create_schema(
+            auto_id=False,
+            enable_dynamic_field=False,
+        )
+        schema.add_field(
+            field_name="id",
+            datatype=DataType.VARCHAR,
+            is_primary=True,
+            max_length=_ID_MAX_LEN,
+        )
+        schema.add_field(
+            field_name="last_accessed",
+            datatype=DataType.DOUBLE,
+        )
+        schema.add_field(
+            field_name="_dummy_vec",
+            datatype=DataType.FLOAT_VECTOR,
+            dim=2,
+        )
+
+        index_params = self.client.prepare_index_params()
+        index_params.add_index(
+            field_name="_dummy_vec",
+            index_type="AUTOINDEX",
+            metric_type="L2",
+        )
+
+        self.client.create_collection(
+            collection_name=self._access_collection,
+            schema=schema,
+            index_params=index_params,
+        )
+        self._has_access_collection = True
+        logger.info(
+            "Created access-tracking collection '%s'",
+            self._access_collection,
+        )
+
+    async def _initialize_embedding_model(self) -> None:
+        """Load the sentence-transformers model (or cached instance)."""
+        if not SENTENCE_TRANSFORMERS_AVAILABLE:
+            raise RuntimeError(
+                "sentence-transformers is required for MilvusMemoryStorage. "
+                "Install with: pip install 'mcp-memory-service[milvus]'"
+            )
+
+        cache_key = f"st_{self.embedding_model_name}"
+        if cache_key in _MODEL_CACHE:
+            self.embedding_model = _MODEL_CACHE[cache_key]
+            self.embedding_dimension = _DIMENSION_CACHE.get(
+                cache_key, self.embedding_dimension
+            )
+            return
+
+        def _load_model():
+            device = self._resolve_device()
+            # If the model is already cached locally, load from the concrete
+            # snapshot path and turn on offline mode. That avoids the HEAD
+            # request huggingface_hub makes when you pass a model name, which
+            # retries for ~30s on networks that can't reach huggingface.co
+            # even though the model is fully present on disk. Mirrors the
+            # approach used in sqlite_vec._initialize_embedding_model.
+            hf_home = os.environ.get(
+                "HF_HOME", os.path.expanduser("~/.cache/huggingface")
+            )
+            safe_name = self.embedding_model_name.replace("/", "--")
+            cache_path = os.path.join(
+                hf_home, "hub", f"models--sentence-transformers--{safe_name}"
+            )
+            local_snapshot = None
+            if os.path.isdir(cache_path):
+                os.environ["HF_HUB_OFFLINE"] = "1"
+                os.environ["TRANSFORMERS_OFFLINE"] = "1"
+                snapshots_dir = os.path.join(cache_path, "snapshots")
+                if os.path.isdir(snapshots_dir):
+                    children = [
+                        os.path.join(snapshots_dir, d)
+                        for d in os.listdir(snapshots_dir)
+                        if os.path.isdir(os.path.join(snapshots_dir, d))
+                    ]
+                    if children:
+                        local_snapshot = children[0]
+
+            if local_snapshot:
+                logger.info(
+                    "Loading cached model from %s on device=%s", local_snapshot, device
+                )
+                return SentenceTransformer(local_snapshot, device=device)
+
+            logger.info(
+                "Loading embedding model '%s' on device=%s (may download)",
+                self.embedding_model_name,
+                device,
+            )
+            return SentenceTransformer(self.embedding_model_name, device=device)
+
+        self.embedding_model = await asyncio.to_thread(_load_model)
+
+        probe = await asyncio.to_thread(
+            self.embedding_model.encode, ["__dimension_probe__"]
+        )
+        try:
+            self.embedding_dimension = int(probe.shape[1])
+        except AttributeError:
+            self.embedding_dimension = len(probe[0])
+
+        _MODEL_CACHE[cache_key] = self.embedding_model
+        _DIMENSION_CACHE[cache_key] = self.embedding_dimension
+        logger.info("Embedding model loaded (dim=%s)", self.embedding_dimension)
+
+    def _resolve_device(self) -> str:
+        """Pick the best available torch device without forcing torch as a hard dep."""
+        try:
+            from ..utils.system_detection import get_torch_device
+
+            return get_torch_device()
+        except Exception:
+            return "cpu"
+
+    def _validate_embedding(self, embedding: list[float]) -> None:
+        """Raise ValueError if ``embedding`` has wrong dim or contains bad values."""
+        if len(embedding) != self.embedding_dimension:
+            raise ValueError(
+                f"Embedding dimension mismatch: expected {self.embedding_dimension}, "
+                f"got {len(embedding)}"
+            )
+        if not all(
+            isinstance(x, (int, float)) and not math.isnan(x) and not math.isinf(x)
+            for x in embedding
+        ):
+            raise ValueError("Embedding contains NaN or infinity")
+
+    def _generate_embedding(self, text: str) -> list[float]:
+        """Generate an embedding for a single piece of text (sync).
+
+        Results are memoized in a bounded LRU keyed by ``(model_name, text)``
+        — keying by the full string avoids the silent-wrong-embedding risk of
+        ``hash(text)`` collisions.
+        """
+        if not self.embedding_model:
+            raise RuntimeError("Embedding model not loaded. Call initialize() first.")
+
+        cache_key = f"{self.embedding_model_name}::{text}"
+        cached = _embedding_cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+        raw = self.embedding_model.encode([text], convert_to_numpy=True)[0]
+        embedding = raw.tolist() if hasattr(raw, "tolist") else list(raw)
+        self._validate_embedding(embedding)
+        _embedding_cache_put(cache_key, embedding)
+        return embedding
+
+    # -- Helpers -------------------------------------------------------------
+
+    def _ensure_initialized(self) -> bool:
+        if not self._initialized or self.client is None:
+            logger.error("MilvusMemoryStorage used before initialize()")
+            return False
+        return True
+
+    # Error substrings that indicate the underlying gRPC channel to the
+    # local Milvus Lite daemon is gone (upstream milvus-lite issue #334 —
+    # the daemon subprocess becomes unreachable after ~60s of idle). We
+    # intentionally match on substrings rather than exception types because
+    # grpc raises a plain ``ValueError`` for the closed-channel case while
+    # pymilvus raises ``MilvusException`` for the server-unavailable case.
+    _LITE_DEAD_CHANNEL_MARKERS = (
+        "Cannot invoke RPC on closed channel",
+        "server unavailable",
+        "Fail connecting to server",
+        "illegal connection params",
+    )
+
+    @classmethod
+    def _is_lite_dead_channel_error(cls, exc: BaseException) -> bool:
+        """Match the exact two error signatures from upstream issue #334."""
+        text = str(exc)
+        return any(m in text for m in cls._LITE_DEAD_CHANNEL_MARKERS)
+
+    def _reconnect_lite_client(self) -> None:
+        """Replace ``self.client`` with a fresh ``MilvusClient`` for the same
+        Lite database file.
+
+        Must be called while ``self._write_lock`` is held so concurrent
+        coroutines can't both observe the dead client and start reconnecting
+        at the same time. Does NOT call ``close()`` on the old client — that
+        call would block or raise on a dead Lite daemon. We just drop the
+        reference and let GC collect it.
+        """
+        kwargs: dict[str, Any] = {"uri": self.uri}
+        if self.token:
+            kwargs["token"] = self.token
+        self.client = MilvusClient(**kwargs)
+
+    async def _call_client(self, method_name: str, *args, **kwargs):
+        """Invoke ``self.client.<method_name>(*args, **kwargs)`` safely.
+
+        * Every invocation holds ``self._write_lock`` (one lock per storage
+          instance) — pymilvus's sync gRPC channel is not safe under
+          concurrent access from multiple worker threads against Milvus Lite.
+        * The sync pymilvus method runs via ``asyncio.to_thread`` so it
+          doesn't block the event loop.
+        * **Remote Milvus / Zilliz Cloud:** any RPC failure is logged with
+          full traceback and re-raised. No reconnect. The caller translates
+          the exception into its contract return value ``(False, <message>)``.
+        * **Milvus Lite only:** if the RPC fails with one of the two exact
+          error signatures from upstream issue #334 (closed channel /
+          server unavailable), we replace ``self.client`` with a fresh one
+          (still holding the same lock) and retry the call exactly once.
+          A failure on the retry propagates unchanged.
+        """
+        async with self._write_lock:
+            if self.client is None:
+                raise RuntimeError("MilvusMemoryStorage was not initialized")
+            return await self._invoke_locked(method_name, args, kwargs)
+
+    async def _invoke_locked(
+        self,
+        method_name: str,
+        args: tuple,
+        kwargs: dict,
+    ):
+        """Run the RPC under the already-acquired write lock.
+
+        Separated from :meth:`_call_client` so both halves stay well under
+        the complexity-≤8 budget.
+        """
+        try:
+            return await asyncio.to_thread(
+                getattr(self.client, method_name), *args, **kwargs
+            )
+        except Exception as exc:
+            if self._is_lite and self._is_lite_dead_channel_error(exc):
+                logger.warning(
+                    "Milvus Lite channel died on %s (%s) — reconnecting and retrying once "
+                    "(upstream milvus-lite issue #334)",
+                    method_name,
+                    exc,
+                )
+                self._reconnect_lite_client()
+                result = await asyncio.to_thread(
+                    getattr(self.client, method_name), *args, **kwargs
+                )
+                logger.info(
+                    "Milvus Lite reconnect succeeded; %s retried OK",
+                    method_name,
+                )
+                return result
+            logger.exception("Milvus RPC failed on %s: %s", method_name, exc)
+            raise
+
+    @staticmethod
+    def _iso_from_epoch(epoch: float) -> str:
+        """Render an epoch second value as an ISO-8601 UTC string."""
+        return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
+
+    def _resolve_timestamps(self, memory: Memory) -> tuple[float, str, float, str]:
+        """Return ``(created_at, created_at_iso, updated_at, updated_at_iso)``.
+
+        Derives both epoch and ISO values from the same ``now`` when a field
+        is missing, guaranteeing the two representations refer to the same
+        moment (previously ``created_at`` and ``created_at_iso`` could be
+        produced from different clock reads).
+        """
+        now = time.time()
+        created_at = float(memory.created_at) if memory.created_at is not None else now
+        created_iso = memory.created_at_iso or self._iso_from_epoch(created_at)
+        updated_at = float(memory.updated_at) if memory.updated_at is not None else now
+        updated_iso = memory.updated_at_iso or self._iso_from_epoch(updated_at)
+        return created_at, created_iso, updated_at, updated_iso
+
+    def _memory_to_entity(
+        self, memory: Memory, embedding: list[float]
+    ) -> dict[str, Any]:
+        created_at, created_iso, updated_at, updated_iso = self._resolve_timestamps(
+            memory
+        )
+        content = memory.content or ""
+        entity: dict[str, Any] = {
+            "id": memory.content_hash,
+            "vector": embedding,
+            "content": content,
+            "tags": _tags_to_string(memory.tags),
+            "memory_type": memory.memory_type or "",
+            "metadata": json.dumps(memory.metadata) if memory.metadata else "{}",
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "created_at_iso": created_iso,
+            "updated_at_iso": updated_iso,
+        }
+        if self._has_content_lower:
+            entity["content_lower"] = content.lower()
+        return entity
+
+    def _entity_to_memory(
+        self,
+        row: dict[str, Any],
+        include_embedding: bool = False,
+    ) -> Memory | None:
+        """Convert a Milvus row dict into a :class:`Memory`.
+
+        Args:
+            row: The row dict as returned by pymilvus ``query`` or
+                ``query_iterator``.
+            include_embedding: If True **and** the row carries a usable
+                ``vector`` value, populate ``Memory.embedding`` as a
+                ``list[float]``. If False, ``Memory.embedding`` is always
+                ``None``. If True but the vector is missing / empty /
+                malformed, ``Memory.embedding`` is ``None`` — hydration
+                never raises.
+
+        Returns:
+            A :class:`Memory` instance, or ``None`` if the row cannot be
+            parsed at all (e.g. missing mandatory scalar fields).
+        """
+        try:
+            embedding = self._coerce_vector(row) if include_embedding else None
+            return Memory(
+                content=row.get("content", "") or "",
+                content_hash=row.get("id", "") or "",
+                tags=_string_to_tags(row.get("tags")),
+                memory_type=row.get("memory_type") or None,
+                metadata=_safe_json_loads(row.get("metadata", ""), "milvus_entity"),
+                embedding=embedding,
+                created_at=row.get("created_at"),
+                updated_at=row.get("updated_at"),
+                created_at_iso=row.get("created_at_iso") or None,
+                updated_at_iso=row.get("updated_at_iso") or None,
+            )
+        except Exception as exc:
+            logger.warning("Failed to convert Milvus entity to Memory: %s", exc)
+            return None
+
+    def _coerce_vector(self, row: dict[str, Any]) -> list[float] | None:
+        """Convert ``row['vector']`` into a ``list[float]`` or return ``None``.
+
+        Never raises. The five non-happy paths all map to ``None``:
+
+        * ``vector`` key absent
+        * ``vector is None``
+        * ``vector`` is an empty sequence
+        * ``vector`` is a string or mapping (iterable but semantically wrong)
+        * ``vector`` is a type we cannot safely convert to a list
+
+        Numpy arrays are converted via ``.tolist()``; other sequences go
+        through ``list(...)``. A successful conversion is **not** validated
+        against ``self.embedding_dimension`` — dimension validation belongs
+        to ``_validate_existing_collection`` at connect time, not the hot
+        loop. Downstream consumers (clustering / associations) already
+        handle mismatched-length embeddings defensively.
+        """
+        if "vector" not in row:
+            return None
+        raw = row["vector"]
+        if raw is None:
+            return None
+        # Fast path: already a list of numbers.
+        if isinstance(raw, list):
+            return raw if raw else None
+        # Reject str / bytes / mapping early — they are iterable but would
+        # produce nonsense when fed into list(). This catches e.g. a stray
+        # JSON string being stored in the vector column.
+        if isinstance(raw, (str, bytes, bytearray, dict)):
+            row_id = row.get("id", "<unknown>")
+            logger.warning(
+                "Unexpected vector type %s for row id=%s; leaving embedding=None",
+                type(raw).__name__,
+                _sanitize_log_value(row_id),
+            )
+            return None
+        # Numpy array path.
+        to_list = getattr(raw, "tolist", None)
+        if callable(to_list):
+            try:
+                converted = to_list()
+            except Exception:
+                converted = None
+            if isinstance(converted, list):
+                return converted if converted else None
+        # Generic sequence fallback.
+        try:
+            converted = list(raw)
+            return converted if converted else None
+        except TypeError:
+            row_id = row.get("id", "<unknown>")
+            logger.warning(
+                "Unexpected vector type %s for row id=%s; leaving embedding=None",
+                type(raw).__name__,
+                _sanitize_log_value(row_id),
+            )
+            return None
+
+    @staticmethod
+    def _tag_like_clauses(tags: list[str], joiner: str) -> tuple[str, bool]:
+        """Build a ``tags like "%,...,%"`` clause for the given tags.
+
+        Returns ``(clause, matched_any)``. ``matched_any`` is False iff every
+        input tag was rejected (e.g. non-string); callers use this to decide
+        whether to return empty results rather than ignore the filter.
+        """
+        tag_clauses = []
+        for tag in tags:
+            if not isinstance(tag, str):
+                logger.warning("Skipping non-string tag of type %s", type(tag).__name__)
+                continue
+            stripped = _escape_like(tag.strip())
+            if not stripped:
+                continue
+            safe = stripped.replace('"', '\\"')
+            tag_clauses.append(f'tags like "%,{safe},%"')
+
+        if not tag_clauses:
+            return "", False
+        if len(tag_clauses) == 1:
+            return tag_clauses[0], True
+        return "(" + f" {joiner} ".join(tag_clauses) + ")", True
+
+    @staticmethod
+    def _combine_filter(*parts: str | None) -> str:
+        """AND-combine non-empty filter fragments into a single filter string."""
+        keep = [p for p in parts if p]
+        if not keep:
+            return ""
+        if len(keep) == 1:
+            return keep[0]
+        return " and ".join(f"({p})" for p in keep)
+
+    # Base output fields for CRUD read paths. Intentionally excludes ``vector``
+    # (roughly ``embedding_dimension * 4`` bytes, ≈ 2 KB per row at 512-dim) so
+    # that high-frequency tool calls like ``retrieve`` / ``search_by_tag`` /
+    # ``get_by_hash`` don't transfer vectors the caller doesn't consume.
+    _OUTPUT_FIELDS_BASE = (
+        "id",
+        "content",
+        "tags",
+        "memory_type",
+        "metadata",
+        "created_at",
+        "updated_at",
+        "created_at_iso",
+        "updated_at_iso",
+    )
+
+    # Extended output fields used by the consolidation read path, which needs
+    # the stored vector to drive DBSCAN clustering and cosine-similarity
+    # associations. Callers opt in via ``include_embeddings=True`` on
+    # ``get_all_memories`` / ``get_memories_by_time_range``.
+    _OUTPUT_FIELDS_WITH_VECTOR = (*_OUTPUT_FIELDS_BASE, "vector")
+
+    # Backward-compat alias. All existing references keep working; new code
+    # should pick one of the two tuples above explicitly.
+    _OUTPUT_FIELDS = _OUTPUT_FIELDS_BASE
+
+    # -- Conflict detection --------------------------------------------------
+
+    # Thresholds matching sqlite_vec behavior:
+    # Conflict = cosine similarity > 0.95 AND Levenshtein divergence > 0.20
+    _CONFLICT_SIMILARITY_THRESHOLD = 0.95
+    _CONFLICT_DIVERGENCE_THRESHOLD = 0.20
+
+    # Cached graph storage instance for conflict operations. Avoids creating
+    # a new MilvusClient + gRPC connection on every store() call.
+    # Stored as an instance attribute (_graph_storage) via _get_graph_storage().
+
+    async def _get_graph_storage(self):
+        """Get or create a cached MilvusGraphStorage instance (thread-safe)."""
+        from .milvus_graph import MilvusGraphStorage
+
+        # Fast path: already initialized
+        if getattr(self, "_graph_storage", None) is not None:
+            return self._graph_storage
+
+        # Slow path: initialize under lock to prevent concurrent creation
+        async with self._write_lock:
+            # Double-check after acquiring lock
+            if getattr(self, "_graph_storage", None) is not None:
+                return self._graph_storage
+
+            graph = MilvusGraphStorage(
+                uri=self.uri,
+                token=self.token,
+                collection_name=self.collection_name,
+            )
+            await graph.initialize()
+            self._graph_storage = graph
+            return graph
+
+    async def _detect_conflicts(
+        self, new_hash: str, new_content: str, embedding: list[float]
+    ) -> list[dict[str, Any]]:
+        """Detect conflicting active memories for a newly stored memory.
+
+        Mirrors sqlite_vec's _detect_conflicts logic:
+        Conflict = cosine similarity > 0.95 AND text divergence > 0.20.
+        Returns list of conflict info dicts.
+        """
+        from difflib import SequenceMatcher
+
+        if not self._ensure_initialized():
+            return []
+
+        # Find top-5 nearest memories (excluding self)
+        try:
+            results = await self._call_client(
+                "search",
+                collection_name=self.collection_name,
+                data=[embedding],
+                anns_field="vector",
+                filter=f'id != "{new_hash}"',
+                limit=5,
+                output_fields=["id", "content"],
+                search_params={"metric_type": "COSINE"},
+            )
+        except Exception as exc:
+            logger.warning("Conflict detection search failed: %s", exc)
+            return []
+
+        if not results or not results[0]:
+            return []
+
+        conflicts = []
+        for hit in results[0]:
+            # Milvus COSINE metric returns similarity directly as distance
+            similarity = float(hit.get("distance", 0.0))
+            if similarity < self._CONFLICT_SIMILARITY_THRESHOLD:
+                continue
+
+            # Extract candidate content
+            entity = hit.get("entity", {})
+            cand_hash = entity.get("id") or hit.get("id", "")
+            cand_content = entity.get("content") or ""
+
+            if not cand_content:
+                continue
+
+            # Compute text divergence (1 - SequenceMatcher ratio)
+            ratio = SequenceMatcher(
+                None, new_content.lower(), cand_content.lower()
+            ).ratio()
+            divergence = 1.0 - ratio
+            if divergence < self._CONFLICT_DIVERGENCE_THRESHOLD:
+                continue
+
+            conflicts.append(
+                {
+                    "existing_hash": cand_hash,
+                    "existing_content": cand_content,
+                    "similarity": round(similarity, 4),
+                    "divergence": round(divergence, 4),
+                }
+            )
+
+        return conflicts
+
+    async def _record_conflicts(
+        self, new_hash: str, conflicts: list[dict[str, Any]]
+    ) -> None:
+        """Record conflict edges in the graph collection and tag memories.
+
+        Stores bidirectional 'contradicts' edges in MilvusGraphStorage and
+        adds 'conflict:unresolved' tag to both memories.
+        """
+        try:
+            graph = await self._get_graph_storage()
+        except Exception as exc:
+            logger.warning("Cannot init graph storage for conflicts: %s", exc)
+            return
+
+        now = time.time()
+
+        # Fetch new_hash memory once (constant across all conflicts)
+        try:
+            new_mem = await self.get_by_hash(new_hash)
+        except Exception:
+            new_mem = None
+
+        # Tag new_hash once if needed
+        if new_mem and "conflict:unresolved" not in new_mem.tags:
+            try:
+                new_tags = [*list(new_mem.tags), "conflict:unresolved"]
+                await self.update_memory_metadata(
+                    content_hash=new_hash,
+                    updates={"tags": new_tags},
+                    preserve_timestamps=True,
+                )
+            except Exception as exc:
+                logger.warning("Failed to tag conflict on %s: %s", new_hash[:8], exc)
+
+        # Batch-fetch all existing_hash memories to avoid N+1 queries
+        existing_hashes = [c["existing_hash"] for c in conflicts]
+        mem_map: dict[str, Any] = {}
+        if existing_hashes:
+            try:
+                fetched = await self._call_client(
+                    "get",
+                    collection_name=self.collection_name,
+                    ids=existing_hashes,
+                    output_fields=list(self._OUTPUT_FIELDS),
+                )
+                for row in fetched or []:
+                    m = self._entity_to_memory(row)
+                    if m:
+                        mem_map[m.content_hash] = m
+            except Exception as exc:
+                logger.warning("Batch fetch for conflict tagging failed: %s", exc)
+
+        for c in conflicts:
+            existing_hash = c["existing_hash"]
+            metadata = {
+                "divergence": c["divergence"],
+                "detected_at": datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
+            }
+
+            # Store bidirectional contradicts edge
+            try:
+                await graph.store_association(
+                    source_hash=new_hash,
+                    target_hash=existing_hash,
+                    similarity=c["similarity"],
+                    connection_types=["semantic"],
+                    metadata=metadata,
+                    created_at=now,
+                    relationship_type="contradicts",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to store conflict edge %s↔%s: %s",
+                    new_hash[:8],
+                    existing_hash[:8],
+                    exc,
+                )
+                continue
+
+            # Tag existing memory with conflict:unresolved
+            existing_mem = mem_map.get(existing_hash)
+            if existing_mem and "conflict:unresolved" not in existing_mem.tags:
+                try:
+                    new_tags = [*list(existing_mem.tags), "conflict:unresolved"]
+                    await self.update_memory_metadata(
+                        content_hash=existing_hash,
+                        updates={"tags": new_tags},
+                        preserve_timestamps=True,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to tag conflict on %s: %s", existing_hash[:8], exc
+                    )
+
+        logger.info("Recorded %d conflict(s) for %s", len(conflicts), new_hash[:8])
+
+    async def get_conflicts(self) -> list[dict[str, Any]]:
+        """Return unresolved conflict pairs from the graph collection.
+
+        Queries the graph collection for edges with relationship_type='contradicts',
+        then batch-fetches all referenced memories to avoid N+1 queries.
+        """
+        if not self._ensure_initialized():
+            return []
+
+        try:
+            graph = await self._get_graph_storage()
+        except Exception as exc:
+            logger.warning("Cannot init graph storage for get_conflicts: %s", exc)
+            return []
+
+        try:
+            # Query all contradicts edges
+            rows = await graph._call_client(
+                "query",
+                collection_name=graph.collection_name,
+                filter='relationship_type == "contradicts"',
+                output_fields=[
+                    "source_hash",
+                    "target_hash",
+                    "similarity",
+                    "metadata",
+                ],
+                limit=_MILVUS_MAX_LIMIT,
+            )
+        except Exception as exc:
+            logger.warning("Failed to query conflict edges: %s", exc)
+            return []
+
+        if not rows:
+            return []
+
+        # Deduplicate and collect all unique hashes
+        pair_rows: list[dict[str, Any]] = []
+        all_hashes: set = set()
+        seen: set = set()
+
+        for row in rows:
+            src = row.get("source_hash", "")
+            tgt = row.get("target_hash", "")
+            pair_key = tuple(sorted([src, tgt]))
+            if pair_key in seen:
+                continue
+            seen.add(pair_key)
+            pair_rows.append(row)
+            if src:
+                all_hashes.add(src)
+            if tgt:
+                all_hashes.add(tgt)
+
+        # Batch-fetch all memories in one call to avoid N+1 queries
+        mem_map: dict[str, Any] = {}
+        if all_hashes:
+            try:
+                fetched = await self._call_client(
+                    "get",
+                    collection_name=self.collection_name,
+                    ids=list(all_hashes),
+                    output_fields=list(self._OUTPUT_FIELDS),
+                )
+                for r in fetched or []:
+                    m = self._entity_to_memory(r)
+                    if m:
+                        mem_map[m.content_hash] = m
+            except Exception as exc:
+                logger.warning("Batch fetch for get_conflicts failed: %s", exc)
+                return []
+
+        results: list[dict[str, Any]] = []
+        for row in pair_rows:
+            src = row.get("source_hash", "")
+            tgt = row.get("target_hash", "")
+            mem_a = mem_map.get(src)
+            mem_b = mem_map.get(tgt)
+            if not mem_a or not mem_b:
+                continue
+            if (
+                "conflict:unresolved" not in mem_a.tags
+                and "conflict:unresolved" not in mem_b.tags
+            ):
+                continue
+
+            meta_raw = row.get("metadata", "{}")
+            meta = json.loads(meta_raw) if isinstance(meta_raw, str) else meta_raw
+
+            results.append(
+                {
+                    "hash_a": src,
+                    "hash_b": tgt,
+                    "content_a": mem_a.content,
+                    "content_b": mem_b.content,
+                    "similarity": row.get("similarity", 0.0),
+                    "divergence": meta.get("divergence"),
+                    "detected_at": meta.get("detected_at"),
+                }
+            )
+
+        return results
+
+    async def resolve_conflict(
+        self, winner_hash: str, loser_hash: str
+    ) -> tuple[bool, str]:
+        """Resolve a conflict: mark loser as superseded, boost winner.
+
+        - Loser gets metadata 'superseded_by' = winner_hash
+        - Winner gets quality_score boosted to max(current, 0.8)
+        - Both have 'conflict:unresolved' tag removed
+        - The contradicts edge is deleted from the graph
+        """
+        if not self._ensure_initialized():
+            return False, "Milvus storage not initialized"
+
+        # Verify both exist
+        winner = await self.get_by_hash(winner_hash)
+        loser = await self.get_by_hash(loser_hash)
+        if not winner:
+            return False, f"Winner memory {winner_hash} not found"
+        if not loser:
+            return False, f"Loser memory {loser_hash} not found"
+
+        # Mark loser as superseded
+        loser_meta = dict(loser.metadata or {})
+        loser_meta["superseded_by"] = winner_hash
+        loser_tags = [t for t in loser.tags if t != "conflict:unresolved"]
+        try:
+            ok, msg = await self.update_memory_metadata(
+                content_hash=loser_hash,
+                updates={"tags": loser_tags, "metadata": loser_meta},
+                preserve_timestamps=True,
+            )
+            if not ok:
+                return False, f"Failed to update loser: {msg}"
+        except Exception as exc:
+            return False, f"Failed to update loser: {exc}"
+
+        # Boost winner confidence / quality
+        winner_meta = dict(winner.metadata or {})
+        winner_meta["quality_score"] = max(winner_meta.get("quality_score", 0.5), 0.8)
+        winner_tags = [t for t in winner.tags if t != "conflict:unresolved"]
+        try:
+            ok, msg = await self.update_memory_metadata(
+                content_hash=winner_hash,
+                updates={"tags": winner_tags, "metadata": winner_meta},
+                preserve_timestamps=True,
+            )
+            if not ok:
+                return False, f"Failed to update winner: {msg}"
+        except Exception as exc:
+            return False, f"Failed to update winner: {exc}"
+
+        # Delete the contradicts edge from graph
+        try:
+            graph = await self._get_graph_storage()
+            await graph.delete_association(winner_hash, loser_hash)
+        except Exception as exc:
+            logger.warning("Failed to delete conflict edge (non-fatal): %s", exc)
+
+        logger.info(
+            "Conflict resolved: %s wins over %s", winner_hash[:8], loser_hash[:8]
+        )
+        return True, f"Conflict resolved: {winner_hash[:8]} supersedes {loser_hash[:8]}"
+
+    # -- Semantic dedup ------------------------------------------------------
+
+    @staticmethod
+    def _cosine_similarity(a: list[float], b: list[float]) -> float:
+        """Compute cosine similarity between two vectors (pure Python)."""
+        dot = sum(x * y for x, y in zip(a, b))
+        norm_a = math.sqrt(sum(x * x for x in a))
+        norm_b = math.sqrt(sum(x * x for x in b))
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        return dot / (norm_a * norm_b)
+
+    async def _check_semantic_duplicate(
+        self,
+        content: str,
+        time_window_hours: int,
+        similarity_threshold: float,
+    ) -> tuple[bool, str | None]:
+        """Look for a recently stored memory that is semantically similar.
+
+        Returns ``(is_duplicate, existing_hash)``.
+
+        Uses ``query()`` (brute-force scan) instead of ``search()`` (ANN) to
+        guarantee visibility of data in growing segments on Milvus Lite.  ANN
+        search may not find freshly inserted records whose segment has not yet
+        been sealed/indexed — see GitHub issue #938.
+
+        The query fetches recent memories with their vectors, then computes
+        cosine similarity on the client side.
+        """
+        if not self._ensure_initialized():
+            return False, None
+
+        cutoff = time.time() - time_window_hours * 3600
+        try:
+            embedding = self._generate_embedding(content)
+        except Exception as exc:
+            logger.warning("Semantic dedup skipped — embedding failed: %s", exc)
+            return False, None
+
+        try:
+            rows = await self._call_client(
+                "query",
+                collection_name=self.collection_name,
+                filter=f"created_at >= {cutoff}",
+                output_fields=["id", "vector", "created_at"],
+                limit=50,
+                consistency_level="Strong",
+            )
+        except Exception as exc:
+            logger.warning("Semantic dedup query failed: %s", exc)
+            return False, None
+
+        if not rows:
+            return False, None
+
+        # Pre-compute query embedding norm once — it is constant across all candidates.
+        norm_embedding = math.sqrt(sum(x * x for x in embedding))
+        if norm_embedding == 0:
+            return False, None
+
+        for row in rows:
+            row_vec = row.get("vector")
+            if not row_vec:
+                continue
+            norm_row = math.sqrt(sum(x * x for x in row_vec))
+            if norm_row == 0:
+                continue
+            dot = sum(x * y for x, y in zip(embedding, row_vec))
+            similarity = dot / (norm_embedding * norm_row)
+            if similarity >= similarity_threshold:
+                return True, row.get("id")
+        return False, None
+
+    # -- Store ---------------------------------------------------------------
+
+    async def store(
+        self, memory: Memory, skip_semantic_dedup: bool = False
+    ) -> tuple[bool, str]:
+        # Explicit invariant log: if this ever reports True, something
+        # outside ``close()`` has nulled out the client and that is a bug.
+        logger.debug("store() entry — self.client is None: %r", self.client is None)
+        if not self._ensure_initialized():
+            return False, "Milvus storage not initialized"
+
+        try:
+            existing = await self.get_by_hash(memory.content_hash)
+            if existing is not None:
+                return False, "Duplicate content detected (exact match)"
+
+            if self.semantic_dedup_enabled and not skip_semantic_dedup:
+                is_dup, hit_hash = await self._check_semantic_duplicate(
+                    memory.content,
+                    time_window_hours=self.semantic_dedup_time_window,
+                    similarity_threshold=self.semantic_dedup_threshold,
+                )
+                if is_dup:
+                    return (
+                        False,
+                        f"Duplicate content detected (semantically similar to {hit_hash})",
+                    )
+
+            try:
+                embedding = self._generate_embedding(memory.content)
+            except Exception as exc:
+                logger.error("Failed to embed memory %s: %s", memory.content_hash, exc)
+                return False, f"Failed to generate embedding: {exc}"
+
+            entity = self._memory_to_entity(memory, embedding)
+
+            await self._call_client(
+                "insert",
+                collection_name=self.collection_name,
+                data=[entity],
+            )
+
+            logger.info("Stored memory %s", memory.content_hash)
+
+            # --- Conflict detection (post-commit) ---
+            try:
+                conflict_infos = await self._detect_conflicts(
+                    memory.content_hash, memory.content, embedding
+                )
+                if conflict_infos:
+                    await self._record_conflicts(memory.content_hash, conflict_infos)
+                    conflict_msg = f" {len(conflict_infos)} conflict(s) detected."
+                else:
+                    conflict_msg = ""
+            except Exception as e:
+                logger.warning("Conflict detection failed (non-fatal): %s", e)
+                conflict_msg = ""
+
+            return True, f"Memory stored successfully{conflict_msg}"
+
+        except Exception as exc:
+            logger.error("Failed to store memory: %s\n%s", exc, traceback.format_exc())
+            return False, f"Failed to store memory: {exc}"
+
+    async def _prepare_batch_entity(
+        self, memory: Memory
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Build a single batch entity or return a failure message for it."""
+        try:
+            existing = await self.get_by_hash(memory.content_hash)
+            if existing is not None:
+                return None, "Duplicate content detected (exact match)"
+            embedding = self._generate_embedding(memory.content)
+        except Exception as exc:
+            return None, f"Failed to prepare memory: {exc}"
+        return self._memory_to_entity(memory, embedding), None
+
+    async def _flush_batch_insert(
+        self,
+        results: list[tuple[bool, str]],
+        to_insert: list[dict[str, Any]],
+        insert_indices: list[int],
+    ) -> None:
+        """Commit a prepared batch and update ``results`` in place."""
+        if not to_insert:
+            return
+        try:
+            await self._call_client(
+                "insert",
+                collection_name=self.collection_name,
+                data=to_insert,
+            )
+            outcome = (True, "Memory stored successfully")
+        except Exception as exc:
+            logger.error("Milvus batch insert failed: %s", exc)
+            outcome = (False, f"Failed to store memory: {exc}")
+        for idx in insert_indices:
+            results[idx] = outcome
+
+    async def store_batch(self, memories: list[Memory]) -> list[tuple[bool, str]]:
+        if not memories:
+            return []
+        if not self._ensure_initialized():
+            return [(False, "Milvus storage not initialized")] * len(memories)
+
+        results: list[tuple[bool, str]] = [(False, "not processed")] * len(memories)
+        to_insert: list[dict[str, Any]] = []
+        insert_indices: list[int] = []
+
+        for idx, memory in enumerate(memories):
+            entity, err = await self._prepare_batch_entity(memory)
+            if entity is None:
+                results[idx] = (False, err or "Failed to prepare memory")
+            else:
+                to_insert.append(entity)
+                insert_indices.append(idx)
+
+        await self._flush_batch_insert(results, to_insert, insert_indices)
+        return results
+
+    # -- Retrieve ------------------------------------------------------------
+
+    def _build_tag_filter(self, tags: list[str] | None) -> tuple[str, bool]:
+        """Prepare a tag-based filter for ``retrieve``.
+
+        Returns ``(filter_expression, ok)``. ``ok=False`` means the caller
+        must short-circuit to an empty result list (tags were supplied but
+        all rejected).
+        """
+        if not tags:
+            return "", True
+        if len(tags) > _MAX_TAGS_FOR_SEARCH:
+            logger.warning(
+                "Too many tags (%s), truncating to %s",
+                len(tags),
+                _MAX_TAGS_FOR_SEARCH,
+            )
+            tags = tags[:_MAX_TAGS_FOR_SEARCH]
+        tag_filter, matched = self._tag_like_clauses(tags, joiner="or")
+        if not matched:
+            logger.warning("Tag filter had no valid tags; returning empty.")
+            return "", False
+        return tag_filter, True
+
+    def _hit_to_row(self, hit: dict[str, Any]) -> dict[str, Any]:
+        """Flatten a MilvusClient search hit into a plain row dict.
+
+        Different pymilvus versions return output_fields inlined on the hit,
+        or nested under an ``entity`` key. Handle both consistently.
+        """
+        entity = hit.get("entity") if isinstance(hit, dict) else None
+        row = dict(entity) if entity else {}
+        for field in self._OUTPUT_FIELDS:
+            if field in hit and field not in row:
+                row[field] = hit[field]
+        if "id" not in row and "id" in hit:
+            row["id"] = hit["id"]
+        return row
+
+    def _hit_to_result(
+        self, hit: dict[str, Any], query: str
+    ) -> MemoryQueryResult | None:
+        row = self._hit_to_row(hit)
+        memory = self._entity_to_memory(row)
+        if memory is None:
+            return None
+        similarity = float(hit.get("distance", 0.0))
+        relevance = max(0.0, min(1.0, similarity))
+        memory.record_access(query)
+        return MemoryQueryResult(
+            memory=memory,
+            relevance_score=relevance,
+            debug_info={"distance": similarity, "backend": "milvus"},
+        )
+
+    async def _run_search(
+        self, query_embedding: list[float], tag_filter: str, fetch_n: int
+    ) -> list[dict[str, Any]]:
+        """Execute a vector search with a tag filter, returning the raw hit list."""
+        try:
+            search_results = await self._call_client(
+                "search",
+                collection_name=self.collection_name,
+                data=[query_embedding],
+                anns_field="vector",
+                filter=tag_filter,
+                limit=fetch_n,
+                output_fields=list(self._OUTPUT_FIELDS),
+                search_params={"metric_type": "COSINE"},
+            )
+        except Exception as exc:
+            logger.error("Milvus search failed: %s", exc)
+            return []
+        if not search_results or not search_results[0]:
+            return []
+        return list(search_results[0])
+
+    async def _run_hybrid_search(
+        self,
+        query: str,
+        query_embedding: list[float],
+        tag_filter: str,
+        fetch_n: int,
+    ) -> list[dict[str, Any]]:
+        """Execute hybrid vector + BM25 search with RRF merging.
+
+        Falls back to vector-only search if hybrid_search fails.
+        """
+        if not _HYBRID_SEARCH_AVAILABLE:
+            return await self._run_search(query_embedding, tag_filter, fetch_n)
+
+        try:
+            # Dense vector ANN request
+            vector_req = AnnSearchRequest(
+                data=[query_embedding],
+                anns_field="vector",
+                param={"metric_type": "COSINE"},
+                limit=fetch_n,
+                expr=tag_filter if tag_filter else None,
+            )
+
+            # BM25 sparse vector request
+            bm25_req = AnnSearchRequest(
+                data=[query],
+                anns_field="sparse_vector",
+                param={"metric_type": "BM25"},
+                limit=fetch_n,
+                expr=tag_filter if tag_filter else None,
+            )
+
+            search_results = await self._call_client(
+                "hybrid_search",
+                collection_name=self.collection_name,
+                reqs=[vector_req, bm25_req],
+                ranker=RRFRanker(k=RRF_RANKER_K),
+                limit=fetch_n,
+                output_fields=list(self._OUTPUT_FIELDS),
+            )
+
+            if not search_results or not search_results[0]:
+                return []
+
+            # Deduplicate by content_hash (id field), keeping higher-ranked entry
+            seen: set = set()
+            deduped: list[dict[str, Any]] = []
+            for hit in search_results[0]:
+                hit_id = hit.get("id") or hit.get("entity", {}).get("id")
+                if hit_id and hit_id in seen:
+                    continue
+                if hit_id:
+                    seen.add(hit_id)
+                deduped.append(hit)
+            return deduped
+
+        except Exception as exc:
+            logger.warning(
+                "Hybrid search failed, falling back to vector-only: %s",
+                exc,
+            )
+            return await self._run_search(query_embedding, tag_filter, fetch_n)
+
+    def _embed_query(self, query: str) -> list[float] | None:
+        """Return an embedding for ``query`` or ``None`` on failure (logged)."""
+        try:
+            return self._generate_embedding(query)
+        except Exception as exc:
+            logger.error("Failed to generate query embedding: %s", exc)
+            return None
+
+    @staticmethod
+    def _retrieve_fetch_limit(n_results: int, tag_filter: str) -> int:
+        # Filtered ANN under HNSW can return fewer than `limit` results when
+        # the selectivity filter eliminates candidates; over-fetch 3× to
+        # compensate so the caller still gets the requested number of hits.
+        base = n_results * 3 if tag_filter else n_results
+        return max(1, min(base, _MILVUS_MAX_LIMIT))
+
+    def _rank_and_trim(
+        self,
+        hits: list[dict[str, Any]],
+        query: str,
+        n_results: int,
+        min_confidence: float,
+    ) -> list[MemoryQueryResult]:
+        results: list[MemoryQueryResult] = []
+        for hit in hits:
+            result = self._hit_to_result(hit, query)
+            if result is not None:
+                results.append(result)
+        results.sort(key=lambda r: r.relevance_score, reverse=True)
+        results = results[:n_results]
+        if min_confidence > 0.0:
+            results = [r for r in results if r.relevance_score >= min_confidence]
+        return results
+
+    async def retrieve(
+        self,
+        query: str,
+        n_results: int = 5,
+        tags: list[str] | None = None,
+        min_confidence: float = 0.0,
+        include_superseded: bool = False,
+        start_time: float | None = None,
+        end_time: float | None = None,
+    ) -> list[MemoryQueryResult]:
+        logger.debug("retrieve() entry — self.client is None: %r", self.client is None)
+        if not self._ensure_initialized():
+            return []
+
+        query_embedding = self._embed_query(query)
+        if query_embedding is None:
+            return []
+
+        tag_filter, ok = self._build_tag_filter(tags)
+        if not ok:
+            return []
+
+        fetch_n = self._retrieve_fetch_limit(n_results, tag_filter)
+        if self._has_bm25:
+            hits = await self._run_hybrid_search(
+                query, query_embedding, tag_filter, fetch_n
+            )
+        else:
+            hits = await self._run_search(query_embedding, tag_filter, fetch_n)
+
+        # Rank all hits, filter superseded before trimming to preserve result count
+        results = self._rank_and_trim(hits, query, len(hits), min_confidence)
+        if not include_superseded:
+            results = [r for r in results if not r.memory.metadata.get("superseded_by")]
+        results = results[:n_results]
+
+        # Async update last_accessed for hit memories (non-blocking)
+        if results:
+            hit_hashes = [r.memory.content_hash for r in results]
+            asyncio.create_task(self._touch_access(hit_hashes))
+
+        return results
+
+    # -- Tag-based search ----------------------------------------------------
+
+    async def search_by_tag(
+        self,
+        tags: list[str],
+        time_start: float | None = None,
+    ) -> list[Memory]:
+        if not tags or not self._ensure_initialized():
+            return []
+
+        tag_filter, matched = self._tag_like_clauses(tags, joiner="or")
+        if not matched:
+            return []
+        time_filter = f"created_at >= {time_start}" if time_start is not None else None
+        filter_expr = self._combine_filter(tag_filter, time_filter)
+
+        return await self._query_memories(
+            filter_expr=filter_expr,
+            limit=_MILVUS_MAX_LIMIT,
+            sort_desc_key="created_at",
+        )
+
+    @staticmethod
+    def _normalize_tag_operation(operation: str) -> str:
+        op = (operation or "AND").strip().upper()
+        if op not in ("AND", "OR"):
+            logger.warning(
+                "Unsupported tag operation '%s'; defaulting to AND", operation
+            )
+            return "AND"
+        return op
+
+    @staticmethod
+    def _time_range_filters(
+        time_start: float | None, time_end: float | None
+    ) -> list[str]:
+        parts: list[str] = []
+        if time_start is not None:
+            parts.append(f"created_at >= {time_start}")
+        if time_end is not None:
+            parts.append(f"created_at <= {time_end}")
+        return parts
+
+    async def search_by_tags(
+        self,
+        tags: list[str],
+        operation: str = "AND",
+        time_start: float | None = None,
+        time_end: float | None = None,
+    ) -> list[Memory]:
+        if not tags or not self._ensure_initialized():
+            return []
+
+        op = self._normalize_tag_operation(operation)
+        tag_filter, matched = self._tag_like_clauses(
+            tags, joiner="and" if op == "AND" else "or"
+        )
+        if not matched:
+            return []
+
+        time_parts = self._time_range_filters(time_start, time_end)
+        filter_expr = self._combine_filter(tag_filter, *time_parts)
+
+        return await self._query_memories(
+            filter_expr=filter_expr,
+            limit=_MILVUS_MAX_LIMIT,
+            sort_desc_key="updated_at",
+        )
+
+    # -- Delete --------------------------------------------------------------
+
+    async def delete(self, content_hash: str) -> tuple[bool, str]:
+        if not self._ensure_initialized():
+            return False, "Milvus storage not initialized"
+
+        existing = await self.get_by_hash(content_hash)
+        if existing is None:
+            return False, f"Memory with hash {content_hash} not found"
+
+        try:
+            await self._call_client(
+                "delete",
+                collection_name=self.collection_name,
+                ids=[content_hash],
+            )
+        except Exception as exc:
+            logger.error("Failed to delete memory %s: %s", content_hash, exc)
+            return False, f"Failed to delete memory: {exc}"
+
+        logger.info("Deleted memory %s", content_hash)
+        # Clean up access tracking record
+        if self._has_access_collection:
+            try:
+                await self._call_client(
+                    "delete",
+                    collection_name=self._access_collection,
+                    ids=[content_hash],
+                )
+            except Exception:
+                pass  # non-fatal
+        return True, f"Successfully deleted memory {content_hash}"
+
+    async def delete_memory(self, content_hash: str) -> bool:
+        """Delete a memory by content hash (consolidation protocol).
+
+        DreamInspiredConsolidator expects a ``delete_memory(hash) -> bool``
+        method during the Compression (replace-with-summary) and Controlled
+        Forgetting stages. Milvus's native ``delete()`` returns
+        ``Tuple[bool, str]``; this thin proxy adapts the signature so
+        consolidation does not fail with ``AttributeError``.
+        """
+        success, _ = await self.delete(content_hash)
+        return success
+
+    async def delete_by_tag(self, tag: str) -> tuple[int, str]:
+        if not self._ensure_initialized():
+            return 0, "Milvus storage not initialized"
+
+        tag_filter, matched = self._tag_like_clauses([tag], joiner="or")
+        if not matched:
+            return 0, f"No memories found with tag '{tag}'"
+        return await self._delete_matching(
+            tag_filter, f"Successfully deleted {{count}} memories with tag '{tag}'"
+        )
+
+    async def delete_by_tags(self, tags: list[str]) -> tuple[int, str, list[str]]:
+        if not self._ensure_initialized():
+            return 0, "Milvus storage not initialized", []
+        if not tags:
+            return 0, "No tags provided", []
+
+        tag_filter, matched = self._tag_like_clauses(tags, joiner="or")
+        if not matched:
+            return 0, f"No memories found matching any of the {len(tags)} tags", []
+
+        hashes = await self._collect_hashes(tag_filter)
+        if not hashes:
+            return 0, f"No memories found matching any of the {len(tags)} tags", []
+
+        await self._call_client(
+            "delete",
+            collection_name=self.collection_name,
+            ids=hashes,
+        )
+        return (
+            len(hashes),
+            f"Successfully deleted {len(hashes)} memories matching {len(tags)} tag(s)",
+            hashes,
+        )
+
+    async def delete_by_timeframe(
+        self,
+        start_date: date,
+        end_date: date,
+        tag: str | None = None,
+    ) -> tuple[int, str]:
+        if not self._ensure_initialized():
+            return 0, "Milvus storage not initialized"
+
+        start_ts = datetime.combine(start_date, datetime.min.time()).timestamp()
+        end_ts = datetime.combine(end_date, datetime.max.time()).timestamp()
+        time_filter = f"created_at >= {start_ts} and created_at <= {end_ts}"
+
+        tag_filter = ""
+        if tag:
+            tag_filter, matched = self._tag_like_clauses([tag], joiner="or")
+            if not matched:
+                return 0, f"Deleted 0 memories from {start_date} to {end_date}" + (
+                    f" with tag '{tag}'" if tag else ""
+                )
+
+        filter_expr = self._combine_filter(tag_filter, time_filter)
+        suffix = f" with tag '{tag}'" if tag else ""
+        count, _ = await self._delete_matching_parts(
+            filter_expr,
+            f"Deleted {{count}} memories from {start_date} to {end_date}{suffix}",
+        )
+        return (
+            count,
+            f"Deleted {count} memories from {start_date} to {end_date}{suffix}",
+        )
+
+    async def delete_before_date(
+        self,
+        before_date: date,
+        tag: str | None = None,
+    ) -> tuple[int, str]:
+        if not self._ensure_initialized():
+            return 0, "Milvus storage not initialized"
+
+        before_ts = datetime.combine(before_date, datetime.min.time()).timestamp()
+        time_filter = f"created_at < {before_ts}"
+
+        tag_filter = ""
+        if tag:
+            tag_filter, matched = self._tag_like_clauses([tag], joiner="or")
+            if not matched:
+                return 0, f"Deleted 0 memories before {before_date}" + (
+                    f" with tag '{tag}'" if tag else ""
+                )
+
+        filter_expr = self._combine_filter(tag_filter, time_filter)
+        suffix = f" with tag '{tag}'" if tag else ""
+        count, _ = await self._delete_matching_parts(
+            filter_expr,
+            f"Deleted {{count}} memories before {before_date}{suffix}",
+        )
+        return count, f"Deleted {count} memories before {before_date}{suffix}"
+
+    async def _delete_matching(
+        self, filter_expr: str, success_template: str
+    ) -> tuple[int, str]:
+        count, _hashes = await self._delete_matching_parts(
+            filter_expr, success_template
+        )
+        if count > 0:
+            return count, success_template.format(count=count)
+        return 0, "No memories found"
+
+    async def _delete_matching_parts(
+        self, filter_expr: str, _success_template: str
+    ) -> tuple[int, list[str]]:
+        hashes = await self._collect_hashes(filter_expr)
+        if not hashes:
+            return 0, []
+        await self._call_client(
+            "delete",
+            collection_name=self.collection_name,
+            ids=hashes,
+        )
+        return len(hashes), hashes
+
+    async def _collect_hashes(self, filter_expr: str) -> list[str]:
+        rows = await self._call_client(
+            "query",
+            collection_name=self.collection_name,
+            filter=filter_expr,
+            output_fields=["id"],
+            limit=_MILVUS_MAX_LIMIT,
+        )
+        return [row["id"] for row in rows if row.get("id")]
+
+    # -- Reads ---------------------------------------------------------------
+
+    async def get_by_hash(self, content_hash: str) -> Memory | None:
+        if not self._ensure_initialized():
+            return None
+
+        try:
+            rows = await self._call_client(
+                "get",
+                collection_name=self.collection_name,
+                ids=[content_hash],
+                output_fields=list(self._OUTPUT_FIELDS),
+            )
+        except Exception as exc:
+            logger.error("Failed to get memory %s: %s", content_hash, exc)
+            return None
+
+        if not rows:
+            return None
+        return self._entity_to_memory(rows[0])
+
+    async def get_by_exact_content(self, content: str) -> list[Memory]:
+        """Case-insensitive substring match on content.
+
+        Matches sqlite_vec's semantics (``LIKE '%...%' COLLATE NOCASE``
+        ordered by ``created_at DESC``). The filter is pushed down to Milvus
+        via the mirrored ``content_lower`` field so we don't fetch every row
+        into Python. On legacy collections that predate ``content_lower``,
+        falls back to a bounded client-side scan.
+        """
+        if not self._ensure_initialized():
+            return []
+
+        if not self._has_content_lower:
+            return await self._get_by_exact_content_fallback(content)
+
+        needle = _escape_like(content.lower())
+        if not needle:
+            return []
+        safe = needle.replace('"', '\\"')
+        filter_expr = f'content_lower like "%{safe}%"'
+        return await self._query_memories(
+            filter_expr=filter_expr,
+            limit=_MILVUS_MAX_LIMIT,
+            sort_desc_key="created_at",
+        )
+
+    async def _get_by_exact_content_fallback(self, content: str) -> list[Memory]:
+        """Client-side scan for collections without ``content_lower`` field."""
+        memories = await self.get_all_memories()
+        needle = content.lower()
+        return [m for m in memories if needle in (m.content or "").lower()]
+
+    async def cleanup_duplicates(self) -> tuple[int, str]:
+        # With content_hash as the primary key, Milvus rejects duplicate PKs
+        # at insert time (upsert replaces in place), so there is nothing to
+        # clean up. Keep the method for contract compliance.
+        return 0, "No duplicate memories found"
+
+    _PROTECTED_UPDATE_KEYS = frozenset(
+        {
+            "content",
+            "content_hash",
+            "tags",
+            "memory_type",
+            "metadata",
+            "embedding",
+            "created_at",
+            "created_at_iso",
+            "updated_at",
+            "updated_at_iso",
+        }
+    )
+
+    def _resolve_updated_tags(
+        self, existing: Memory, updates: dict[str, Any]
+    ) -> tuple[list[str] | None, str | None]:
+        if "tags" not in updates:
+            return list(existing.tags), None
+        if not isinstance(updates["tags"], list):
+            return None, "Tags must be provided as a list of strings"
+        return list(updates["tags"]), None
+
+    def _resolve_updated_metadata(
+        self, existing: Memory, updates: dict[str, Any]
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        new_metadata = dict(existing.metadata or {})
+        if "metadata" in updates:
+            if not isinstance(updates["metadata"], dict):
+                return None, "Metadata must be provided as a dictionary"
+            new_metadata.update(updates["metadata"])
+        for key, value in updates.items():
+            if key not in self._PROTECTED_UPDATE_KEYS:
+                new_metadata[key] = value
+        return new_metadata, None
+
+    def _merge_updates(
+        self, existing: Memory, updates: dict[str, Any]
+    ) -> tuple[tuple[list[str], str | None, dict[str, Any]] | None, str | None]:
+        """Validate ``updates`` and merge them into a (tags, type, metadata) tuple.
+
+        Returns ``(merged, None)`` on success, or ``(None, error_message)`` on
+        a validation failure.
+        """
+        new_tags, err = self._resolve_updated_tags(existing, updates)
+        if err is not None:
+            return None, err
+        new_type = updates.get("memory_type", existing.memory_type)
+        new_metadata, err = self._resolve_updated_metadata(existing, updates)
+        if err is not None:
+            return None, err
+        return (new_tags, new_type, new_metadata), None
+
+    def _compute_update_timestamps(
+        self, existing: Memory, updates: dict[str, Any], preserve_timestamps: bool
+    ) -> tuple[float | None, str | None, float, str]:
+        """Pick the (created_at, created_at_iso, updated_at, updated_at_iso) tuple for an upsert.
+
+        Both ``now`` and its ISO rendering come from the same ``time.time()``
+        reading, so the two representations never refer to different moments.
+        """
+        now = time.time()
+        now_iso = self._iso_from_epoch(now)
+
+        # Detect structural changes by comparing actual values, not just key
+        # presence. This prevents consolidation's metadata-only updates (which
+        # pass tags/memory_type unchanged) from incorrectly bumping updated_at.
+        structural = False
+        if (
+            ("content" in updates and updates["content"] != existing.content)
+            or (
+                "tags" in updates
+                and sorted(updates["tags"] or []) != sorted(existing.tags or [])
+            )
+            or (
+                "memory_type" in updates
+                and updates["memory_type"] != existing.memory_type
+            )
+        ):
+            structural = True
+
+        if preserve_timestamps and not structural:
+            updated_at = existing.updated_at if existing.updated_at is not None else now
+            updated_at_iso = existing.updated_at_iso or now_iso
+            return (
+                existing.created_at,
+                existing.created_at_iso,
+                updated_at,
+                updated_at_iso,
+            )
+
+        if not preserve_timestamps:
+            created_at = updates.get("created_at", existing.created_at)
+            created_at_iso = updates.get("created_at_iso", existing.created_at_iso)
+            return (
+                created_at,
+                created_at_iso,
+                updates.get("updated_at", now),
+                updates.get("updated_at_iso", now_iso),
+            )
+
+        # preserve_timestamps=True with a structural change — bump updated_at.
+        return existing.created_at, existing.created_at_iso, now, now_iso
+
+    @staticmethod
+    def _summarize_updated_fields(
+        updates: dict[str, Any], protected: frozenset
+    ) -> list[str]:
+        summary: list[str] = []
+        for key in ("tags", "memory_type"):
+            if key in updates:
+                summary.append(key)
+        if "metadata" in updates:
+            summary.append("custom_metadata")
+        for key in updates:
+            if key not in protected and key not in ("tags", "memory_type", "metadata"):
+                summary.append(key)
+        summary.append("updated_at")
+        return summary
+
+    def _build_update_entity(
+        self,
+        existing: Memory,
+        merged: tuple[list[str], str | None, dict[str, Any]],
+        timestamps: tuple[float | None, str | None, float, str],
+        embedding: list[float],
+    ) -> dict[str, Any]:
+        new_tags, new_type, new_metadata = merged
+        created_at, created_at_iso, updated_at, updated_at_iso = timestamps
+        # Derive a single fallback instant so missing created_at and missing
+        # created_at_iso both reference the same moment.
+        now = time.time()
+        if created_at is None:
+            created_at = now
+            created_at_iso = created_at_iso or self._iso_from_epoch(now)
+        else:
+            created_at = float(created_at)
+            created_at_iso = created_at_iso or self._iso_from_epoch(created_at)
+        content = existing.content or ""
+        entity: dict[str, Any] = {
+            "id": existing.content_hash,
+            "vector": embedding,
+            "content": content,
+            "tags": _tags_to_string(new_tags),
+            "memory_type": new_type or "",
+            "metadata": json.dumps(new_metadata),
+            "created_at": created_at,
+            "updated_at": float(updated_at),
+            "created_at_iso": created_at_iso,
+            "updated_at_iso": updated_at_iso,
+        }
+        if self._has_content_lower:
+            entity["content_lower"] = content.lower()
+        return entity
+
+    async def update_memory_metadata(
+        self,
+        content_hash: str,
+        updates: dict[str, Any],
+        preserve_timestamps: bool = True,
+    ) -> tuple[bool, str]:
+        if not self._ensure_initialized():
+            return False, "Milvus storage not initialized"
+
+        existing = await self.get_by_hash(content_hash)
+        if existing is None:
+            return False, f"Memory with hash {content_hash} not found"
+
+        merged, err = self._merge_updates(existing, updates)
+        if merged is None:
+            return False, err  # type: ignore[return-value]
+
+        timestamps = self._compute_update_timestamps(
+            existing, updates, preserve_timestamps
+        )
+
+        try:
+            embedding = self._generate_embedding(existing.content)
+        except Exception as exc:
+            return False, f"Failed to generate embedding for upsert: {exc}"
+
+        entity = self._build_update_entity(existing, merged, timestamps, embedding)
+
+        try:
+            await self._call_client(
+                "upsert",
+                collection_name=self.collection_name,
+                data=[entity],
+            )
+        except Exception as exc:
+            return False, f"Error updating memory metadata: {exc}"
+
+        summary = self._summarize_updated_fields(updates, self._PROTECTED_UPDATE_KEYS)
+        return True, f"Updated fields: {', '.join(summary)}"
+
+    # -- update_memory / update_memories_batch --------------------------------
+
+    async def update_memory(self, memory: Memory) -> bool:
+        """Update an existing memory using Milvus native upsert.
+
+        Delegates to ``update_memory_metadata`` to reuse validation
+        (via ``_merge_updates``), timestamp handling, and entity construction.
+        Passes ``preserve_timestamps=False`` so ``updated_at`` is refreshed.
+        """
+        if not self._ensure_initialized():
+            return False
+
+        updates = {
+            "tags": memory.tags,
+            "memory_type": memory.memory_type,
+            "metadata": memory.metadata,
+        }
+        success, _ = await self.update_memory_metadata(
+            memory.content_hash, updates, preserve_timestamps=False
+        )
+        return success
+
+    async def update_memories_batch(
+        self, memories: list[Memory], preserve_timestamps: bool = False
+    ) -> list[bool]:
+        """Batch-update memories using a single Milvus upsert call.
+
+        Optimizations over the base-class fallback (``asyncio.gather`` of N
+        individual updates):
+
+        1. **Batch fetch**: Single ``client.get(ids=...)`` call instead of
+           N ``get_by_hash`` round-trips.
+        2. **Batch embedding**: Single ``SentenceTransformer.encode(texts)``
+           call instead of N sequential encodes.
+        3. **Batch upsert**: Single Milvus upsert with all entities.
+
+        Metadata is merged via ``_merge_updates`` for consistency with
+        ``update_memory_metadata``.
+
+        Args:
+            memories: List of Memory objects with updated fields.
+            preserve_timestamps: If True, do not advance ``updated_at``.
+
+        Returns:
+            List of booleans indicating success for each memory.
+        """
+        if not memories:
+            return []
+        if not self._ensure_initialized():
+            return [False] * len(memories)
+
+        results: list[bool] = [False] * len(memories)
+
+        # -- Step 1: Batch fetch all existing records in one call --
+        hashes = [m.content_hash for m in memories]
+        existing_map: dict[str, Memory] = {}
+        try:
+            fetched = await self._call_client(
+                "get",
+                collection_name=self.collection_name,
+                ids=hashes,
+                output_fields=list(self._OUTPUT_FIELDS),
+            )
+            for row in fetched or []:
+                mem = self._entity_to_memory(row)
+                if mem:
+                    existing_map[mem.content_hash] = mem
+        except Exception as exc:
+            logger.error("update_memories_batch: batch fetch failed: %s", exc)
+            return results
+
+        # -- Step 2: Merge updates and collect content for batch embedding --
+        # Track which indices have valid existing records and merged data.
+        valid_items: list[tuple] = []  # (idx, existing, merged, updates_dict)
+        for idx, memory in enumerate(memories):
+            existing = existing_map.get(memory.content_hash)
+            if existing is None:
+                logger.warning(
+                    "update_memories_batch: hash %s not found, skipping",
+                    memory.content_hash,
+                )
+                continue
+
+            updates = {
+                "tags": memory.tags,
+                "memory_type": memory.memory_type,
+                "metadata": memory.metadata,
+            }
+            merged, err = self._merge_updates(existing, updates)
+            if merged is None:
+                logger.warning(
+                    "update_memories_batch: merge failed for %s: %s",
+                    memory.content_hash,
+                    err,
+                )
+                continue
+
+            valid_items.append((idx, existing, merged, updates))
+
+        if not valid_items:
+            return results
+
+        # -- Step 3: Batch embedding generation --
+        contents = [existing.content or "" for (_, existing, _, _) in valid_items]
+        try:
+            if not self.embedding_model:
+                raise RuntimeError("Embedding model not loaded")
+            raw_embeddings = self.embedding_model.encode(
+                contents, convert_to_numpy=True
+            )
+            embeddings = [
+                e.tolist() if hasattr(e, "tolist") else list(e) for e in raw_embeddings
+            ]
+        except Exception as exc:
+            logger.error("update_memories_batch: batch embedding failed: %s", exc)
+            return results
+
+        # -- Step 4: Build entities --
+        entities: list[dict[str, Any]] = []
+        entity_indices: list[int] = []
+
+        for i, (idx, existing, merged, updates) in enumerate(valid_items):
+            timestamps = self._compute_update_timestamps(
+                existing, updates, preserve_timestamps
+            )
+            embedding = embeddings[i]
+            entity = self._build_update_entity(existing, merged, timestamps, embedding)
+            entities.append(entity)
+            entity_indices.append(idx)
+
+        # -- Step 5: Single batch upsert --
+        if not entities:
+            return results
+
+        try:
+            await self._call_client(
+                "upsert",
+                collection_name=self.collection_name,
+                data=entities,
+            )
+            for idx in entity_indices:
+                results[idx] = True
+        except Exception as exc:
+            logger.error("update_memories_batch: batch upsert failed: %s", exc)
+
+        return results
+
+    async def mark_superseded_batch(self, pairs: list[tuple[str, str]]) -> int:
+        """Mark memories as superseded in a single batch operation.
+
+        For each (winner_hash, loser_hash) pair, sets the loser's metadata
+        ``superseded_by`` field to the winner_hash. Uses batch fetch + batch
+        upsert for efficiency.
+
+        Args:
+            pairs: List of (winner_hash, loser_hash) tuples.
+
+        Returns:
+            Number of memories successfully marked.
+        """
+        if not pairs:
+            return 0
+        if not self._ensure_initialized():
+            return 0
+
+        # Collect all loser hashes for batch fetch
+        loser_hashes = list({loser for _, loser in pairs})
+
+        # Build a mapping: loser_hash -> winner_hash
+        # (if a loser appears multiple times, last winner wins)
+        loser_to_winner: dict[str, str] = {loser: winner for winner, loser in pairs}
+
+        # -- Batch fetch all losers (including vectors to avoid re-encoding) --
+        existing_map: dict[str, Memory] = {}
+        try:
+            fetched = await self._call_client(
+                "get",
+                collection_name=self.collection_name,
+                ids=loser_hashes,
+                output_fields=list(self._OUTPUT_FIELDS_WITH_VECTOR),
+            )
+            for row in fetched or []:
+                mem = self._entity_to_memory(row, include_embedding=True)
+                if mem:
+                    existing_map[mem.content_hash] = mem
+        except Exception as exc:
+            logger.error("mark_superseded_batch: batch fetch failed: %s", exc)
+            return 0
+
+        if not existing_map:
+            return 0
+
+        # -- Build update entities (reuse existing vectors, no re-encoding) --
+        valid_losers: list[tuple] = []  # (loser_hash, existing, winner_hash)
+        for loser_hash, winner_hash in loser_to_winner.items():
+            existing = existing_map.get(loser_hash)
+            if existing is None:
+                logger.warning(
+                    "mark_superseded_batch: loser %s not found, skipping",
+                    loser_hash,
+                )
+                continue
+            valid_losers.append((loser_hash, existing, winner_hash))
+
+        if not valid_losers:
+            return 0
+
+        # Build entities with superseded_by in metadata, reusing existing vectors
+        entities: list[dict[str, Any]] = []
+        for loser_hash, existing, winner_hash in valid_losers:
+            # Only pass the new field — _merge_updates handles merging internally
+            updates: dict[str, Any] = {"metadata": {"superseded_by": winner_hash}}
+            merged, err = self._merge_updates(existing, updates)
+            if merged is None:
+                logger.warning(
+                    "mark_superseded_batch: merge failed for %s: %s",
+                    loser_hash,
+                    err,
+                )
+                continue
+
+            timestamps = self._compute_update_timestamps(
+                existing, updates, preserve_timestamps=True
+            )
+
+            # Reuse existing vector — content hasn't changed
+            embedding = existing.embedding
+            if not embedding:
+                # Fallback: generate embedding if vector wasn't fetched
+                try:
+                    embedding = self._generate_embedding(existing.content or "")
+                except Exception as exc:
+                    logger.warning(
+                        "mark_superseded_batch: embedding fallback failed for %s: %s",
+                        loser_hash,
+                        exc,
+                    )
+                    continue
+
+            entity = self._build_update_entity(existing, merged, timestamps, embedding)
+            entities.append(entity)
+
+        if not entities:
+            return 0
+
+        # -- Single batch upsert --
+        try:
+            await self._call_client(
+                "upsert",
+                collection_name=self.collection_name,
+                data=entities,
+            )
+        except Exception as exc:
+            logger.error("mark_superseded_batch: batch upsert failed: %s", exc)
+            return 0
+
+        marked = len(entities)
+        logger.info("mark_superseded_batch: marked %d memories as superseded", marked)
+        return marked
+
+    # -- search_memories / retrieve_with_quality_boost / recall_memory --------
+
+    async def retrieve_with_quality_boost(
+        self,
+        query: str,
+        n_results: int = 10,
+        tags: list[str] | None = None,
+        quality_boost: bool | None = None,
+        quality_weight: float | None = None,
+        include_superseded: bool = False,
+    ) -> list["MemoryQueryResult"]:
+        """Quality-boosted retrieval using Milvus native hybrid search.
+
+        Over-fetches 3x via the native Milvus retrieve (which already uses
+        hybrid BM25+vector when available), then reranks by a composite
+        score combining semantic similarity and quality_score from metadata.
+        """
+        from ..config import MCP_QUALITY_BOOST_ENABLED, MCP_QUALITY_BOOST_WEIGHT
+
+        if quality_boost is None:
+            quality_boost = MCP_QUALITY_BOOST_ENABLED
+        if quality_weight is None:
+            quality_weight = MCP_QUALITY_BOOST_WEIGHT
+
+        if not 0.0 <= quality_weight <= 1.0:
+            raise ValueError(f"quality_weight must be 0.0-1.0, got {quality_weight}")
+
+        if not quality_boost:
+            return await self.retrieve(
+                query, n_results, tags=tags, include_superseded=include_superseded
+            )
+
+        # Over-fetch for reranking pool
+        oversample = 3
+        candidates = await self.retrieve(
+            query,
+            n_results * oversample,
+            tags=tags,
+            include_superseded=include_superseded,
+        )
+        if not candidates:
+            return []
+
+        # Rerank by composite score
+        semantic_weight = 1.0 - quality_weight
+        for result in candidates:
+            semantic_score = result.relevance_score
+            q_score = result.memory.quality_score
+
+            result.relevance_score = (
+                semantic_weight * semantic_score + quality_weight * q_score
+            )
+            if result.debug_info is None:
+                result.debug_info = {}
+            result.debug_info.update(
+                {
+                    "original_semantic_score": semantic_score,
+                    "quality_score": q_score,
+                    "quality_weight": quality_weight,
+                    "semantic_weight": semantic_weight,
+                    "reranked": True,
+                }
+            )
+
+        candidates.sort(key=lambda r: r.relevance_score, reverse=True)
+        return candidates[:n_results]
+
+    async def recall_memory(self, query: str, n_results: int = 5) -> list[Memory]:
+        """Recall memories with time-expression awareness.
+
+        Parses natural language time expressions from the query (e.g.,
+        "last week", "yesterday") and applies a Milvus time-range filter
+        on ``created_at``. Falls back to plain semantic retrieve if no
+        time expression is detected.
+        """
+        if not self._ensure_initialized():
+            return []
+
+        # Try to parse time expression from query
+        start_time = None
+        end_time = None
+        try:
+            from ..utils.time_parser import parse_time_expression
+
+            start_time, end_time = parse_time_expression(query)
+        except Exception as exc:
+            logger.warning(
+                "Failed to parse time expression from query, falling back to standard retrieve: %s",
+                exc,
+            )
+
+        if start_time is not None or end_time is not None:
+            # Build time filter for Milvus
+            filters: list[str] = []
+            if start_time is not None:
+                filters.append(f"created_at >= {start_time}")
+            if end_time is not None:
+                filters.append(f"created_at <= {end_time}")
+            time_filter = " and ".join(filters)
+
+            # Use vector search with time filter
+            query_embedding = self._embed_query(query)
+            if query_embedding is None:
+                return []
+
+            fetch_n = self._retrieve_fetch_limit(n_results, time_filter)
+            if self._has_bm25:
+                hits = await self._run_hybrid_search(
+                    query, query_embedding, time_filter, fetch_n
+                )
+            else:
+                hits = await self._run_search(query_embedding, time_filter, fetch_n)
+
+            results = self._rank_and_trim(hits, query, n_results, 0.0)
+            return [r.memory for r in results[:n_results]]
+
+        # No time expression — fall back to standard retrieve
+        results = await self.retrieve(query, n_results)
+        return [r.memory for r in results]
+
+    async def search_memories(
+        self,
+        query: str | None = None,
+        mode: str = "semantic",
+        time_expr: str | None = None,
+        after: str | None = None,
+        before: str | None = None,
+        tags: list[str] | None = None,
+        tag_match: str = "any",
+        quality_boost: float = 0.0,
+        limit: int = 10,
+        include_debug: bool = False,
+        include_superseded: bool = False,
+        ranking_weights: dict[str, float] | None = None,
+    ) -> dict[str, Any]:
+        """Unified memory search with Milvus-native filtering.
+
+        Pushes time and tag filters into Milvus filter expressions for
+        server-side filtering instead of Python-side post-filtering.
+        Supports all modes: semantic, exact, hybrid, ranked.
+        """
+        if not self._ensure_initialized():
+            return {
+                "memories": [],
+                "total": 0,
+                "query": query,
+                "mode": mode,
+                "error": "Milvus storage not initialized",
+            }
+
+        # Validate inputs
+        if mode not in ("semantic", "exact", "hybrid", "ranked"):
+            return {
+                "memories": [],
+                "total": 0,
+                "query": query,
+                "mode": mode,
+                "error": f"Invalid mode: {mode}. Must be 'semantic', 'exact', 'hybrid', or 'ranked'",
+            }
+        if not 0.0 <= quality_boost <= 1.0:
+            return {
+                "memories": [],
+                "total": 0,
+                "query": query,
+                "mode": mode,
+                "error": f"Invalid quality_boost: {quality_boost}",
+            }
+
+        # -- Parse time filters --
+        start_time: float | None = None
+        end_time: float | None = None
+
+        if time_expr:
+            try:
+                from ..utils.time_parser import parse_time_expression
+
+                start_time, end_time = parse_time_expression(time_expr)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to parse time_expr '%s', ignoring time filter: %s",
+                    time_expr,
+                    exc,
+                )
+
+        if not time_expr:
+            if after:
+                try:
+                    from datetime import datetime as _dt
+
+                    start_time = _dt.fromisoformat(after).timestamp()
+                except ValueError:
+                    return {
+                        "memories": [],
+                        "total": 0,
+                        "query": query,
+                        "mode": mode,
+                        "error": f"Invalid after date: {after}",
+                    }
+            if before:
+                try:
+                    from datetime import datetime as _dt
+
+                    end_time = _dt.fromisoformat(before).timestamp()
+                except ValueError:
+                    return {
+                        "memories": [],
+                        "total": 0,
+                        "query": query,
+                        "mode": mode,
+                        "error": f"Invalid before date: {before}",
+                    }
+
+        # -- Build Milvus filter expression (push filters server-side) --
+        filter_parts: list[str] = []
+        if start_time is not None:
+            filter_parts.append(f"created_at >= {start_time}")
+        if end_time is not None:
+            filter_parts.append(f"created_at <= {end_time}")
+        if tags:
+            tag_expr, matched = self._tag_like_clauses(
+                tags, joiner="and" if tag_match == "all" else "or"
+            )
+            if matched:
+                filter_parts.append(tag_expr)
+
+        combined_filter = " and ".join(filter_parts) if filter_parts else ""
+
+        # -- Execute search based on mode --
+        results: list[MemoryQueryResult] = []
+        pre_filter_count = 0
+
+        if mode == "exact":
+            if not query:
+                return {
+                    "memories": [],
+                    "total": 0,
+                    "query": query,
+                    "mode": mode,
+                    "error": "query required for exact mode",
+                }
+
+            if self._has_content_lower and combined_filter:
+                # Push all filters (content + time + tags) to Milvus in one query
+                needle = query.lower().replace('"', '\\"')
+                content_filter = f'content_lower like "%{needle}%"'
+                final_filter = (
+                    f"({combined_filter}) and ({content_filter})"
+                    if combined_filter
+                    else content_filter
+                )
+                matched_memories = await self._query_memories(
+                    filter_expr=final_filter,
+                    limit=_MILVUS_MAX_LIMIT,
+                    sort_desc_key="created_at",
+                )
+                results = [
+                    MemoryQueryResult(memory=m, relevance_score=1.0, debug_info=None)
+                    for m in matched_memories
+                ]
+                pre_filter_count = len(results)
+            else:
+                # Fallback: fetch by content, then post-filter
+                matched_memories = await self.get_by_exact_content(query)
+                results = [
+                    MemoryQueryResult(memory=m, relevance_score=1.0, debug_info=None)
+                    for m in matched_memories
+                ]
+                pre_filter_count = len(results)
+                if start_time is not None:
+                    results = [
+                        r
+                        for r in results
+                        if r.memory.created_at and r.memory.created_at >= start_time
+                    ]
+                if end_time is not None:
+                    results = [
+                        r
+                        for r in results
+                        if r.memory.created_at and r.memory.created_at <= end_time
+                    ]
+                if tags:
+                    if tag_match == "all":
+                        results = [
+                            r for r in results if all(t in r.memory.tags for t in tags)
+                        ]
+                    else:
+                        results = [
+                            r for r in results if any(t in r.memory.tags for t in tags)
+                        ]
+
+        elif mode in ("semantic", "hybrid", "ranked"):
+            if mode == "ranked" and not query:
+                return {
+                    "memories": [],
+                    "total": 0,
+                    "query": query,
+                    "mode": mode,
+                    "error": "query required for ranked mode",
+                }
+            if not query and not combined_filter:
+                return {
+                    "memories": [],
+                    "total": 0,
+                    "query": query,
+                    "mode": mode,
+                    "error": "At least one filter required (query, time, or tags)",
+                }
+
+            if query:
+                # ranked over-fetches like quality_boost, then multi-signal reranks
+                fetch_limit = (
+                    limit * 3 if (quality_boost > 0 or mode == "ranked") else limit
+                )
+                query_embedding = self._embed_query(query)
+                if query_embedding is None:
+                    return {
+                        "memories": [],
+                        "total": 0,
+                        "query": query,
+                        "mode": mode,
+                        "error": "Failed to generate query embedding",
+                    }
+
+                fetch_n = self._retrieve_fetch_limit(fetch_limit, combined_filter)
+                if self._has_bm25:
+                    hits = await self._run_hybrid_search(
+                        query, query_embedding, combined_filter, fetch_n
+                    )
+                else:
+                    hits = await self._run_search(
+                        query_embedding, combined_filter, fetch_n
+                    )
+
+                results = self._rank_and_trim(hits, query, len(hits), 0.0)
+                pre_filter_count = len(results)
+
+                # Apply quality boost reranking
+                if quality_boost > 0:
+                    semantic_weight = 1.0 - quality_boost
+                    for r in results:
+                        orig = r.relevance_score
+                        r.relevance_score = (
+                            semantic_weight * orig
+                            + quality_boost * r.memory.quality_score
+                        )
+                    results.sort(key=lambda r: r.relevance_score, reverse=True)
+
+                # Apply multi-signal ranked reranking (time decay + access + quality)
+                if mode == "ranked" and results:
+                    from ..reasoning.ranked_search import (
+                        RankedSearchWeights,
+                        apply_ranked_rerank,
+                    )
+
+                    weights = RankedSearchWeights.from_dict(ranking_weights)
+                    results = apply_ranked_rerank(results, weights=weights)
+            else:
+                # Time/tag only — use Milvus query with filter
+                try:
+                    rows = await self._call_client(
+                        "query",
+                        collection_name=self.collection_name,
+                        filter=combined_filter,
+                        output_fields=list(self._OUTPUT_FIELDS),
+                        limit=min(limit * 3, _MILVUS_MAX_LIMIT),
+                    )
+                    for row in rows or []:
+                        mem = self._entity_to_memory(row)
+                        if mem:
+                            results.append(
+                                MemoryQueryResult(
+                                    memory=mem, relevance_score=0.5, debug_info=None
+                                )
+                            )
+                    pre_filter_count = len(results)
+                except Exception as exc:
+                    logger.error("search_memories: query failed: %s", exc)
+
+        # Filter superseded
+        if not include_superseded:
+            results = [r for r in results if not r.memory.metadata.get("superseded_by")]
+
+        # Limit
+        results = results[:limit]
+
+        # Build response
+        memories = []
+        for r in results:
+            mem_dict = r.memory.to_dict()
+            mem_dict["similarity_score"] = r.relevance_score
+            if r.debug_info:
+                mem_dict["debug_info"] = r.debug_info
+            memories.append(mem_dict)
+
+        response: dict[str, Any] = {
+            "memories": memories,
+            "total": len(memories),
+            "query": query,
+            "mode": mode,
+        }
+
+        if include_debug:
+            response["debug"] = {
+                "time_filter": {
+                    "time_expr": time_expr,
+                    "after": after,
+                    "before": before,
+                    "start_timestamp": start_time,
+                    "end_timestamp": end_time,
+                },
+                "tag_filter": tags,
+                "quality_boost": quality_boost,
+                "milvus_filter": combined_filter,
+                "pre_filter_count": pre_filter_count,
+                "post_filter_count": len(memories),
+                "limit": limit,
+            }
+
+        return response
+
+    # -- Low-priority optional overrides -------------------------------------
+
+    async def search_by_tag_chronological(
+        self, tags: list[str], limit: int | None = None, offset: int = 0
+    ) -> list[Memory]:
+        """Search memories by tags with chronological ordering (newest first).
+
+        Pushes tag filter + sort to Milvus instead of fetching all then
+        sorting in Python (base-class fallback).
+        """
+        if not tags or not self._ensure_initialized():
+            return []
+
+        tag_filter, matched = self._tag_like_clauses(tags, joiner="or")
+        if not matched:
+            return []
+
+        effective_limit = limit if limit is not None else _MILVUS_MAX_LIMIT
+        return await self._query_memories(
+            filter_expr=tag_filter,
+            limit=effective_limit,
+            offset=offset,
+            sort_desc_key="created_at",
+        )
+
+    async def count_memories_by_tag(self, tags: list[str]) -> int:
+        """Count memories matching any of the given tags.
+
+        Uses Milvus count query instead of fetching all rows and counting
+        in Python (base-class fallback).
+        """
+        if not tags or not self._ensure_initialized():
+            return 0
+
+        tag_filter, matched = self._tag_like_clauses(tags, joiner="or")
+        if not matched:
+            return 0
+
+        try:
+            rows = await self._call_client(
+                "query",
+                collection_name=self.collection_name,
+                filter=tag_filter,
+                output_fields=["count(*)"],
+            )
+            return self._extract_count(rows)
+        except Exception as exc:
+            logger.error("count_memories_by_tag failed: %s", exc)
+            return 0
+
+    async def is_deleted(self, content_hash: str) -> bool:
+        """Check if a memory has been soft-deleted.
+
+        In Milvus, a soft-deleted memory has metadata.deleted_at set.
+        If the memory doesn't exist at all, returns False (not soft-deleted,
+        just gone).
+        """
+        if not self._ensure_initialized():
+            return False
+
+        existing = await self.get_by_hash(content_hash)
+        if existing is None:
+            return False
+
+        return existing.metadata.get("deleted_at") is not None
+
+    async def purge_deleted(self, older_than_days: int = 30) -> int:
+        """Permanently delete soft-deleted memories older than specified days.
+
+        Finds memories with metadata.deleted_at set and created_at older
+        than the threshold, then hard-deletes them from Milvus.
+        """
+        if not self._ensure_initialized():
+            return 0
+
+        import time as _time
+
+        cutoff = _time.time() - (older_than_days * 86400)
+
+        # Milvus can't filter on JSON sub-fields easily, so we need to
+        # scan for memories with deleted_at in metadata
+        try:
+            # Get all memories created before cutoff
+            rows = await self._call_client(
+                "query",
+                collection_name=self.collection_name,
+                filter=f"created_at <= {cutoff}",
+                output_fields=["id", "metadata"],
+                limit=_MILVUS_MAX_LIMIT,
+            )
+        except Exception as exc:
+            logger.error("purge_deleted: query failed: %s", exc)
+            return 0
+
+        if not rows:
+            return 0
+
+        # Filter for those with deleted_at in metadata
+        to_purge: list[str] = []
+        for row in rows:
+            meta = _safe_json_loads(row.get("metadata", "{}"), "purge_deleted")
+            if meta.get("deleted_at") is not None:
+                to_purge.append(row["id"])
+
+        if not to_purge:
+            return 0
+
+        try:
+            await self._call_client(
+                "delete",
+                collection_name=self.collection_name,
+                ids=to_purge,
+            )
+        except Exception as exc:
+            logger.error("purge_deleted: delete failed: %s", exc)
+            return 0
+
+        logger.info("purge_deleted: permanently removed %d tombstones", len(to_purge))
+        return len(to_purge)
+
+    # -- Stats / misc --------------------------------------------------------
+
+    async def get_stats(self) -> dict[str, Any]:
+        if not self._ensure_initialized():
+            return {"error": "Milvus storage not initialized"}
+
+        week_ago = time.time() - 7 * 24 * 60 * 60
+
+        try:
+            total_rows = await self._call_client(
+                "query",
+                collection_name=self.collection_name,
+                filter="",
+                output_fields=["count(*)"],
+            )
+            recent_rows = await self._call_client(
+                "query",
+                collection_name=self.collection_name,
+                filter=f"created_at >= {week_ago}",
+                output_fields=["count(*)"],
+            )
+            total = self._extract_count(total_rows)
+            recent = self._extract_count(recent_rows)
+        except Exception as exc:
+            logger.warning("Milvus stats query failed: %s", exc)
+            total = recent = 0
+
+        unique_tags = len(await self.get_all_tags())
+
+        return {
+            "backend": "milvus",
+            "uri": self.uri,
+            "collection": self.collection_name,
+            "total_memories": total,
+            "unique_tags": unique_tags,
+            "memories_this_week": recent,
+            "embedding_model": self.embedding_model_name,
+            "embedding_dimension": self.embedding_dimension,
+        }
+
+    @staticmethod
+    def _extract_count(rows: Any) -> int:
+        if not rows:
+            return 0
+        first = rows[0]
+        # Different client versions have used 'count(*)' or 'count'.
+        for key in ("count(*)", "count", "total"):
+            if isinstance(first, dict) and key in first:
+                try:
+                    return int(first[key])
+                except (TypeError, ValueError):
+                    return 0
+        return 0
+
+    async def get_all_tags(self) -> list[str]:
+        if not self._ensure_initialized():
+            return []
+
+        try:
+            rows = await self._call_client(
+                "query",
+                collection_name=self.collection_name,
+                filter="",
+                output_fields=["tags"],
+                limit=_MILVUS_MAX_LIMIT,
+            )
+        except Exception as exc:
+            logger.warning("get_all_tags failed: %s", exc)
+            return []
+
+        seen: set[str] = set()
+        for row in rows:
+            for tag in _string_to_tags(row.get("tags")):
+                seen.add(tag)
+        return sorted(seen)
+
+    async def get_recent_memories(self, n: int = 10) -> list[Memory]:
+        return await self.get_all_memories(limit=n, offset=0)
+
+    async def get_all_memories(
+        self,
+        limit: int | None = None,
+        offset: int = 0,
+        memory_type: str | None = None,
+        tags: list[str] | None = None,
+        tag_match: str = "any",
+        stale_days: int | None = None,
+        include_embeddings: bool = False,
+        store: str = "default",
+    ) -> list[Memory]:
+        if not self._ensure_initialized():
+            return []
+
+        filters: list[str | None] = []
+        if memory_type is not None:
+            safe_type = memory_type.replace('"', '\\"')
+            filters.append(f'memory_type == "{safe_type}"')
+        if tags:
+            joiner = "and" if tag_match == "all" else "or"
+            tag_filter, matched = self._tag_like_clauses(tags, joiner=joiner)
+            if matched:
+                filters.append(tag_filter)
+            else:
+                return []
+
+        filter_expr = self._combine_filter(*filters)
+
+        # When stale_days is set, perform cross-collection filtering.
+        # Fetch all matching memories first, filter for staleness, then
+        # apply pagination manually — mirrors count_all_memories logic.
+        if stale_days is not None and stale_days > 0:
+            return await self._get_stale_memories(
+                filter_expr,
+                stale_days,
+                limit=limit,
+                offset=offset,
+                include_embeddings=include_embeddings,
+            )
+
+        return await self._query_memories(
+            filter_expr=filter_expr,
+            limit=limit if limit is not None else _MILVUS_MAX_LIMIT,
+            offset=offset,
+            sort_desc_key="created_at",
+            include_embeddings=include_embeddings,
+        )
+
+    async def count_all_memories(
+        self,
+        memory_type: str | None = None,
+        tags: list[str] | None = None,
+        tag_match: str = "any",
+        stale_days: int | None = None,
+    ) -> int:
+        if not self._ensure_initialized():
+            return 0
+
+        filters: list[str | None] = []
+        if memory_type is not None:
+            safe_type = memory_type.replace('"', '\\"')
+            filters.append(f'memory_type == "{safe_type}"')
+        if tags:
+            joiner = "and" if tag_match == "all" else "or"
+            tag_filter, matched = self._tag_like_clauses(tags, joiner=joiner)
+            if matched:
+                filters.append(tag_filter)
+            else:
+                return 0
+
+        filter_expr = self._combine_filter(*filters)
+
+        # When stale_days is set, perform cross-collection filtering
+        if stale_days is not None and stale_days > 0:
+            return await self._count_stale_memories(filter_expr, stale_days)
+
+        try:
+            rows = await self._call_client(
+                "query",
+                collection_name=self.collection_name,
+                filter=filter_expr,
+                output_fields=["count(*)"],
+            )
+            return self._extract_count(rows)
+        except Exception as exc:
+            logger.warning("count_all_memories failed: %s", exc)
+            return 0
+
+    async def _count_stale_memories(self, base_filter: str, stale_days: int) -> int:
+        """Count memories not accessed in the last ``stale_days`` days.
+
+        Cross-references the ``_access`` side-collection to determine which
+        memories are stale. Memories without an access record fall back to
+        ``created_at`` for staleness determination.
+
+        Uses QueryIterator for both queries to handle arbitrarily large
+        collections without hitting the single-query limit cap.
+        """
+        threshold = time.time() - stale_days * 86400
+
+        # Drain both collections under a single lock acquisition to avoid deadlock
+        try:
+            async with self._write_lock:
+                if self.client is None:
+                    return 0
+                all_rows = await asyncio.to_thread(
+                    self._drain_main_ids_and_created_at,
+                    base_filter,
+                )
+                active_rows: list[dict[str, Any]] = []
+                if self._has_access_collection:
+                    active_rows = await asyncio.to_thread(
+                        self._drain_active_hashes,
+                        threshold,
+                    )
+        except Exception as exc:
+            logger.warning("_count_stale_memories failed: %s", exc)
+            return 0
+
+        if not all_rows:
+            return 0
+
+        # Build active hash set
+        active_hashes = {row.get("id") for row in active_rows if row.get("id")}
+
+        # Count stale: not in active set AND created_at < threshold
+        stale_count = 0
+        for row in all_rows:
+            rid = row.get("id")
+            if rid and rid not in active_hashes:
+                # Not recently accessed — check created_at as fallback
+                created_at = row.get("created_at", 0)
+                if created_at < threshold:
+                    stale_count += 1
+
+        return stale_count
+
+    async def _get_stale_memories(
+        self,
+        base_filter: str,
+        stale_days: int,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+        include_embeddings: bool = False,
+    ) -> list[Memory]:
+        """Return memories not accessed in the last ``stale_days`` days.
+
+        Mirrors the cross-collection logic in ``_count_stale_memories`` but
+        returns full Memory objects instead of a count.  Pagination
+        (limit/offset) is applied *after* staleness filtering.
+        """
+        threshold = time.time() - stale_days * 86400
+
+        # Determine stale content_hashes via _access side-collection
+        try:
+            async with self._write_lock:
+                if self.client is None:
+                    return []
+                all_rows = await asyncio.to_thread(
+                    self._drain_main_ids_and_created_at,
+                    base_filter,
+                )
+                active_rows: list[dict[str, Any]] = []
+                if self._has_access_collection:
+                    active_rows = await asyncio.to_thread(
+                        self._drain_active_hashes,
+                        threshold,
+                    )
+        except Exception as exc:
+            logger.warning("_get_stale_memories failed: %s", exc)
+            return []
+
+        if not all_rows:
+            return []
+
+        active_hashes = {row.get("id") for row in active_rows if row.get("id")}
+
+        # Collect stale hashes (not recently accessed AND created_at < threshold)
+        stale_hashes: list[str] = []
+        for row in all_rows:
+            rid = row.get("id")
+            if rid and rid not in active_hashes:
+                created_at = row.get("created_at", 0)
+                if created_at < threshold:
+                    stale_hashes.append(rid)
+
+        if not stale_hashes:
+            return []
+
+        # Apply pagination to the stale set
+        # Sort by created_at desc is implicit from _drain_main_ids_and_created_at order
+        paginated = stale_hashes[offset:]
+        if limit is not None:
+            paginated = paginated[:limit]
+
+        if not paginated:
+            return []
+
+        # Fetch full Memory objects for the paginated stale hashes
+        hash_filter_parts = [f'id == "{h.replace(chr(34), "")}"' for h in paginated]
+        hash_filter = " or ".join(hash_filter_parts)
+
+        return await self._query_memories(
+            filter_expr=hash_filter,
+            limit=len(paginated),
+            sort_desc_key="created_at",
+            include_embeddings=include_embeddings,
+        )
+
+    async def get_memories_by_time_range(
+        self,
+        start_time: float,
+        end_time: float,
+        include_embeddings: bool = False,
+    ) -> list[Memory]:
+        if not self._ensure_initialized():
+            return []
+        filter_expr = f"created_at >= {start_time} and created_at <= {end_time}"
+        return await self._query_memories(
+            filter_expr=filter_expr,
+            limit=_MILVUS_MAX_LIMIT,
+            sort_desc_key="created_at",
+            include_embeddings=include_embeddings,
+        )
+
+    async def get_memory_timestamps(self, days: int | None = None) -> list[float]:
+        if not self._ensure_initialized():
+            return []
+
+        filter_expr = ""
+        if days is not None:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).timestamp()
+            filter_expr = f"created_at >= {cutoff}"
+
+        try:
+            rows = await self._call_client(
+                "query",
+                collection_name=self.collection_name,
+                filter=filter_expr,
+                output_fields=["created_at"],
+                limit=_MILVUS_MAX_LIMIT,
+            )
+        except Exception as exc:
+            logger.warning("get_memory_timestamps failed: %s", exc)
+            return []
+
+        timestamps = [
+            row["created_at"] for row in rows if row.get("created_at") is not None
+        ]
+        return sorted(timestamps, reverse=True)
+
+    # ------------------------------------------------------------------
+    # Connection tracking (graph-based)
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Access tracking (_access side-collection)
+    # ------------------------------------------------------------------
+
+    async def _touch_access(self, hashes: list[str]) -> None:
+        """Batch-upsert last_accessed timestamps for retrieved memories.
+
+        Called asynchronously after retrieve() returns results. Failures are
+        logged but never propagate — access tracking is best-effort.
+        """
+        if not self._has_access_collection or not hashes:
+            return
+
+        now = time.time()
+        rows = [
+            {"id": h, "last_accessed": now, "_dummy_vec": [0.0, 0.0]} for h in hashes
+        ]
+
+        try:
+            await self._call_client(
+                "upsert",
+                collection_name=self._access_collection,
+                data=rows,
+            )
+        except Exception as exc:
+            logger.warning("_touch_access failed (non-fatal): %s", exc)
+
+    async def get_access_patterns(self) -> dict[str, datetime]:
+        """Return last-accessed timestamps from the _access side-collection.
+
+        Used by the Forgetting engine's decay calculator to compute
+        access_boost. Returns ``{content_hash: datetime}`` for all memories
+        that have been accessed at least once.
+        """
+        if not self._has_access_collection:
+            return {}
+
+        try:
+            async with self._write_lock:
+                if self.client is None:
+                    return {}
+                rows = await asyncio.to_thread(
+                    self._drain_access_records,
+                )
+        except Exception as exc:
+            logger.warning("get_access_patterns failed: %s", exc)
+            return {}
+
+        patterns: dict[str, datetime] = {}
+        for row in rows:
+            ts = row.get("last_accessed")
+            rid = row.get("id")
+            if rid and ts:
+                patterns[rid] = datetime.fromtimestamp(ts, tz=timezone.utc)
+        return patterns
+
+    def _drain_access_records(self) -> list[dict[str, Any]]:
+        """Sync helper that drains all rows from the _access collection."""
+        assert self.client is not None
+        iterator = self.client.query_iterator(
+            collection_name=self._access_collection,
+            filter="",
+            output_fields=["id", "last_accessed"],
+            batch_size=self._QUERY_ITER_BATCH,
+        )
+        rows: list[dict[str, Any]] = []
+        try:
+            while True:
+                batch = iterator.next()
+                if not batch:
+                    break
+                rows.extend(batch)
+        finally:
+            try:
+                iterator.close()
+            except Exception:
+                pass
+        return rows
+
+    def _drain_main_ids_and_created_at(self, filter_expr: str) -> list[dict[str, Any]]:
+        """Sync helper that drains id + created_at from the main collection."""
+        assert self.client is not None
+        iterator = self.client.query_iterator(
+            collection_name=self.collection_name,
+            filter=filter_expr or "",
+            output_fields=["id", "created_at"],
+            batch_size=self._QUERY_ITER_BATCH,
+        )
+        rows: list[dict[str, Any]] = []
+        try:
+            while True:
+                batch = iterator.next()
+                if not batch:
+                    break
+                rows.extend(batch)
+        finally:
+            try:
+                iterator.close()
+            except Exception:
+                pass
+        return rows
+
+    def _drain_active_hashes(self, threshold: float) -> list[dict[str, Any]]:
+        """Sync helper that drains active (recently accessed) hashes from _access collection."""
+        assert self.client is not None
+        iterator = self.client.query_iterator(
+            collection_name=self._access_collection,
+            filter=f"last_accessed >= {threshold}",
+            output_fields=["id"],
+            batch_size=self._QUERY_ITER_BATCH,
+        )
+        rows: list[dict[str, Any]] = []
+        try:
+            while True:
+                batch = iterator.next()
+                if not batch:
+                    break
+                rows.extend(batch)
+        finally:
+            try:
+                iterator.close()
+            except Exception:
+                pass
+        return rows
+
+    async def get_memory_connections(self) -> dict[str, int]:
+        """Return connection counts per memory hash from the graph collection.
+
+        Queries ``{collection_name}_graph`` for all edges and counts how many
+        times each hash appears as either ``source_hash`` or ``target_hash``.
+        This enables the Forgetting engine to protect highly-connected
+        "hub" memories from premature archival.
+
+        Uses ``query_iterator`` to handle arbitrarily large graph collections
+        without hitting the single-query limit cap.
+        """
+        graph_collection = f"{self.collection_name}_graph"
+
+        if not self._ensure_initialized():
+            return {}
+
+        # Check if graph collection exists
+        try:
+            has_graph = await self._call_client(
+                "has_collection",
+                collection_name=graph_collection,
+            )
+            if not has_graph:
+                return {}
+        except Exception:
+            return {}
+
+        # Drain all edges via QueryIterator (handles large graphs)
+        try:
+            async with self._write_lock:
+                if self.client is None:
+                    return {}
+                rows = await asyncio.to_thread(
+                    self._drain_graph_edges,
+                    graph_collection,
+                )
+        except Exception as exc:
+            logger.warning(
+                "get_memory_connections: failed to query graph collection: %s", exc
+            )
+            return {}
+
+        # Count occurrences of each hash (as source or target)
+        connections: dict[str, int] = {}
+        for row in rows:
+            src = row.get("source_hash")
+            tgt = row.get("target_hash")
+            if src:
+                connections[src] = connections.get(src, 0) + 1
+            if tgt:
+                connections[tgt] = connections.get(tgt, 0) + 1
+
+        return connections
+
+    def _drain_graph_edges(self, graph_collection: str) -> list[dict[str, Any]]:
+        """Sync helper that drains all edges from the graph collection.
+
+        Deduplicates by primary-key ``id`` to defend against the same Milvus
+        Lite double-batch bug handled in :meth:`_drain_query_iterator`.
+        """
+        assert self.client is not None
+        iterator = self.client.query_iterator(
+            collection_name=graph_collection,
+            filter="",
+            output_fields=["id", "source_hash", "target_hash"],
+            batch_size=self._QUERY_ITER_BATCH,
+        )
+        rows: list[dict[str, Any]] = []
+        seen_ids: set = set()
+        try:
+            while True:
+                batch = iterator.next()
+                if not batch:
+                    break
+                for row in batch:
+                    row_id = row.get("id")
+                    if row_id is not None:
+                        if row_id in seen_ids:
+                            continue
+                        seen_ids.add(row_id)
+                    rows.append(row)
+        finally:
+            try:
+                iterator.close()
+            except Exception:
+                pass
+        return rows
+
+    _QUERY_ITER_BATCH = 1000
+
+    async def _query_memories(
+        self,
+        filter_expr: str,
+        limit: int,
+        offset: int = 0,
+        sort_desc_key: str | None = None,
+        include_embeddings: bool = False,
+    ) -> list[Memory]:
+        """Stream rows via ``QueryIterator`` and return sorted, sliced ``Memory``
+        objects.
+
+        Iterating avoids the silent 16384-row truncation that a plain
+        ``client.query(limit=...)`` imposes: the cap only applies per RPC, not
+        per scan, so a filter that selects more than 16384 matching rows used
+        to return an arbitrary window. Sorting is still done client-side
+        (Milvus Lite has no server-side ``order_by``), but it is now applied
+        to the full matching set rather than to a random subset.
+
+        Args:
+            include_embeddings: If True, request the ``vector`` field from
+                Milvus and populate ``Memory.embedding`` on the returned
+                objects. Used by the consolidation pipeline. Default False
+                keeps the CRUD cost envelope unchanged.
+        """
+        if limit <= 0:
+            return []
+        rows = await self._iterate_all_rows(
+            filter_expr,
+            include_embeddings=include_embeddings,
+        )
+        memories: list[Memory] = []
+        hydrated = 0
+        for row in rows:
+            mem = self._entity_to_memory(row, include_embedding=include_embeddings)
+            if mem is not None:
+                memories.append(mem)
+                if mem.embedding:
+                    hydrated += 1
+
+        if include_embeddings:
+            self._log_hydration_stats(memories, hydrated)
+
+        if sort_desc_key:
+            memories.sort(key=lambda m: getattr(m, sort_desc_key) or 0.0, reverse=True)
+
+        if offset:
+            memories = memories[offset:]
+        return memories[:limit]
+
+    def _log_hydration_stats(
+        self,
+        memories: list[Memory],
+        hydrated: int,
+    ) -> None:
+        """Emit a DEBUG counter and, at most, one WARNING when no row hydrated.
+
+        Called only when a consolidation read path ran with
+        ``include_embeddings=True``. The caller passes a pre-computed
+        ``hydrated`` count to avoid a second O(n) scan of the already-built
+        ``memories`` list (see PR #885 review feedback). Never logs raw
+        vector values — only integer counts and the collection name.
+        """
+        total = len(memories)
+        logger.debug(
+            "Milvus hydration: %d/%d memories returned with embeddings",
+            hydrated,
+            total,
+        )
+        if total > 0 and hydrated == 0:
+            logger.warning(
+                "Milvus collection '%s' returned %d rows but none carried a "
+                "usable vector — the collection may be missing vector data.",
+                self.collection_name,
+                total,
+            )
+
+    async def _iterate_all_rows(
+        self,
+        filter_expr: str,
+        include_embeddings: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Collect every row matching ``filter_expr`` using ``QueryIterator``.
+
+        One lock-acquisition covers the full iteration so other coroutines
+        can't interleave RPCs on the shared pymilvus channel.
+
+        Args:
+            include_embeddings: If True, request the ``vector`` field in
+                ``output_fields`` so :meth:`_entity_to_memory` can hydrate
+                ``Memory.embedding``.
+        """
+        async with self._write_lock:
+            if self.client is None:
+                raise RuntimeError("MilvusMemoryStorage was not initialized")
+            return await asyncio.to_thread(
+                self._drain_query_iterator,
+                filter_expr,
+                include_embeddings,
+            )
+
+    def _drain_query_iterator(
+        self,
+        filter_expr: str,
+        include_embeddings: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Sync helper that drains a ``QueryIterator`` into a plain list.
+
+        Deduplicates by primary-key ``id`` to defend against a Milvus Lite bug
+        where the last batch of records is returned a second time before the
+        iterator signals end-of-data with an empty batch.
+        """
+        assert self.client is not None
+        fields = (
+            self._OUTPUT_FIELDS_WITH_VECTOR
+            if include_embeddings
+            else self._OUTPUT_FIELDS_BASE
+        )
+        iterator = self.client.query_iterator(
+            collection_name=self.collection_name,
+            filter=filter_expr or "",
+            output_fields=list(fields),
+            batch_size=self._QUERY_ITER_BATCH,
+        )
+        rows: list[dict[str, Any]] = []
+        seen_ids: set = set()
+        try:
+            while True:
+                batch = iterator.next()
+                if not batch:
+                    break
+                for row in batch:
+                    row_id = row.get("id")
+                    if row_id is not None:
+                        if row_id in seen_ids:
+                            continue
+                        seen_ids.add(row_id)
+                    rows.append(row)
+        finally:
+            try:
+                iterator.close()
+            except Exception:
+                pass
+        return rows
+
+    # -- Teardown ------------------------------------------------------------
+
+    async def close(self) -> None:
+        if self.client is None:
+            return
+        try:
+            close = getattr(self.client, "close", None)
+            if callable(close):
+                await asyncio.to_thread(close)
+        except Exception as exc:
+            logger.debug("MilvusClient.close failed (ignored): %s", exc)
+        finally:
+            self.client = None
+            self._initialized = False

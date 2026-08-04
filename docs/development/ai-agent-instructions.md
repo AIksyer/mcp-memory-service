@@ -1,0 +1,193 @@
+# AI Agent Instructions
+
+AI coding agent instructions for MCP Memory Service - a universal memory service providing semantic search and persistent storage for AI assistants.
+
+## Project Overview
+
+MCP Memory Service implements the Model Context Protocol (MCP) to provide semantic memory capabilities for AI assistants. It supports multiple storage backends (SQLite-vec, Cloudflare, Hybrid) and works with 13+ AI applications including Claude Desktop, VS Code, Cursor, and Continue.
+
+## Setup Commands
+
+**⚠️ CRITICAL FOR DEVELOPMENT**: Always use editable install to avoid stale package issues:
+
+```bash
+# Install dependencies in EDITABLE mode (REQUIRED for development)
+pip install -e .
+
+# Or with uv (faster, also editable)
+uv pip install -e .
+
+# Verify editable install (critical check!)
+pip show mcp-memory-service | grep Location
+# Expected: Location: /path/to/mcp-memory-service/src
+# NOT: Location: /path/to/venv/lib/python3.x/site-packages
+
+# Verify version consistency (detects stale venv)
+python scripts/validation/check_dev_setup.py
+
+# Start MCP stdio server (for Claude Desktop)
+memory server
+
+# Run with inspector for debugging (stdio child process)
+npx @modelcontextprotocol/inspector memory server
+
+# Start HTTP API server (dashboard at http://localhost:8000, background)
+memory launch
+```
+
+**Why `-e` flag matters**: MCP servers load from `site-packages`, not source files. Without editable install, source code changes won't take effect until you reinstall. System restart won't help - it just relaunches with the same stale package.
+
+**Common symptom**: Code shows v8.23.0 but server reports v8.5.3 → Run `pip install -e . --force-reinstall`
+
+## Testing
+
+```bash
+# Run all tests
+pytest tests/
+
+# Run specific test categories
+pytest tests/test_server.py          # Server tests
+pytest tests/test_storage.py         # Storage backend tests
+pytest tests/test_embeddings.py      # Embedding tests
+
+# Run with coverage
+pytest --cov=mcp_memory_service tests/
+
+# Verify environment setup
+python scripts/validation/verify_environment.py
+
+# Check database health
+python scripts/database/db_health_check.py
+```
+
+## Code Style
+
+- **Python 3.10+** with type hints everywhere
+- **Async/await** for all I/O operations
+- **Black** formatter with 88-char line length
+- **Import order**: stdlib, third-party, local (use `isort`)
+- **Docstrings**: Google style for all public functions
+- **Error handling**: Always catch specific exceptions
+- **Logging**: Use structured logging with appropriate levels
+
+## Project Structure
+
+```
+src/mcp_memory_service/
+├── server.py           # Main MCP server implementation
+├── mcp_server.py       # MCP protocol handler
+├── storage/            # Storage backend implementations
+│   ├── base.py        # Abstract base class
+│   ├── sqlite_vec.py  # SQLite-vec backend (default for dev)
+│   ├── cloudflare.py  # Cloudflare D1/Vectorize backend
+│   └── hybrid.py      # Hybrid backend (local + cloud sync; recommended for production)
+├── embeddings/         # Embedding model implementations
+├── consolidation/      # Memory consolidation algorithms
+└── web/               # FastAPI dashboard and REST API
+```
+
+## Key Files to Understand
+
+- `src/mcp_memory_service/server.py` - Entry point and server initialization
+- `src/mcp_memory_service/storage/base.py` - Storage interface all backends must implement
+- `src/mcp_memory_service/web/app.py` - FastAPI application for HTTP mode
+- `pyproject.toml` - Project dependencies and configuration (install via `pip install -e .`)
+
+## Common Development Tasks
+
+### Adding a New Storage Backend
+1. Create new file in `src/mcp_memory_service/storage/`
+2. Inherit from `BaseStorage` abstract class
+3. Implement all required methods
+4. Add backend to `STORAGE_BACKENDS` in `server.py`
+5. Write tests in `tests/test_storage.py`
+
+### Modifying MCP Tools
+1. Edit tool definitions in `src/mcp_memory_service/mcp_server.py`
+2. Update tool handlers in the same file
+3. Test with MCP inspector: `npx @modelcontextprotocol/inspector memory server`
+4. Update documentation in `docs/api/tools.md`
+
+### Adding Environment Variables
+1. Define in `src/mcp_memory_service/config.py`
+2. Document in README.md and CLAUDE.md
+3. Add to Docker configurations in `tools/docker/`
+4. Update `scripts/validation/verify_environment.py`
+
+### Database Migrations
+```bash
+# Check for needed migrations
+python scripts/migration/verify_mcp_timestamps.py
+
+# Migrate legacy ChromaDB data (from the chromadb-legacy branch — see docs/guides/chromadb-migration.md)
+git checkout chromadb-legacy
+python scripts/migration/migrate_chroma_to_sqlite.py
+
+# Validate existing memories
+python scripts/validation/validate_memories.py
+```
+
+## Performance Considerations
+
+- **Embedding caching**: Models are cached globally to avoid reloading
+- **Batch operations**: Use batch methods for multiple memory operations
+- **Connection pooling**: Storage backends use connection pools
+- **Async operations**: All I/O is async to prevent blocking
+- **Hardware acceleration**: Auto-detects CUDA, MPS, DirectML, ROCm
+
+## Security Guidelines
+
+- **Never commit secrets**: API keys, tokens must use environment variables
+- **Input validation**: Always validate and sanitize user inputs
+- **SQL injection**: Use parameterized queries in SQLite backend
+- **API authentication**: HTTP mode requires API key authentication
+- **Path traversal**: Validate all file paths before operations
+- **Memory content**: Never log full memory content (may contain sensitive data)
+
+## Debugging Tips
+
+```bash
+# Enable debug logging
+export LOG_LEVEL=DEBUG
+
+# Check service health
+curl http://localhost:8000/api/health
+
+# Monitor logs
+tail -f ~/.mcp-memory-service/logs/service.log
+
+# Inspect MCP communication
+npx @modelcontextprotocol/inspector memory server
+
+# Database debugging
+sqlite3 ~/.mcp-memory-service/sqlite_vec.db ".tables"
+```
+
+## Release Process
+
+1. Update version in `pyproject.toml`
+2. Update CHANGELOG.md with changes
+3. Run full test suite: `pytest tests/`
+4. Create git tag: `git tag -a vX.Y.Z -m "Release vX.Y.Z"`
+5. Push tag: `git push origin vX.Y.Z`
+6. GitHub Actions will handle PyPI release
+
+## Common Issues and Solutions
+
+- **SQLite extension errors on macOS**: Use Homebrew Python or pyenv with `--enable-loadable-sqlite-extensions`
+- **Model download hangs**: Check network connectivity, models are ~25MB
+- **Import errors**: Run `pip install -e .` (or `pip install -e ".[full]"` for all extras) to ensure dependencies are installed
+- **MCP connection fails**: Restart Claude Desktop to refresh MCP connections
+- **Memory not persisting**: Check file permissions in `~/.mcp-memory-service/`
+
+## Contributing
+
+- Follow existing code patterns and conventions
+- Add tests for new features
+- Update documentation for API changes
+- Use semantic commit messages
+- Run tests before submitting PRs
+
+---
+
+*This file follows the [agents.md](https://agents.md/) standard for AI coding agent instructions.*

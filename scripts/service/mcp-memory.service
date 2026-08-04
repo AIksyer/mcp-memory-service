@@ -1,0 +1,35 @@
+[Unit]
+Description=MCP Memory Service FastAPI v4.0.0-alpha.1
+Documentation=https://github.com/doobidoo/mcp-memory-service
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# NOTE: User= and Group= should NOT be set for user services
+# They are only for system services. User services automatically run as the user.
+WorkingDirectory=%h/repositories/mcp-memory-service
+Environment=PATH=%h/repositories/mcp-memory-service/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PYTHONPATH=%h/repositories/mcp-memory-service/src
+Environment=MCP_CONSOLIDATION_ENABLED=true
+Environment=MCP_MDNS_ENABLED=true
+Environment=MCP_HTTPS_ENABLED=true
+Environment=MCP_MDNS_SERVICE_NAME="MCP Memory Service - Consolidated"
+Environment=MCP_MDNS_SERVICE_TYPE="_http._tcp.local."
+Environment=MCP_HTTP_ENABLED=true
+Environment=MCP_SERVER_HOST=0.0.0.0
+Environment=MCP_SERVER_PORT=8000
+Environment=MCP_MEMORY_STORAGE_BACKEND=sqlite_vec
+# Security: API key should be stored in a separate environment file
+# Create %h/repositories/mcp-memory-service/.env with: MCP_API_KEY=your-key-here
+# Then uncomment the line below and set proper permissions (chmod 600)
+# EnvironmentFile=-%h/repositories/mcp-memory-service/.env
+ExecStart=%h/repositories/mcp-memory-service/venv/bin/python -m mcp_memory_service.mcp_server
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mcp-memory-service
+
+[Install]
+WantedBy=default.target

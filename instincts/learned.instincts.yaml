@@ -1,0 +1,119 @@
+version: "1.0"
+instincts:
+  never-push-main-directly:
+    id: never-push-main-directly
+    rule: "Never push commits directly to main. Always create a feature branch and open a PR, even for single-line fixes. PRs are quality gates for code review, not bureaucracy."
+    domain: git
+    tags: [git, workflow, pr, code-review, branch-protection]
+    trigger_patterns:
+      - "git push.*main"
+      - "push to main"
+      - "commit.*main"
+    confidence: 0.8
+    min_confidence: 0.5
+    approved_by: human
+    active: true
+    created_at: "2026-03-29T16:25:00Z"
+    outcome_log: []
+
+  check-memory-before-diagnosing:
+    id: check-memory-before-diagnosing
+    rule: "When hitting a recurring error (especially Cloudflare 401, auth failures), search MCP Memory for prior incidents before investigating from scratch. The fix is often already documented."
+    domain: troubleshooting
+    tags: [troubleshooting, memory, cloudflare, auth, debugging]
+    trigger_patterns:
+      - "401"
+      - "unauthorized"
+      - "authentication error"
+      - "cloudflare.*fail"
+    confidence: 0.75
+    min_confidence: 0.5
+    approved_by: human
+    active: true
+    created_at: "2026-03-29T16:25:00Z"
+    outcome_log: []
+
+  verify-env-matches-dashboard:
+    id: verify-env-matches-dashboard
+    rule: "When Cloudflare API returns 401/auth errors, first verify the token in .env matches the active token in the Cloudflare Dashboard. Token rotation in the dashboard does not auto-update local config files."
+    domain: cloudflare
+    tags: [cloudflare, env, token, auth, configuration]
+    trigger_patterns:
+      - "cloudflare.*401"
+      - "invalid.*api.*token"
+      - "authentication error.*cloudflare"
+    confidence: 0.7
+    min_confidence: 0.5
+    approved_by: human
+    active: true
+    created_at: "2026-03-29T16:25:00Z"
+    outcome_log: []
+
+  use-release-agent-for-versions:
+    id: use-release-agent-for-versions
+    rule: "Never manually bump versions or create release commits. Always use the github-release-manager agent which handles version sync across pyproject.toml, _version.py, CHANGELOG, README, and CLAUDE.md consistently."
+    domain: workflow
+    tags: [workflow, release, versioning, automation]
+    trigger_patterns:
+      - "version bump"
+      - "release"
+      - "changelog"
+      - "patch release"
+      - "new version"
+    confidence: 0.75
+    min_confidence: 0.5
+    approved_by: human
+    active: true
+    created_at: "2026-03-29T16:25:00Z"
+    outcome_log: []
+
+  gemini-review-retrigger:
+    id: gemini-review-retrigger
+    rule: "To retrigger Gemini Code Assist review on a PR, post a comment with '/gemini review' via 'gh pr comment <PR> --body \"/gemini review\"'. Then reply to inline comments with fix details."
+    domain: github
+    tags: [github, code-review, gemini, pr, workflow]
+    trigger_patterns:
+      - "gemini.*re.?review"
+      - "retrigger.*review"
+      - "code.?review.*again"
+    confidence: 0.8
+    min_confidence: 0.5
+    usage_count: 0
+    approved_by: human
+    active: true
+    created_at: "2026-03-31T15:30:00Z"
+    outcome_log: []
+
+  sqlite-tombstone-unique-conflict:
+    id: sqlite-tombstone-unique-conflict
+    rule: "Soft-delete (SET deleted_at) leaves tombstone rows that block UNIQUE constraints. Any INSERT path with a dedup check filtering 'deleted_at IS NULL' must also purge tombstones before INSERT to avoid IntegrityError."
+    domain: sqlite
+    tags: [sqlite, soft-delete, unique-constraint, storage, bugfix-pattern]
+    trigger_patterns:
+      - "UNIQUE constraint.*content_hash"
+      - "soft.?delete.*unique"
+      - "tombstone.*insert"
+    confidence: 0.7
+    min_confidence: 0.5
+    usage_count: 0
+    approved_by: human
+    active: true
+    created_at: "2026-03-31T15:30:00Z"
+    outcome_log: []
+
+  gemini-review-iterate-then-release:
+    id: gemini-review-iterate-then-release
+    rule: "After PR creation: address all Gemini review comments in separate commits, reply to each inline comment with fix reference, retrigger with '/gemini review', and only merge+release when Gemini says 'no feedback to provide'."
+    domain: workflow
+    tags: [workflow, code-review, gemini, pr, iteration]
+    trigger_patterns:
+      - "review.*feedback"
+      - "gemini.*happy"
+      - "merge.*after.*review"
+    confidence: 0.7
+    min_confidence: 0.5
+    usage_count: 0
+    approved_by: human
+    active: true
+    created_at: "2026-03-31T15:30:00Z"
+    outcome_log: []

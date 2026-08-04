@@ -1,0 +1,10 @@
+"""
+Services package for MCP Memory Service.
+
+This package contains shared business logic services that provide
+consistent behavior across different interfaces (API, MCP tools).
+"""
+
+from .memory_service import MemoryResult, MemoryService
+
+__all__ = ["MemoryResult", "MemoryService"]

@@ -92,7 +92,7 @@ jobs:
 
       - name: Create issue on threshold warning
         if: failure()
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             github.rest.issues.create({

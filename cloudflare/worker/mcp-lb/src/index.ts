@@ -42,7 +42,7 @@ interface Env {
   MCP_HA_KV?: KVNamespace;
   GITHUB_CLIENT_ID?: string;
   GITHUB_CLIENT_SECRET?: string;
-  GITHUB_ALLOWED_USERS?: string; // comma-separated GitHub usernames, empty = allow all
+  GITHUB_ALLOWED_IDS?: string; // comma-separated GitHub numeric user IDs, empty = deny all (private deployment)
 }
 
 // ===== Constants =====
@@ -581,16 +581,17 @@ export default {
       }
       const userInfo = await userResp.json() as { login?: string; id?: number; name?: string };
 
-      // Check allowed users list
-      if (env.GITHUB_ALLOWED_USERS) {
-        const allowed = env.GITHUB_ALLOWED_USERS.split(",").map((s) => s.trim().toLowerCase());
-        if (!allowed.includes(userInfo.login?.toLowerCase() || "")) {
-          return new Response(`User '${userInfo.login}' is not authorized`, { status: 403 });
-        }
+      // Authorization: use numeric GitHub user ID (immutable, never changes).
+      // Default deny — only users whose ID is in GITHUB_ALLOWED_IDS can login.
+      // This is a private deployment: no one is allowed unless explicitly authorized.
+      const userId = String(userInfo.id || 0);
+      const allowedIds = (env.GITHUB_ALLOWED_IDS || "").split(",").map((s) => s.trim()).filter(Boolean);
+      if (!allowedIds.includes(userId)) {
+        return new Response(`GitHub user ID ${userId} (${userInfo.login || 'unknown'}) is not authorized. Contact the administrator.`, { status: 403 });
       }
 
-      // Issue session token
-      const sessionToken = await createSessionCookie(env, `github:${userInfo.login}`);
+      // Issue session token bound to immutable GitHub user ID
+      const sessionToken = await createSessionCookie(env, `github:${userId}`);
       const cookieHeader = `${SESSION_COOKIE}=${sessionToken}; HttpOnly; Secure; SameSite=Lax; Max-Age=${SESSION_MAX_AGE}; Path=/`;
 
       // If there are pending MCP OAuth params, resume the authorization code flow
@@ -605,7 +606,7 @@ export default {
           await env.MCP_HA_KV.put(`oauth_code:${authCode}`, JSON.stringify({
             redirect_uri: redirectUri,
             code_challenge: codeChallenge,
-            api_key: `github:${userInfo.login}`,
+            api_key: `github:${userId}`,
           }), { expirationTtl: 600 });
         }
         const cbUrl = new URL(redirectUri);

@@ -263,6 +263,12 @@ class MemoryServer:
         self.server = Server(SERVER_NAME)
         self.system_info = get_system_info()
 
+        # Transport mode: "stdio" (default) or "remote" (HTTP/Streamable HTTP).
+        # When "remote", local-only tools (memory_harvest, memory_ingest) are
+        # filtered from list_tools() and rejected in call_tool() to prevent
+        # confused-deputy filesystem access from untrusted callers.
+        self.transport_mode = "stdio"
+
         # Initialize query time tracking
         self.query_times = deque(maxlen=50)  # Keep last 50 query times for averaging
 
@@ -1778,13 +1784,22 @@ class MemoryServer:
         return frozenset({"memory_harvest", "memory_ingest"})
 
     async def list_tools(self) -> list[types.Tool]:
-        """Return the canonical MCP tool list from declarative registry."""
+        """Return the canonical MCP tool list from declarative registry.
+
+        When ``transport_mode == "remote"``, local-only tools (``memory_harvest``,
+        ``memory_ingest``) are filtered out. These tools read caller-supplied
+        filesystem paths and must not be exposed to untrusted remote callers.
+        """
         logger.info("=== HANDLING LIST_TOOLS REQUEST ===")
         try:
             from mcp_memory_service.tools.registry import TOOL_REGISTRY
 
+            local_only = self.local_only_tools() if self.transport_mode == "remote" else frozenset()
+
             tools = []
             for tool_def in TOOL_REGISTRY:
+                if tool_def.name in local_only:
+                    continue
                 annotations = None
                 if tool_def.annotations:
                     annotations = types.ToolAnnotations(**tool_def.annotations)
@@ -1808,6 +1823,12 @@ class MemoryServer:
     ) -> list[types.TextContent]:
         """Dispatch tool call via routing table (replaces elif chain)."""
         logger.info(f"=== HANDLING TOOL CALL: {name} ===")
+
+        # Reject local-only tools on remote transport — prevents confused-deputy
+        # filesystem access from untrusted callers.
+        if self.transport_mode == "remote" and name in self.local_only_tools():
+            raise ValueError(f"Tool '{name}' is not available on this transport")
+
         if arguments is None:
             arguments = {}
 

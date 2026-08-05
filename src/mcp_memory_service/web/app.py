@@ -91,6 +91,9 @@ backup_scheduler: Optional["BackupScheduler"] = None
 # Global upload session cleanup task
 upload_cleanup_task: asyncio.Task | None = None
 
+# Global MCP Streamable HTTP session manager (standard transport)
+mcp_session_manager: Any | None = None
+
 
 async def oauth_cleanup_background_task():
     """Background task to periodically clean up expired OAuth tokens and codes."""
@@ -129,7 +132,8 @@ async def lifespan(app: FastAPI):
         oauth_cleanup_task, \
         consolidation_scheduler, \
         backup_scheduler, \
-        upload_cleanup_task
+        upload_cleanup_task, \
+        mcp_session_manager
 
     # Startup
     logger.info("Starting MCP Memory Service HTTP interface...")
@@ -238,11 +242,53 @@ async def lifespan(app: FastAPI):
         upload_cleanup_task = asyncio.create_task(cleanup_old_sessions_loop())
         logger.info("Upload session cleanup task started")
 
+        # Initialize standard MCP Streamable HTTP transport (stateless mode
+        # for load-balanced deployments). The SDK's StreamableHTTPSessionManager
+        # handles POST (JSON-RPC), GET (SSE stream), and DELETE (session
+        # termination) per the MCP spec — replacing the custom JSON-RPC shim.
+        try:
+            import mcp_memory_service.server  # noqa: F401 — bootstrap circular import
+            from ..server_impl import MemoryServer
+            from ..api.client import get_consolidator, get_scheduler
+            from .dependencies import get_storage
+
+            cons, sched = None, None
+            try:
+                cons = get_consolidator()
+                sched = get_scheduler()
+            except (ImportError, AttributeError):
+                pass
+
+            _mcp_server = MemoryServer(
+                storage=get_storage(),
+                consolidator=cons,
+                consolidation_scheduler=sched,
+            )
+            _mcp_server.transport_mode = "remote"
+
+            from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+
+            mcp_session_manager = StreamableHTTPSessionManager(
+                app=_mcp_server.server,
+                stateless=True,
+                json_response=True,
+            )
+            logger.info("MCP Streamable HTTP session manager initialized (stateless)")
+        except Exception as e:
+            logger.error(f"Failed to initialize MCP session manager: {e}")
+            mcp_session_manager = None
+
     except Exception as e:
         logger.error(f"Failed to initialize storage: {e}")
         raise
 
-    yield
+    if mcp_session_manager is not None:
+        async with mcp_session_manager.run():
+            logger.info("MCP Streamable HTTP session manager started")
+            yield
+            logger.info("MCP Streamable HTTP session manager shutting down")
+    else:
+        yield
 
     # Shutdown
     logger.info("Shutting down MCP Memory Service HTTP interface...")
@@ -401,8 +447,88 @@ def create_app() -> FastAPI:
     app.include_router(harvest_router, tags=["harvest"])
     logger.info(f"✓ Included harvest router with {len(harvest_router.routes)} routes")
 
-    # Include MCP protocol router
+    # Include MCP protocol REST endpoints (tools list, health)
+    # The standard Streamable HTTP transport is mounted as an ASGI app below.
     app.include_router(mcp_router, tags=["mcp-protocol"])
+
+    # Mount the standard MCP Streamable HTTP transport at /mcp.
+    # The session manager's handle_request is an ASGI callable that
+    # handles POST (JSON-RPC), GET (SSE stream), and DELETE (session
+    # termination) per the MCP spec. It is initialized in the lifespan
+    # and stored as the global mcp_session_manager.
+    #
+    # We use a pure ASGI middleware class (not starlette.Mount) to intercept
+    # /mcp and /mcp/ requests before FastAPI's router sees them. This avoids
+    # the 307 redirect that Mount produces for /mcp (no trailing slash).
+
+    class MCPStreamableHTTPMiddleware:
+        """Pure ASGI middleware: intercept /mcp, authenticate, delegate to SDK."""
+
+        def __init__(self, app_inner):
+            self.app = app_inner
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] == "http" and scope["path"] in ("/mcp", "/mcp/"):
+                await self._handle_mcp(scope, receive, send)
+            else:
+                await self.app(scope, receive, send)
+
+        async def _handle_mcp(self, scope, receive, send):
+            if mcp_session_manager is None:
+                from starlette.responses import JSONResponse
+                resp = JSONResponse({"error": "MCP transport not initialized"}, status_code=503)
+                await resp(scope, receive, send)
+                return
+
+            from .oauth.middleware import (
+                API_KEY, OAUTH_ENABLED, ALLOW_ANONYMOUS_ACCESS,
+                authenticate_bearer_token, authenticate_api_key,
+            )
+            from starlette.requests import Request
+
+            request = Request(scope, receive)
+            authenticated = False
+
+            auth_header = request.headers.get("authorization", "")
+            if auth_header.lower().startswith("bearer "):
+                token = auth_header[7:].strip()
+                if OAUTH_ENABLED:
+                    result = await authenticate_bearer_token(token)
+                    if result.authenticated:
+                        authenticated = True
+                if not authenticated and API_KEY:
+                    result = authenticate_api_key(token)
+                    if result.authenticated:
+                        authenticated = True
+            elif API_KEY:
+                api_key_header = request.headers.get("x-api-key")
+                if api_key_header:
+                    result = authenticate_api_key(api_key_header)
+                    if result.authenticated:
+                        authenticated = True
+                else:
+                    api_key_param = request.query_params.get("api_key")
+                    if api_key_param:
+                        result = authenticate_api_key(api_key_param)
+                        if result.authenticated:
+                            authenticated = True
+
+            if not authenticated and ALLOW_ANONYMOUS_ACCESS:
+                authenticated = True
+
+            if not authenticated:
+                from starlette.responses import JSONResponse
+                resp = JSONResponse(
+                    {"error": "authorization_required", "error_description": "Authentication is required."},
+                    status_code=401,
+                )
+                await resp(scope, receive, send)
+                return
+
+            # Delegate to the SDK session manager (handles POST/GET/DELETE)
+            await mcp_session_manager.handle_request(scope, receive, send)
+
+    app.add_middleware(MCPStreamableHTTPMiddleware)
 
     # Include OAuth routers if enabled
     if OAUTH_ENABLED:

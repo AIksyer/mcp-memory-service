@@ -6,6 +6,12 @@
  * - Health check caching (60s TTL via Cloudflare Cache API)
  * - Automatic failover on 5xx / timeout
  * - Transparent header/body passthrough
+ *
+ * NOTE: The MCP Streamable HTTP transport runs in stateless mode, so no
+ * session affinity (sticky sessions) is needed. Each request is
+ * self-contained and can be routed to any healthy backend. If stateful
+ * mode is ever enabled, the LB must route requests with the same
+ * `Mcp-Session-Id` header to the same backend.
  */
 
 export interface BackendState {

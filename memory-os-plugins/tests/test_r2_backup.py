@@ -106,7 +106,7 @@ class TestParseConfigFile:
         f.write_text(
             "# Memory OS Git Sync configuration\n"
             "enabled: true\n"
-            "repo_path: ~/AgentMemory\n"
+            "base_dir: ~/AgentMemory\n"
             "\n"
             "# Memory OS R2 Backup configuration\n"
             "r2_backup_enabled: true\n"
@@ -127,7 +127,7 @@ class TestParseConfigFile:
         assert result["prefix"] == "memories/"
         assert result["batch_upload"] is False
         # git_sync keys should NOT appear (filtered by prefix).
-        assert "repo_path" not in result
+        assert "base_dir" not in result
 
     def test_comments_and_blanks(self, tmp_path):
         f = tmp_path / "config.yml"
@@ -146,7 +146,7 @@ class TestParseConfigFile:
     def test_no_r2_keys_returns_empty(self, tmp_path):
         f = tmp_path / "config.yml"
         f.write_text(
-            "enabled: true\nrepo_path: ~/repo\n",
+            "enabled: true\nbase_dir: ~/repo\n",
             encoding="utf-8",
         )
         result = _parse_config_file(f)
@@ -317,7 +317,7 @@ class TestSaveConfig:
         cfg_path.write_text(
             "# Memory OS Git Sync configuration\n"
             "enabled: true\n"
-            "repo_path: ~/AgentMemory\n"
+            "base_dir: ~/AgentMemory\n"
             "auto_push: false\n"
             "batch_size: 5\n",
             encoding="utf-8",
@@ -333,7 +333,7 @@ class TestSaveConfig:
         content = cfg_path.read_text(encoding="utf-8")
         # git_sync config should be preserved.
         assert "enabled: true" in content
-        assert "repo_path: ~/AgentMemory" in content
+        assert "base_dir: ~/AgentMemory" in content
         assert "auto_push: false" in content
         assert "batch_size: 5" in content
         # R2 config should be appended.
@@ -347,7 +347,7 @@ class TestSaveConfig:
         cfg_path.write_text(
             "# Memory OS Git Sync configuration\n"
             "enabled: true\n"
-            "repo_path: ~/AgentMemory\n"
+            "base_dir: ~/AgentMemory\n"
             "\n"
             "# Memory OS R2 Backup configuration\n"
             "r2_backup_enabled: false\n"

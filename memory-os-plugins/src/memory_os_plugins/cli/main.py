@@ -119,7 +119,7 @@ def status() -> None:
     click.echo("=" * 40)
     click.echo(f"  Enabled:       {'yes' if config.enabled else 'no'}")
 
-    repo_path = Path(config.repo_path).expanduser()
+    repo_path = Path(config.base_dir).expanduser()
     click.echo(f"  Repo path:     {repo_path}")
     click.echo(f"  Auto push:     {'yes' if config.auto_push else 'no'}")
     click.echo(f"  Batch size:    {config.batch_size}")
@@ -378,7 +378,7 @@ def pull(remote: str, branch: str, dry_run: bool) -> None:
     database.  Existing memories (matched by content hash) are skipped.
     """
     config = load_config()
-    repo_path = Path(config.repo_path).expanduser()
+    repo_path = Path(config.base_dir).expanduser()
 
     if not repo_path.exists():
         click.echo(f"Error: Repository not found at {repo_path}", err=True)
@@ -537,7 +537,7 @@ def _save_project_scope_config(updates: dict[str, str]) -> None:
 def _switch_list_projects() -> None:
     """List known projects from memory files in the git sync repo."""
     config = load_config()
-    repo_path = Path(config.repo_path).expanduser()
+    repo_path = Path(config.base_dir).expanduser()
     memories_dir = repo_path / "memories"
 
     if not memories_dir.exists():

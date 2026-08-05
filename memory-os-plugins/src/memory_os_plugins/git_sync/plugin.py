@@ -13,7 +13,7 @@ from pathlib import Path
 
 from .config import GitSyncConfig, load_config
 from .git_ops import GitSyncQueue
-from .markdown import convert, find_md_path, generate_readme_index
+from .markdown import convert, find_md_path, generate_readme_index, remove_from_index
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +141,7 @@ async def _git_sync_delete(content_hash: str) -> None:
 
         if md_path and md_path.exists():
             md_path.unlink()
+            remove_from_index(content_hash, base_dir)
 
         await _sync_queue.enqueue("delete", content_hash)
         logger.debug("Deleted memory %s from git", content_hash[:12])

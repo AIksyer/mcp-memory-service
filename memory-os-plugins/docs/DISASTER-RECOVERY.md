@@ -108,7 +108,7 @@ git clone <your-git-repo-url> .
 cat > ~/.memory-os/config.yml << 'EOF'
 # Memory OS Git Sync configuration
 enabled: true
-repo_path: ~/AgentMemory
+base_dir: ~/AgentMemory
 auto_push: false
 batch_size: 5
 batch_timeout: 30
@@ -150,7 +150,7 @@ aws s3 sync "s3://$R2_BUCKET/memories/" ~/AgentMemory/memories/ \
 cat > ~/.memory-os/config.yml << 'EOF'
 # Memory OS Git Sync configuration
 enabled: true
-repo_path: ~/AgentMemory
+base_dir: ~/AgentMemory
 auto_push: false
 batch_size: 5
 batch_timeout: 30

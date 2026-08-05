@@ -15,9 +15,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+
+logger = logging.getLogger(__name__)
 
 # Maximum number of entries shown in the README index table.
 README_MAX_ENTRIES = 100
@@ -48,9 +51,11 @@ class MemoryToMarkdown:
     def convert(self, memory: dict, base_dir: str | Path) -> Path:
         """Convert a memory dict to a Markdown file and write it to disk.
 
+        Also updates the index cache for fast ``find_md_path`` lookups.
+
         Args:
             memory: Memory dict with ``content``, ``content_hash``,
-                ``tags``, ``created_at_iso``, ``updated_at_iso``, etc.
+                ``tags``, ``created_at_iso``, etc.
             base_dir: Base directory for the markdown file tree.
 
         Returns:
@@ -61,6 +66,12 @@ class MemoryToMarkdown:
         file_path.parent.mkdir(parents=True, exist_ok=True)
         # UTF-8 without BOM — Python's default for encoding="utf-8".
         file_path.write_text(md_content, encoding="utf-8")
+
+        # Update the index cache for fast lookups by content_hash.
+        content_hash = memory.get("content_hash", "") if isinstance(memory, dict) else ""
+        if content_hash:
+            _update_index(Path(base_dir), content_hash, file_path)
+
         return file_path
 
     def to_markdown(self, memory: dict) -> str:
@@ -248,11 +259,16 @@ def get_md_path(memory: dict, base_dir: str | Path) -> Path:
 def find_md_path(content_hash: str, base_dir: str | Path) -> Path | None:
     """Find the Markdown file for a memory by content_hash.
 
-    Searches the ``memories/`` directory for a file whose name starts with
-    ``mem-<short_id>`` and whose front-matter ``id`` matches *content_hash*.
+    Uses an index cache (``.index/hash_map.json``) for O(1) lookups when
+    available.  On cache miss, falls back to a glob search.
+
+    The *content_hash* is sanitized the same way as in :func:`get_md_path`
+    to prevent path traversal via malicious hash values.
 
     Args:
-        content_hash: The SHA-256 content hash of the memory.
+        content_hash: The content hash of the memory (hex string or
+            arbitrary string — non-hex strings are SHA-256 hashed for
+            filename matching).
         base_dir: Base directory for the markdown file tree.
 
     Returns:
@@ -263,6 +279,28 @@ def find_md_path(content_hash: str, base_dir: str | Path) -> Path | None:
     if not memories_dir.exists():
         return None
 
+    # Preserve the original hash for front-matter id comparison.
+    original_hash = content_hash
+
+    # Sanitize content_hash to prevent path traversal (same as get_md_path).
+    if not re.match(r"^[a-fA-F0-9]+$", content_hash):
+        content_hash = hashlib.sha256(content_hash.encode()).hexdigest()
+
+    # --- Cache lookup (optional optimization) ---
+    index = _load_index(base)
+    cached_rel = index.get(original_hash) or index.get(content_hash)
+    if cached_rel:
+        candidate = base / cached_rel
+        if candidate.exists():
+            try:
+                text = candidate.read_text(encoding="utf-8")
+                front_matter, _ = _parse_front_matter(text)
+                if front_matter.get("id", "") == original_hash:
+                    return candidate
+            except Exception:
+                pass  # Stale or corrupt cache entry — fall through to rglob.
+
+    # --- Fallback: glob search ---
     short_id = content_hash[:SHORT_ID_LENGTH] if len(content_hash) >= SHORT_ID_LENGTH else content_hash
     pattern = f"mem-{short_id}*.md"
 
@@ -270,7 +308,9 @@ def find_md_path(content_hash: str, base_dir: str | Path) -> Path | None:
         try:
             text = md_file.read_text(encoding="utf-8")
             front_matter, _ = _parse_front_matter(text)
-            if front_matter.get("id", "") == content_hash:
+            if front_matter.get("id", "") == original_hash:
+                # Populate the cache for future lookups.
+                _update_index(base, original_hash, md_file)
                 return md_file
         except Exception:
             continue
@@ -306,11 +346,9 @@ def markdown_to_memory_dict(md_text: str) -> dict:
     if embedding_hash:
         metadata["embedding_hash"] = embedding_hash
 
-    # Backward compat: accept both new (id, created_at, updated_at)
-    # and legacy (hash, created, updated) front-matter field names.
-    content_hash = front_matter.get("id", "") or front_matter.get("hash", "")
-    created_at = front_matter.get("created_at", "") or front_matter.get("created", "")
-    updated_at = front_matter.get("updated_at", "") or front_matter.get("updated", "")
+    content_hash = front_matter.get("id", "")
+    created_at = front_matter.get("created_at", "")
+    updated_at = front_matter.get("updated_at", "")
 
     # Extract content from body — everything before ## Tags or ## Metadata.
     content = body
@@ -471,3 +509,117 @@ def _make_preview(body: str, length: int = PREVIEW_LENGTH) -> str:
     # Escape pipe characters so they don't break the table.
     text = text.replace("|", "\\|")
     return text
+
+
+# --------------------------------------------------------------------------- #
+#  Index cache for fast content_hash → file path lookups
+# --------------------------------------------------------------------------- #
+
+
+def _get_index_path(base_dir: Path) -> Path:
+    """Return the path to the hash-map index file.
+
+    Args:
+        base_dir: Base directory for the markdown file tree.
+
+    Returns:
+        ``base_dir / .index / hash_map.json``
+    """
+    return base_dir / ".index" / "hash_map.json"
+
+
+def _load_index(base_dir: Path) -> Dict[str, str]:
+    """Load the hash-map index from disk.
+
+    Returns an empty dict if the file does not exist or is corrupt.
+    All errors are silently swallowed — the index is an optional
+    optimization and callers must fall back to rglob on failure.
+
+    Args:
+        base_dir: Base directory for the markdown file tree.
+
+    Returns:
+        A dict mapping ``content_hash`` → ``relative_file_path``.
+    """
+    index_path = _get_index_path(base_dir)
+    try:
+        text = index_path.read_text(encoding="utf-8")
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return {str(k): str(v) for k, v in data.items()}
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        logger.debug("Index cache load failed (will use rglob): %s", exc)
+    return {}
+
+
+def _save_index(base_dir: Path, index: Dict[str, str]) -> None:
+    """Atomically write the hash-map index to disk.
+
+    Uses a temp-file + ``os.replace`` pattern to ensure the index file
+    is never partially written.  Errors are silently logged — the index
+    is an optional optimization.
+
+    Args:
+        base_dir: Base directory for the markdown file tree.
+        index: The full index dict to write.
+    """
+    index_path = _get_index_path(base_dir)
+    try:
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = index_path.with_name(index_path.name + ".tmp")
+        tmp_path.write_text(
+            json.dumps(index, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        tmp_path.replace(index_path)  # Atomic on same filesystem.
+    except Exception as exc:
+        logger.debug("Index cache save failed: %s", exc)
+
+
+def _update_index(base_dir: Path, content_hash: str, file_path: Path) -> None:
+    """Add or update a single entry in the hash-map index.
+
+    Args:
+        base_dir: Base directory for the markdown file tree.
+        content_hash: The content hash to use as the cache key.
+        file_path: Absolute path to the ``.md`` file (will be stored as
+            a path relative to *base_dir*).
+    """
+    try:
+        index = _load_index(base_dir)
+        rel_path = str(file_path.relative_to(base_dir))
+        index[content_hash] = rel_path
+        _save_index(base_dir, index)
+    except Exception as exc:
+        logger.debug("Index cache update failed: %s", exc)
+
+
+def _remove_index_entry(base_dir: Path, content_hash: str) -> None:
+    """Remove a single entry from the hash-map index.
+
+    Args:
+        base_dir: Base directory for the markdown file tree.
+        content_hash: The content hash to remove from the cache.
+    """
+    try:
+        index = _load_index(base_dir)
+        if content_hash in index:
+            del index[content_hash]
+            _save_index(base_dir, index)
+    except Exception as exc:
+        logger.debug("Index cache removal failed: %s", exc)
+
+
+def remove_from_index(content_hash: str, base_dir: str | Path) -> None:
+    """Remove a content_hash entry from the index cache.
+
+    Public wrapper around :func:`_remove_index_entry` for use by callers
+    that delete memory files (e.g. ``_git_sync_delete`` in plugin.py).
+
+    Args:
+        content_hash: The content hash to remove.
+        base_dir: Base directory for the markdown file tree.
+    """
+    _remove_index_entry(Path(base_dir), content_hash)

@@ -10,6 +10,7 @@ from memory_os_plugins.git_sync.markdown import (
     get_md_path,
     memory_to_markdown,
     markdown_to_memory_dict,
+    remove_from_index,
 )
 
 
@@ -676,3 +677,172 @@ class TestRoundTrip:
         assert parsed["tags"] == original["tags"]
         assert parsed["memory_type"] == original["memory_type"]
         assert parsed["created_at_iso"] == original["created_at_iso"]
+
+
+# ─── Index cache ────────────────────────────────────────────────────
+
+
+class TestIndexCache:
+    """Tests for the content_hash → file_path index cache."""
+
+    def test_convert_creates_index(self, tmp_path):
+        """convert() creates a .index/hash_map.json file."""
+        memory = {
+            "content": "Cached memory",
+            "content_hash": "deadbeef12345678",
+            "tags": ["cache"],
+            "memory_type": "note",
+            "metadata": {},
+            "created_at_iso": "2026-08-03T10:00:00Z",
+            "updated_at_iso": "2026-08-03T10:00:00Z",
+        }
+        convert(memory, tmp_path)
+
+        index_path = tmp_path / ".index" / "hash_map.json"
+        assert index_path.exists()
+
+    def test_find_uses_cache(self, tmp_path):
+        """find_md_path returns the file via cache without rglob."""
+        memory = {
+            "content": "Cached lookup",
+            "content_hash": "cafe123456789abc",
+            "tags": [],
+            "memory_type": "note",
+            "metadata": {},
+            "created_at_iso": "2026-08-03T10:00:00Z",
+            "updated_at_iso": "2026-08-03T10:00:00Z",
+        }
+        convert(memory, tmp_path)
+
+        # Index should have been populated by convert().
+        found = find_md_path("cafe123456789abc", tmp_path)
+        assert found is not None
+        assert found.exists()
+
+    def test_remove_from_index(self, tmp_path):
+        """remove_from_index deletes the cache entry."""
+        memory = {
+            "content": "To be deleted",
+            "content_hash": "feedface12345678",
+            "tags": [],
+            "memory_type": "note",
+            "metadata": {},
+            "created_at_iso": "2026-08-03T10:00:00Z",
+            "updated_at_iso": "2026-08-03T10:00:00Z",
+        }
+        convert(memory, tmp_path)
+
+        # Verify cache entry exists.
+        found = find_md_path("feedface12345678", tmp_path)
+        assert found is not None
+
+        # Remove from index (simulating delete).
+        remove_from_index("feedface12345678", tmp_path)
+
+        # find_md_path should still find the file via rglob fallback.
+        found_after = find_md_path("feedface12345678", tmp_path)
+        assert found_after is not None
+        assert found_after.exists()
+
+    def test_corrupt_index_falls_back_to_rglob(self, tmp_path):
+        """A corrupt index file does not break find_md_path."""
+        memory = {
+            "content": "Corrupt index test",
+            "content_hash": "baadf00d12345678",
+            "tags": [],
+            "memory_type": "note",
+            "metadata": {},
+            "created_at_iso": "2026-08-03T10:00:00Z",
+            "updated_at_iso": "2026-08-03T10:00:00Z",
+        }
+        convert(memory, tmp_path)
+
+        # Corrupt the index file.
+        index_path = tmp_path / ".index" / "hash_map.json"
+        index_path.write_text("NOT VALID JSON {{{", encoding="utf-8")
+
+        # find_md_path should still work via rglob fallback.
+        found = find_md_path("baadf00d12345678", tmp_path)
+        assert found is not None
+        assert found.exists()
+
+    def test_find_nonexistent_returns_none(self, tmp_path):
+        """find_md_path returns None for a hash that doesn't exist."""
+        # Create a memory so memories/ dir exists.
+        memory = {
+            "content": "Existing",
+            "content_hash": "aabbccdd11223344",
+            "tags": [],
+            "memory_type": "note",
+            "metadata": {},
+            "created_at_iso": "2026-08-03T10:00:00Z",
+            "updated_at_iso": "2026-08-03T10:00:00Z",
+        }
+        convert(memory, tmp_path)
+
+        result = find_md_path("ffffffffffffffff", tmp_path)
+        assert result is None
+
+
+# ─── content_hash validation (security) ─────────────────────────────
+
+
+class TestContentHashValidation:
+    """Tests for content_hash sanitization in find_md_path()."""
+
+    def test_non_hex_hash_sanitized(self, tmp_path):
+        """Non-hex content_hash is SHA-256 hashed before pattern matching."""
+        # Store a memory with a non-hex hash — get_md_path will sanitize it
+        # for the filename, but the frontmatter id keeps the original.
+        memory = {
+            "content": "Non-hex hash memory",
+            "content_hash": "hello world!",  # Not hex
+            "tags": [],
+            "memory_type": "note",
+            "metadata": {},
+            "created_at_iso": "2026-08-03T10:00:00Z",
+            "updated_at_iso": "2026-08-03T10:00:00Z",
+        }
+        convert(memory, tmp_path)
+
+        # find_md_path should sanitize the same way and find the file.
+        found = find_md_path("hello world!", tmp_path)
+        assert found is not None
+        assert found.exists()
+
+    def test_path_traversal_attempt_sanitized(self, tmp_path):
+        """Malicious content_hash with path separators is sanitized."""
+        # Store a memory to ensure memories/ dir exists.
+        memory = {
+            "content": "Base memory",
+            "content_hash": "aabbccdd11223344",
+            "tags": [],
+            "memory_type": "note",
+            "metadata": {},
+            "created_at_iso": "2026-08-03T10:00:00Z",
+            "updated_at_iso": "2026-08-03T10:00:00Z",
+        }
+        convert(memory, tmp_path)
+
+        # A malicious hash with path traversal characters should not
+        # cause any file access outside the memories/ directory.
+        malicious = "../../etc/passwd"
+        result = find_md_path(malicious, tmp_path)
+        assert result is None  # Sanitized to a hex hash, no file matches.
+
+    def test_hex_hash_not_modified(self, tmp_path):
+        """A valid hex content_hash is used as-is (no SHA-256 hashing)."""
+        memory = {
+            "content": "Hex hash memory",
+            "content_hash": "0123456789abcdef",
+            "tags": [],
+            "memory_type": "note",
+            "metadata": {},
+            "created_at_iso": "2026-08-03T10:00:00Z",
+            "updated_at_iso": "2026-08-03T10:00:00Z",
+        }
+        convert(memory, tmp_path)
+
+        found = find_md_path("0123456789abcdef", tmp_path)
+        assert found is not None
+        assert "mem-01234567.md" in found.name

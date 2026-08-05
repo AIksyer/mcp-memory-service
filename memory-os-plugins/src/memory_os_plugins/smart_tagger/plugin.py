@@ -1,63 +1,38 @@
-"""Smart tagger plugin — auto-tags memories before storage and filters
-retrieval results by project context.
+"""Smart tagger plugin — registers before_store + on_retrieve hooks.
 
-Hooks:
-    - ``before_store``: analyzes memory content, injects auto-generated tags
-      (project:xxx, type:bug-fix, date:YYYY-MM).
-    - ``on_retrieve``: if the query mentions a project path, boosts results
-      that have the matching ``project:`` tag.
+The ``before_store`` hook fires BEFORE memory storage, so tag modifications
+are persisted to the database.  This fixes the bug in the legacy example
+plugin which used ``on_store`` (post-storage, changes lost).
+
+The ``on_retrieve`` hook boosts mistake-note/error-replay results and
+optionally prioritizes same-project memories.
 """
 
 from __future__ import annotations
 
-import datetime
 import logging
-import re
-from typing import Any, List
 
 from .config import SmartTaggerConfig, load_config
+from .tagger import auto_generate_tags, get_project_name, inject_project_tag
 
 logger = logging.getLogger(__name__)
 
+# Global state — initialised by register(), read by hook handlers.
 _config: SmartTaggerConfig | None = None
-
-# Windows path pattern: drive letter + path, e.g. G:\Project\my-project
-_WIN_PATH_RE = re.compile(
-    r"[A-Za-z]:\\(?:[^\s\\]+\\)*([^\s\\]+)", re.IGNORECASE
-)
-# POSIX path pattern: /path/to/project-name
-_POSIX_PATH_RE = re.compile(r"/(?:[^\s/]+/)+([^\s/]+)")
-
-# Bug-fix keyword patterns (case-insensitive).
-_BUG_FIX_PATTERNS = [
-    re.compile(r"fix(?:ed|ing)?\s*(?:a)?\s*bug", re.IGNORECASE),
-    re.compile(r"\u4fee\u590d\u4e86?\s*bug", re.IGNORECASE),
-    re.compile(r"bug\s*fix", re.IGNORECASE),
-]
-
-# Decision/learning patterns.
-_DECISION_PATTERNS = [
-    re.compile(r"decided?\s+to", re.IGNORECASE),
-    re.compile(r"\u51b3\u5b9a", re.IGNORECASE),
-]
-_LEARNING_PATTERNS = [
-    re.compile(r"learned?\s+(?:that|from)", re.IGNORECASE),
-    re.compile(r"\u5b66\u5230\u4e86", re.IGNORECASE),
-]
-
-# Pattern to extract project name from a project: tag in query context.
-_PROJECT_TAG_RE = re.compile(r"project:([a-zA-Z0-9_-]+)")
 
 
 def register(ctx) -> None:
     """Plugin registration entry point.
 
+    Called automatically by PluginRegistry.discover_and_register().
     Subscribes to ``before_store`` and ``on_retrieve`` hooks if enabled.
 
     Args:
-        ctx: PluginContext from mcp_memory_service.
+        ctx: PluginContext from mcp_memory_service.  Provides ``on(hook, fn)``
+            for hook subscription, plus ``storage`` and ``service`` references.
     """
     global _config
+
     _config = load_config()
 
     if not _config.enabled:
@@ -67,196 +42,128 @@ def register(ctx) -> None:
     ctx.on("before_store", before_store_handler)
     ctx.on("on_retrieve", on_retrieve_handler)
 
-    logger.info("smart_tagger plugin registered")
-
-
-# --------------------------------------------------------------------------- #
-#  Tag extraction logic
-# --------------------------------------------------------------------------- #
-
-def _extract_project_tags(content: str) -> List[str]:
-    """Extract project tags from path patterns in content.
-
-    Scans for Windows and POSIX path patterns and extracts the last
-    path component as a project name.
-
-    Args:
-        content: Memory content text.
-
-    Returns:
-        List of ``project:xxx`` tags (deduplicated, max 3).
-    """
-    tags: list[str] = []
-    seen: set[str] = set()
-
-    for pattern in (_WIN_PATH_RE, _POSIX_PATH_RE):
-        for match in pattern.finditer(content):
-            project_name = match.group(1).lower()
-            tag = f"project:{project_name}"
-            if tag not in seen:
-                seen.add(tag)
-                tags.append(tag)
-            if len(tags) >= 3:
-                return tags
-
-    return tags
-
-
-def _extract_type_tags(content: str) -> List[str]:
-    """Extract type tags from keyword patterns in content.
-
-    Detects bug-fix, decision, and learning patterns.
-
-    Args:
-        content: Memory content text.
-
-    Returns:
-        List of ``type:xxx`` tags.
-    """
-    tags: list[str] = []
-
-    for pattern in _BUG_FIX_PATTERNS:
-        if pattern.search(content):
-            tags.append("type:bug-fix")
-            break
-
-    for pattern in _DECISION_PATTERNS:
-        if pattern.search(content):
-            tags.append("type:decision")
-            break
-
-    for pattern in _LEARNING_PATTERNS:
-        if pattern.search(content):
-            tags.append("type:learning")
-            break
-
-    return tags
-
-
-def _extract_date_tag() -> str:
-    """Generate a date tag from the current date.
-
-    Returns:
-        ``date:YYYY-MM`` string.
-    """
-    now = datetime.datetime.now(datetime.timezone.utc)
-    return f"date:{now.year:04d}-{now.month:02d}"
-
-
-def auto_tag(content: str) -> List[str]:
-    """Generate auto-tags for a memory content string.
-
-    Args:
-        content: Memory content text.
-
-    Returns:
-        List of auto-generated tags.
-    """
-    tags: list[str] = []
-
-    if _config is None:
-        return tags
-
-    if _config.inject_project_tag:
-        tags.extend(_extract_project_tags(content))
-
-    if _config.inject_type_tag:
-        tags.extend(_extract_type_tags(content))
-
-    if _config.inject_date_tag:
-        tags.append(_extract_date_tag())
-
-    return tags
+    logger.info(
+        "smart_tagger plugin registered (auto_tags=%s, project_filter=%s, mistake_boost=%.2f)",
+        _config.auto_tags,
+        _config.project_filter,
+        _config.mistake_boost,
+    )
 
 
 # --------------------------------------------------------------------------- #
 #  Hook handlers
 # --------------------------------------------------------------------------- #
 
-async def before_store_handler(memory_dict: dict) -> dict | None:
-    """Handle before_store hook.
+async def before_store_handler(memory_dict: dict) -> dict:
+    """Handle before_store hook — auto-tag memory BEFORE it is stored.
 
-    Injects auto-generated tags into the memory's tag list.  Existing
-    tags are preserved; only new tags are appended.
+    **Critical**: must return the modified memory_dict.  The before_store hook
+    is chain-processed — the returned dict's ``tags`` and ``metadata`` override
+    the final values used to construct the Memory object.
+
+    Generates content-based tags, injects project tag, and merges with
+    any existing tags (deduplicates, does not overwrite).
 
     Args:
-        memory_dict: Memory dict with ``content``, ``tags``, etc.
+        memory_dict: Pre-store dict with ``content``, ``content_hash``,
+            ``tags``, ``memory_type``, ``metadata``.
 
     Returns:
-        Modified memory dict with updated tags, or None if no changes.
+        Modified memory_dict with auto-generated tags merged in.
     """
-    if _config is None or not _config.enabled:
-        return None
+    if _config is None:
+        return memory_dict
 
-    content = memory_dict.get("content", "")
-    existing_tags: list[str] = list(memory_dict.get("tags") or [])
+    try:
+        if _config.auto_tags:
+            # Generate tags and merge into memory_dict.
+            new_tags = auto_generate_tags(memory_dict)
+            memory_dict["tags"] = new_tags
 
-    new_tags = auto_tag(content)
-    existing_set = set(existing_tags)
-    added = [t for t in new_tags if t not in existing_set]
+        # Inject project tag (from config or env or cwd).
+        project = get_project_name(_config.project_name)
+        inject_project_tag(memory_dict, project)
 
-    if not added:
-        return None
+        logger.debug(
+            "before_store: tagged memory %s with %d tags",
+            memory_dict.get("content_hash", "")[:12],
+            len(memory_dict.get("tags", [])),
+        )
+    except Exception as exc:
+        logger.warning("smart_tagger before_store failed: %s", exc)
 
-    result = dict(memory_dict)
-    result["tags"] = existing_tags + added
-    logger.debug("smart_tagger injected %d tags: %s", len(added), added)
-    return result
+    return memory_dict
 
 
-async def on_retrieve_handler(query: str, results: list[dict]) -> list[dict] | None:
-    """Handle on_retrieve hook.
+async def on_retrieve_handler(query: str, results: list[dict]) -> list[dict]:
+    """Handle on_retrieve hook — boost relevant results and optionally filter.
 
-    If the query contains a project path or ``project:xxx`` tag, boosts
-    results that have the matching project tag by moving them to the
-    front of the list.
+    Two behaviors:
+    1. **Mistake-note boost**: results tagged ``mistake-note`` or ``error-replay``
+       get a configurable score boost, then results are re-sorted.
+    2. **Project filter** (if enabled): results tagged with the current project
+       are boosted to the top.  Cross-project results are still returned
+       (not filtered out) to avoid blocking cross-project retrieval.
 
     Args:
         query: The search query string.
-        results: List of memory result dicts.
+        results: List of result dicts, each with ``tags``, ``similarity``
+            (or ``score``), etc.
 
     Returns:
-        Reordered results list, or None if no reordering was needed.
+        Re-ranked (and optionally project-prioritized) results list.
     """
-    if _config is None or not _config.enabled:
-        return None
+    if _config is None or not results:
+        return results
 
-    # Extract project name from query.
-    project_name = None
+    try:
+        # 1. Boost mistake-note / error-replay results.
+        for result in results:
+            tags = result.get("tags", [])
+            if "mistake-note" in tags or "error-replay" in tags:
+                current_score = result.get("similarity", result.get("score", 0.5))
+                result["similarity"] = min(1.0, current_score + _config.mistake_boost)
 
-    # Check for explicit project:xxx tag in query.
-    tag_match = _PROJECT_TAG_RE.search(query)
-    if tag_match:
-        project_name = tag_match.group(1).lower()
-    else:
-        # Check for path patterns in the query.
-        for pattern in (_WIN_PATH_RE, _POSIX_PATH_RE):
-            match = pattern.search(query)
-            if match:
-                project_name = match.group(1).lower()
-                break
+        # 2. Project filtering: if enabled, partition by project match.
+        if _config.project_filter:
+            project = get_project_name(_config.project_name)
+            project_tag = f"project:{project}" if project else ""
 
-    if not project_name:
-        return None
+            if project_tag:
+                same_project = []
+                other = []
+                for result in results:
+                    tags = result.get("tags", [])
+                    if project_tag in tags:
+                        same_project.append(result)
+                    else:
+                        other.append(result)
 
-    project_tag = f"project:{project_name}"
-
-    # Partition results: tagged first, then others.
-    tagged: list[dict] = []
-    untagged: list[dict] = []
-
-    for r in results:
-        r_tags = r.get("tags") or []
-        if project_tag in r_tags:
-            tagged.append(r)
+                # Sort each partition by score, then concatenate.
+                same_project.sort(
+                    key=lambda r: r.get("similarity", r.get("score", 0)),
+                    reverse=True,
+                )
+                other.sort(
+                    key=lambda r: r.get("similarity", r.get("score", 0)),
+                    reverse=True,
+                )
+                results = same_project + other
+            else:
+                # No project tag configured — just sort by score.
+                results.sort(
+                    key=lambda r: r.get("similarity", r.get("score", 0)),
+                    reverse=True,
+                )
         else:
-            untagged.append(r)
+            # No project filter — just re-sort by boosted scores.
+            results.sort(
+                key=lambda r: r.get("similarity", r.get("score", 0)),
+                reverse=True,
+            )
 
-    if not tagged:
-        return None
+        logger.debug("on_retrieve: re-ranked %d results", len(results))
+    except Exception as exc:
+        logger.warning("smart_tagger on_retrieve failed: %s", exc)
 
-    logger.debug(
-        "smart_tagger boosted %d/%d results for project:%s",
-        len(tagged), len(results), project_name,
-    )
-    return tagged + untagged
+    return results

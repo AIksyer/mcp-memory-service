@@ -1,3 +1,5 @@
+> ⚠️ **DEPRECATED**: This example plugin has a known bug — it uses the `on_store` hook (fires *after* storage), so tag modifications are **not persisted** to the database. Use the built-in [`memory_os_plugins.smart_tagger`](../../memory-os-plugins/src/memory_os_plugins/smart_tagger/) package instead, which correctly uses the `before_store` hook.
+
 # Plugin: Smart Tagger
 
 Auto-tags memories on store and boosts mistake-notes on retrieve.

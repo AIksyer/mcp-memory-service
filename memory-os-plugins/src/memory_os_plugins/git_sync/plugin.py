@@ -13,7 +13,7 @@ from pathlib import Path
 
 from .config import GitSyncConfig, load_config
 from .git_ops import GitSyncQueue
-from .markdown import generate_readme_index, get_md_path, memory_to_markdown
+from .markdown import convert, find_md_path, generate_readme_index
 
 logger = logging.getLogger(__name__)
 
@@ -40,9 +40,9 @@ def register(ctx) -> None:
         logger.info("git_sync plugin is disabled by configuration")
         return
 
-    repo_path = Path(_config.repo_path).expanduser()
+    base_dir = Path(_config.base_dir).expanduser()
     _sync_queue = GitSyncQueue(
-        repo_path=repo_path,
+        repo_path=base_dir,
         batch_size=_config.batch_size,
         timeout=_config.batch_timeout,
         auto_push=_config.auto_push,
@@ -51,7 +51,7 @@ def register(ctx) -> None:
     ctx.on("on_store", on_store_handler)
     ctx.on("on_delete", on_delete_handler)
 
-    logger.info("git_sync plugin registered (repo: %s)", repo_path)
+    logger.info("git_sync plugin registered (base_dir: %s)", base_dir)
 
 
 # --------------------------------------------------------------------------- #
@@ -91,8 +91,8 @@ async def on_delete_handler(content_hash: str) -> None:
 async def _git_sync_store(memory_dict: dict) -> None:
     """Write a memory to Markdown and enqueue git sync.
 
-    Converts the memory dict to Markdown via markdown.memory_to_markdown(),
-    writes it to the repo, then enqueues a batch commit via GitSyncQueue.
+    Uses ``convert()`` to write the Markdown file, then updates the README
+    index and enqueues a batch commit via GitSyncQueue.
     All errors are caught and logged as warnings — never propagates.
 
     Args:
@@ -106,17 +106,13 @@ async def _git_sync_store(memory_dict: dict) -> None:
         if not content_hash:
             return
 
-        md_content = memory_to_markdown(memory_dict)
-        repo_path = Path(_config.repo_path).expanduser()
-        md_path = get_md_path(content_hash, repo_path)
-
-        md_path.parent.mkdir(parents=True, exist_ok=True)
-        md_path.write_text(md_content, encoding="utf-8")
+        base_dir = Path(_config.base_dir).expanduser()
+        convert(memory_dict, base_dir)
 
         try:
-            memories_dir = repo_path / "memories"
+            memories_dir = base_dir / "memories"
             readme_content = generate_readme_index(memories_dir)
-            (repo_path / "README.md").write_text(readme_content, encoding="utf-8")
+            (base_dir / "README.md").write_text(readme_content, encoding="utf-8")
         except Exception as exc:
             logger.warning("Failed to update README index: %s", exc)
 
@@ -129,7 +125,8 @@ async def _git_sync_store(memory_dict: dict) -> None:
 async def _git_sync_delete(content_hash: str) -> None:
     """Delete a memory's Markdown file and enqueue git sync.
 
-    Removes the Markdown file from the repo, then enqueues a batch commit.
+    Uses ``find_md_path()`` to locate the file by content_hash, removes it,
+    then enqueues a batch commit.
     All errors are caught and logged as warnings — never propagates.
 
     Args:
@@ -139,10 +136,10 @@ async def _git_sync_delete(content_hash: str) -> None:
         if _config is None or _sync_queue is None:
             return
 
-        repo_path = Path(_config.repo_path).expanduser()
-        md_path = get_md_path(content_hash, repo_path)
+        base_dir = Path(_config.base_dir).expanduser()
+        md_path = find_md_path(content_hash, base_dir)
 
-        if md_path.exists():
+        if md_path and md_path.exists():
             md_path.unlink()
 
         await _sync_queue.enqueue("delete", content_hash)

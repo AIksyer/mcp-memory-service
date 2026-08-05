@@ -3,8 +3,11 @@
 from pathlib import Path
 
 from memory_os_plugins.git_sync.markdown import (
-    get_md_path,
+    MemoryToMarkdown,
+    convert,
+    find_md_path,
     generate_readme_index,
+    get_md_path,
     memory_to_markdown,
     markdown_to_memory_dict,
 )
@@ -27,30 +30,33 @@ class TestMemoryToMarkdown:
                 "quality_score": 0.85,
                 "access_count": 3,
                 "source_type": "user",
-                "importance": "high",
             },
             "created_at_iso": "2026-08-03T10:00:00Z",
+            "updated_at_iso": "2026-08-03T12:00:00Z",
         }
         result = memory_to_markdown(memory_dict)
 
         # Front matter
         assert "---" in result
-        assert "hash: abc123def456" in result
-        assert "type: decision" in result
+        assert "id: abc123def456" in result
         assert "tags: [auth, security]" in result
-        assert "created: 2026-08-03T10:00:00Z" in result
-        assert "importance: high" in result
+        assert "created_at: 2026-08-03T10:00:00Z" in result
+        assert "updated_at: 2026-08-03T12:00:00Z" in result
+        assert "type: decision" in result
 
-        # Content
+        # Content in body
         assert "Use JWT for authentication." in result
+
+        # Tags section
+        assert "## Tags" in result
+        assert "#auth" in result
+        assert "#security" in result
 
         # Metadata section
         assert "## Metadata" in result
         assert "- **quality_score**: 0.85" in result
         assert "- **access_count**: 3" in result
         assert "- **source_type**: user" in result
-        # importance is in front matter, not Metadata section
-        assert "- **importance**:" not in result
 
     def test_empty_metadata(self):
         """When metadata is empty, the ## Metadata section should be omitted."""
@@ -61,13 +67,12 @@ class TestMemoryToMarkdown:
             "memory_type": None,
             "metadata": {},
             "created_at_iso": "2026-08-03T12:00:00Z",
+            "updated_at_iso": "2026-08-03T12:00:00Z",
         }
         result = memory_to_markdown(memory_dict)
 
         assert "## Metadata" not in result
-        # memory_type defaults to "observation"
-        assert "type: observation" in result
-        # empty tags → tags: []
+        assert "type:" not in result
         assert "tags: []" in result
 
     def test_none_metadata(self):
@@ -79,6 +84,7 @@ class TestMemoryToMarkdown:
             "memory_type": "note",
             "metadata": None,
             "created_at_iso": "",
+            "updated_at_iso": "",
         }
         result = memory_to_markdown(memory_dict)
 
@@ -101,6 +107,7 @@ class TestMemoryToMarkdown:
                 "access_count": 5,
             },
             "created_at_iso": "2026-08-03T15:00:00Z",
+            "updated_at_iso": "2026-08-03T15:00:00Z",
         }
         result = memory_to_markdown(memory_dict)
 
@@ -111,25 +118,38 @@ class TestMemoryToMarkdown:
         assert "empty_list" not in result
         assert "empty_dict" not in result
 
-    def test_importance_not_in_metadata_section(self):
-        """importance goes to front matter, should not appear in Metadata section."""
+    def test_embedding_hash(self):
+        """When embedding is present, embedding_hash should appear in front matter."""
         memory_dict = {
-            "content": "Test",
-            "content_hash": "h",
-            "tags": [],
-            "memory_type": "observation",
-            "metadata": {"importance": "low", "quality_score": 0.1},
-            "created_at_iso": "2026-01-01T00:00:00Z",
+            "content": "Test with embedding",
+            "content_hash": "hash_emb",
+            "tags": ["test"],
+            "memory_type": "note",
+            "metadata": {},
+            "created_at_iso": "2026-08-03T10:00:00Z",
+            "updated_at_iso": "2026-08-03T10:00:00Z",
+            "embedding": [0.1, 0.2, 0.3],
         }
         result = memory_to_markdown(memory_dict)
-        assert "importance: low" in result
-        assert "- **importance**:" not in result.split("## Metadata")[1]
+        assert "embedding_hash:" in result
+
+    def test_no_embedding_hash_when_absent(self):
+        """When embedding is absent, embedding_hash should not appear."""
+        memory_dict = {
+            "content": "No embedding",
+            "content_hash": "hash_no_emb",
+            "tags": [],
+            "memory_type": "note",
+            "metadata": {},
+            "created_at_iso": "2026-08-03T10:00:00Z",
+            "updated_at_iso": "2026-08-03T10:00:00Z",
+        }
+        result = memory_to_markdown(memory_dict)
+        assert "embedding_hash:" not in result
 
     def test_missing_fields(self):
         """A dict with minimal fields should not raise."""
         result = memory_to_markdown({"content": "Minimal"})
-        assert "type: observation" in result
-        assert "tags: []" in result
         assert "Minimal" in result
 
     def test_output_ends_with_newline(self):
@@ -137,74 +157,24 @@ class TestMemoryToMarkdown:
         result = memory_to_markdown({"content": "Test", "content_hash": "h"})
         assert result.endswith("\n")
 
-    # ── Requested test names ────────────────────────────────────────
-
-    def test_memory_to_markdown_basic(self):
-        """Basic Markdown generation: content, tags, hash."""
+    def test_multiline_content(self):
+        """Multi-line content should be handled via YAML block scalar."""
         memory_dict = {
-            "content": "Use JWT for authentication.",
-            "content_hash": "abc123def456",
-            "tags": ["auth", "security"],
-            "memory_type": "decision",
-            "metadata": {},
-            "created_at_iso": "2026-08-03T10:00:00Z",
-        }
-        result = memory_to_markdown(memory_dict)
-
-        assert "abc123def456" in result
-        assert "Use JWT for authentication." in result
-        assert "tags: [auth, security]" in result
-        assert "type: decision" in result
-        assert "---" in result
-
-    def test_memory_to_markdown_with_metadata(self):
-        """Markdown with metadata should include ## Metadata section."""
-        memory_dict = {
-            "content": "Important decision",
-            "content_hash": "hash789",
-            "tags": ["test"],
-            "memory_type": "observation",
-            "metadata": {
-                "quality_score": 0.9,
-                "source_type": "user",
-                "importance": "high",
-            },
-            "created_at_iso": "2026-08-03T15:00:00Z",
-        }
-        result = memory_to_markdown(memory_dict)
-
-        assert "## Metadata" in result
-        assert "- **quality_score**: 0.9" in result
-        assert "- **source_type**: user" in result
-        assert "importance: high" in result  # in front matter
-        assert "- **importance**:" not in result  # not in Metadata section
-
-    def test_memory_to_markdown_empty_tags(self):
-        """Empty tags should render as tags: []."""
-        memory_dict = {
-            "content": "No tags here",
-            "content_hash": "h1",
-            "tags": [],
+            "content": "Line 1\nLine 2\nLine 3",
+            "content_hash": "multi001",
+            "tags": ["multi"],
             "memory_type": "note",
             "metadata": {},
-            "created_at_iso": "2026-08-03T12:00:00Z",
+            "created_at_iso": "2026-08-03T10:00:00Z",
+            "updated_at_iso": "2026-08-03T10:00:00Z",
         }
         result = memory_to_markdown(memory_dict)
-        assert "tags: []" in result
-
-    def test_memory_to_markdown_no_metadata(self):
-        """When metadata is empty/None, ## Metadata section should be omitted."""
-        for metadata in [{}, None]:
-            memory_dict = {
-                "content": "Content",
-                "content_hash": "h2",
-                "tags": ["note"],
-                "memory_type": "note",
-                "metadata": metadata,
-                "created_at_iso": "2026-08-03T12:00:00Z",
-            }
-            result = memory_to_markdown(memory_dict)
-            assert "## Metadata" not in result
+        # Block scalar indicator
+        assert "content: |" in result
+        # All lines present in body
+        assert "Line 1" in result
+        assert "Line 2" in result
+        assert "Line 3" in result
 
 
 # ─── get_md_path ─────────────────────────────────────────────────────
@@ -213,40 +183,207 @@ class TestMemoryToMarkdown:
 class TestGetMdPath:
     """Tests for get_md_path()."""
 
-    def test_standard_hash(self):
-        repo = Path("/tmp/repo")
-        result = get_md_path("abcdef123456", repo)
-        assert result == Path("/tmp/repo/memories/ab/abcdef123456.md")
+    def test_standard_path(self, tmp_path):
+        """File path uses YYYY/MM/mem-<short_id>.md format."""
+        memory = {
+            "content_hash": "abcdef1234567890",
+            "created_at_iso": "2026-08-03T10:00:00Z",
+        }
+        result = get_md_path(memory, tmp_path)
+        assert result == tmp_path / "memories" / "2026" / "08" / "mem-abcdef12.md"
 
-    def test_short_hash(self):
-        """Very short hash uses '00' as prefix."""
-        repo = Path("/tmp/repo")
-        result = get_md_path("a", repo)
-        assert result == Path("/tmp/repo/memories/00/a.md")
+    def test_short_hash(self, tmp_path):
+        """Very short hash uses what's available."""
+        memory = {
+            "content_hash": "a",
+            "created_at_iso": "2026-08-03T10:00:00Z",
+        }
+        result = get_md_path(memory, tmp_path)
+        assert result == tmp_path / "memories" / "2026" / "08" / "mem-a.md"
 
-    def test_long_hash(self):
-        """Typical SHA-256 hash."""
+    def test_long_hash(self, tmp_path):
+        """Typical SHA-256 hash truncated to 8 chars in filename."""
         sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        repo = Path("/repo")
-        result = get_md_path(sha, repo)
-        assert result == Path(f"/repo/memories/e3/{sha}.md")
+        memory = {
+            "content_hash": sha,
+            "created_at_iso": "2026-08-03T10:00:00Z",
+        }
+        result = get_md_path(memory, tmp_path)
+        assert result == tmp_path / "memories" / "2026" / "08" / "mem-e3b0c442.md"
 
-    # ── Requested test names ────────────────────────────────────────
+    def test_missing_timestamp(self, tmp_path):
+        """Missing created_at_iso falls back to 1970/01."""
+        memory = {"content_hash": "abcdef12"}
+        result = get_md_path(memory, tmp_path)
+        assert result == tmp_path / "memories" / "1970" / "01" / "mem-abcdef12.md"
 
-    def test_get_md_path(self, tmp_path):
-        """File path uses first 2 chars of hash as sub-directory name."""
-        repo = tmp_path / "repo"
-        result = get_md_path("abcdef123456", repo)
-        assert result == repo / "memories" / "ab" / "abcdef123456.md"
+    def test_different_dates(self, tmp_path):
+        """Different dates produce different paths."""
+        mem1 = {"content_hash": "hash0001", "created_at_iso": "2025-12-01T00:00:00Z"}
+        mem2 = {"content_hash": "hash0002", "created_at_iso": "2026-03-15T00:00:00Z"}
+        path1 = get_md_path(mem1, tmp_path)
+        path2 = get_md_path(mem2, tmp_path)
+        assert path1 != path2
+        assert "2025" in str(path1) and "12" in str(path1)
+        assert "2026" in str(path2) and "03" in str(path2)
 
-    def test_get_md_path_special_chars(self, tmp_path):
-        """Normal content hashes are hex (0-9a-f); path should be safe."""
-        repo = tmp_path / "repo"
-        hex_hash = "e3b0c44298fc1c149afbf4c8996fb924"
-        result = get_md_path(hex_hash, repo)
-        assert result == repo / "memories" / "e3" / f"{hex_hash}.md"
-        # Verify the path doesn't escape the memories/ directory.
-        assert result.is_relative_to(repo / "memories")
+    def test_path_is_within_base(self, tmp_path):
+        """Path should be within the base_dir/memories/ directory."""
+        memory = {
+            "content_hash": "abcdef123456",
+            "created_at_iso": "2026-08-03T10:00:00Z",
+        }
+        result = get_md_path(memory, tmp_path)
+        assert result.is_relative_to(tmp_path / "memories")
+
+
+# ─── find_md_path ────────────────────────────────────────────────────
+
+
+class TestFindMdPath:
+    """Tests for find_md_path()."""
+
+    def test_find_existing_file(self, tmp_path):
+        """find_md_path locates a file written by convert()."""
+        memory = {
+            "content": "Test content",
+            "content_hash": "abcdef1234567890",
+            "tags": ["test"],
+            "memory_type": "note",
+            "metadata": {},
+            "created_at_iso": "2026-08-03T10:00:00Z",
+            "updated_at_iso": "2026-08-03T10:00:00Z",
+        }
+        convert(memory, tmp_path)
+
+        found = find_md_path("abcdef1234567890", tmp_path)
+        assert found is not None
+        assert found.exists()
+        assert "mem-abcdef12.md" in found.name
+
+    def test_find_nonexistent(self, tmp_path):
+        """find_md_path returns None when no file exists."""
+        result = find_md_path("nonexistent_hash", tmp_path)
+        assert result is None
+
+    def test_find_no_memories_dir(self, tmp_path):
+        """find_md_path returns None when memories dir doesn't exist."""
+        result = find_md_path("anyhash", tmp_path)
+        assert result is None
+
+
+# ─── MemoryToMarkdown class ──────────────────────────────────────────
+
+
+class TestMemoryToMarkdownClass:
+    """Tests for the MemoryToMarkdown class."""
+
+    def test_convert_writes_file(self, tmp_path):
+        """convert() writes a Markdown file to the correct path."""
+        converter = MemoryToMarkdown()
+        memory = {
+            "content": "Test content",
+            "content_hash": "abcdef0123456789",
+            "tags": ["tag1", "tag2"],
+            "memory_type": "note",
+            "metadata": {},
+            "created_at_iso": "2026-08-03T10:00:00Z",
+            "updated_at_iso": "2026-08-03T10:00:00Z",
+        }
+        path = converter.convert(memory, tmp_path)
+
+        assert path.exists()
+        assert path.parent == tmp_path / "memories" / "2026" / "08"
+        assert path.name == "mem-abcdef01.md"
+
+        # Verify file content
+        content = path.read_text(encoding="utf-8")
+        assert "---" in content
+        assert "id: abcdef0123456789" in content
+        assert "Test content" in content
+
+    def test_to_markdown_returns_string(self):
+        """to_markdown() returns a string without writing to disk."""
+        converter = MemoryToMarkdown()
+        memory = {
+            "content": "Hello",
+            "content_hash": "h",
+            "tags": ["test"],
+            "memory_type": "note",
+            "metadata": {},
+            "created_at_iso": "2026-08-03T10:00:00Z",
+            "updated_at_iso": "2026-08-03T10:00:00Z",
+        }
+        result = converter.to_markdown(memory)
+        assert isinstance(result, str)
+        assert "Hello" in result
+
+    def test_get_path_returns_path(self, tmp_path):
+        """get_path() returns the expected path."""
+        converter = MemoryToMarkdown()
+        memory = {
+            "content_hash": "abcdef123456",
+            "created_at_iso": "2026-08-03T10:00:00Z",
+        }
+        path = converter.get_path(memory, tmp_path)
+        assert isinstance(path, Path)
+        assert path == tmp_path / "memories" / "2026" / "08" / "mem-abcdef12.md"
+
+
+# ─── convert standalone function ────────────────────────────────────
+
+
+class TestConvertFunction:
+    """Tests for the standalone convert() function."""
+
+    def test_convert_writes_file(self, tmp_path):
+        """convert() writes a file and returns the path."""
+        memory = {
+            "content": "Standalone test",
+            "content_hash": "abcde1234567890a",
+            "tags": ["func"],
+            "memory_type": "note",
+            "metadata": {},
+            "created_at_iso": "2026-07-15T08:00:00Z",
+            "updated_at_iso": "2026-07-15T08:00:00Z",
+        }
+        path = convert(memory, tmp_path)
+
+        assert path.exists()
+        assert "mem-abcde123.md" in path.name
+        assert "2026" in str(path)
+        assert "07" in str(path)
+
+    def test_convert_utf8_no_bom(self, tmp_path):
+        """File must be UTF-8 without BOM."""
+        memory = {
+            "content": "UTF-8 test with émojis 🎉",
+            "content_hash": "utf8test1234567",
+            "tags": ["utf8"],
+            "memory_type": "note",
+            "metadata": {},
+            "created_at_iso": "2026-08-03T10:00:00Z",
+            "updated_at_iso": "2026-08-03T10:00:00Z",
+        }
+        path = convert(memory, tmp_path)
+        raw_bytes = path.read_bytes()
+        # UTF-8 BOM is EF BB BF
+        assert not raw_bytes.startswith(b"\xef\xbb\xbf"), "File must not have UTF-8 BOM"
+
+    def test_convert_creates_parent_dirs(self, tmp_path):
+        """convert() creates parent directories as needed."""
+        memory = {
+            "content": "Deep path test",
+            "content_hash": "deeppath1234567",
+            "tags": [],
+            "memory_type": "note",
+            "metadata": {},
+            "created_at_iso": "2025-01-15T08:00:00Z",
+            "updated_at_iso": "2025-01-15T08:00:00Z",
+        }
+        path = convert(memory, tmp_path)
+        assert path.exists()
+        assert path.parent.exists()
 
 
 # ─── generate_readme_index ──────────────────────────────────────────
@@ -264,78 +401,69 @@ class TestGenerateReadmeIndex:
 
     def test_with_files(self, tmp_path):
         """Files with front matter are listed in the index."""
-        # Create two memory files
-        subdir = tmp_path / "ab"
-        subdir.mkdir()
-        (subdir / "abc123.md").write_text(
-            "---\n"
-            "hash: abc123\n"
-            "type: note\n"
-            "tags: [python, test]\n"
-            "created: 2026-08-03T10:00:00Z\n"
-            "---\n\n"
-            "This is a test memory about Python.",
-            encoding="utf-8",
-        )
+        # Create memory files using convert()
+        mem1 = {
+            "content": "This is a test memory about Python.",
+            "content_hash": "abc123def45678901",
+            "tags": ["python", "test"],
+            "memory_type": "note",
+            "metadata": {},
+            "created_at_iso": "2026-08-03T10:00:00Z",
+            "updated_at_iso": "2026-08-03T10:00:00Z",
+        }
+        mem2 = {
+            "content": "Use SQLite for local storage.",
+            "content_hash": "cde456fgh78901234",
+            "tags": ["architecture"],
+            "memory_type": "decision",
+            "metadata": {},
+            "created_at_iso": "2026-08-02T08:00:00Z",
+            "updated_at_iso": "2026-08-02T08:00:00Z",
+        }
+        convert(mem1, tmp_path)
+        convert(mem2, tmp_path)
 
-        subdir2 = tmp_path / "cd"
-        subdir2.mkdir()
-        (subdir2 / "cde456.md").write_text(
-            "---\n"
-            "hash: cde456\n"
-            "type: decision\n"
-            "tags: [architecture]\n"
-            "created: 2026-08-02T08:00:00Z\n"
-            "---\n\n"
-            "Use SQLite for local storage.",
-            encoding="utf-8",
-        )
-
-        result = generate_readme_index(tmp_path)
+        result = generate_readme_index(tmp_path / "memories")
 
         assert "Total memories: 2" in result
-        assert "abc123" in result
-        assert "cde456" in result
+        assert "abc123de" in result
+        assert "cde456fg" in result
         # More recent entry should appear first
-        abc_pos = result.index("abc123")
-        cde_pos = result.index("cde456")
+        abc_pos = result.index("abc123de")
+        cde_pos = result.index("cde456fg")
         assert abc_pos < cde_pos
 
     def test_preview_truncation(self, tmp_path):
         """Long content is truncated in the preview column."""
         long_content = "A" * 200
-        subdir = tmp_path / "ab"
-        subdir.mkdir()
-        (subdir / "abc.md").write_text(
-            "---\n"
-            "hash: abc\n"
-            "type: note\n"
-            "tags: []\n"
-            "created: 2026-08-03T10:00:00Z\n"
-            "---\n\n"
-            f"{long_content}",
-            encoding="utf-8",
-        )
+        mem = {
+            "content": long_content,
+            "content_hash": "longprev12345678",
+            "tags": [],
+            "memory_type": "note",
+            "metadata": {},
+            "created_at_iso": "2026-08-03T10:00:00Z",
+            "updated_at_iso": "2026-08-03T10:00:00Z",
+        }
+        convert(mem, tmp_path)
 
-        result = generate_readme_index(tmp_path)
-        assert "…" in result
+        result = generate_readme_index(tmp_path / "memories")
+        assert "\u2026" in result
 
     def test_pipe_escaping_in_preview(self, tmp_path):
         """Pipe characters in content are escaped to not break the table."""
-        subdir = tmp_path / "ab"
-        subdir.mkdir()
-        (subdir / "abc.md").write_text(
-            "---\n"
-            "hash: abc\n"
-            "type: note\n"
-            "tags: []\n"
-            "created: 2026-08-03T10:00:00Z\n"
-            "---\n\n"
-            "Use command: echo a | grep b",
-            encoding="utf-8",
-        )
+        mem = {
+            "content": "Use command: echo a | grep b",
+            "content_hash": "pipe1234567890ab",
+            "tags": [],
+            "memory_type": "note",
+            "metadata": {},
+            "created_at_iso": "2026-08-03T10:00:00Z",
+            "updated_at_iso": "2026-08-03T10:00:00Z",
+        }
+        convert(mem, tmp_path)
 
-        result = generate_readme_index(tmp_path)
+        result = generate_readme_index(tmp_path / "memories")
         assert "\\|" in result
 
     def test_file_without_front_matter(self, tmp_path):
@@ -363,8 +491,9 @@ class TestMarkdownToMemoryDict:
             "content_hash": "abc123def456789",
             "tags": ["auth", "security"],
             "memory_type": "decision",
-            "metadata": {"importance": "high"},
+            "metadata": {},
             "created_at_iso": "2026-08-03T10:00:00Z",
+            "updated_at_iso": "2026-08-03T12:00:00Z",
         }
         md = memory_to_markdown(original)
         parsed = markdown_to_memory_dict(md)
@@ -373,18 +502,19 @@ class TestMarkdownToMemoryDict:
         assert parsed["content_hash"] == original["content_hash"]
         assert parsed["tags"] == original["tags"]
         assert parsed["memory_type"] == original["memory_type"]
-        assert parsed["metadata"]["importance"] == "high"
         assert parsed["created_at_iso"] == original["created_at_iso"]
+        assert parsed["updated_at_iso"] == original["updated_at_iso"]
 
     def test_empty_tags(self):
         """Empty tags should parse to an empty list."""
         md = (
             "---\n"
-            "hash: abc123\n"
-            "type: note\n"
+            "id: abc123\n"
+            "content: |\n"
+            "  Some content.\n"
             "tags: []\n"
-            "created: 2026-08-03T10:00:00Z\n"
-            "importance: N/A\n"
+            "created_at: 2026-08-03T10:00:00Z\n"
+            "updated_at: 2026-08-03T10:00:00Z\n"
             "---\n\n"
             "Some content."
         )
@@ -395,11 +525,12 @@ class TestMarkdownToMemoryDict:
         """A single tag should parse correctly."""
         md = (
             "---\n"
-            "hash: abc123\n"
-            "type: note\n"
+            "id: abc123\n"
+            "content: |\n"
+            "  Content here.\n"
             "tags: [only-tag]\n"
-            "created: 2026-08-03T10:00:00Z\n"
-            "importance: N/A\n"
+            "created_at: 2026-08-03T10:00:00Z\n"
+            "updated_at: 2026-08-03T10:00:00Z\n"
             "---\n\n"
             "Content here."
         )
@@ -413,20 +544,22 @@ class TestMarkdownToMemoryDict:
         assert parsed["content_hash"] == ""
         assert parsed["tags"] == []
 
-    def test_importance_in_metadata(self):
-        """Importance should be extracted into metadata dict."""
+    def test_embedding_hash_parsed(self):
+        """embedding_hash should be parsed into metadata."""
         md = (
             "---\n"
-            "hash: abc\n"
-            "type: note\n"
+            "id: abc\n"
+            "content: |\n"
+            "  Content.\n"
             "tags: []\n"
-            "created: 2026-08-03T10:00:00Z\n"
-            "importance: critical\n"
+            "created_at: 2026-08-03T10:00:00Z\n"
+            "updated_at: 2026-08-03T10:00:00Z\n"
+            "embedding_hash: abcdef1234567890\n"
             "---\n\n"
-            "Important content."
+            "Content."
         )
         parsed = markdown_to_memory_dict(md)
-        assert parsed["metadata"]["importance"] == "critical"
+        assert parsed["metadata"]["embedding_hash"] == "abcdef1234567890"
 
 
 # ─── Round-trip tests ───────────────────────────────────────────────
@@ -444,6 +577,7 @@ class TestRoundTrip:
             "memory_type": "decision",
             "metadata": {},
             "created_at_iso": "2026-08-03T10:00:00Z",
+            "updated_at_iso": "2026-08-03T12:00:00Z",
         }
         md = memory_to_markdown(original)
         parsed = markdown_to_memory_dict(md)
@@ -453,22 +587,22 @@ class TestRoundTrip:
         assert parsed["tags"] == original["tags"]
         assert parsed["memory_type"] == original["memory_type"]
         assert parsed["created_at_iso"] == original["created_at_iso"]
+        assert parsed["updated_at_iso"] == original["updated_at_iso"]
 
     def test_complex_metadata_round_trip(self):
-        """importance (front matter) survives; other metadata fields are
-        written to the ## Metadata section but not parsed back."""
+        """metadata fields are written to ## Metadata section."""
         original = {
             "content": "Important architectural decision.",
-            "content_hash": "deadbeef1234",
+            "content_hash": "deadbeef12345678",
             "tags": ["architecture", "decision"],
             "memory_type": "decision",
             "metadata": {
                 "quality_score": 0.85,
                 "access_count": 3,
                 "source_type": "user",
-                "importance": "high",
             },
             "created_at_iso": "2026-08-03T12:00:00Z",
+            "updated_at_iso": "2026-08-03T12:00:00Z",
         }
         md = memory_to_markdown(original)
         parsed = markdown_to_memory_dict(md)
@@ -480,11 +614,7 @@ class TestRoundTrip:
         assert parsed["memory_type"] == original["memory_type"]
         assert parsed["created_at_iso"] == original["created_at_iso"]
 
-        # importance is stored in front matter and parsed back.
-        assert parsed["metadata"].get("importance") == "high"
-
-        # The ## Metadata section is written but not parsed back by the
-        # current implementation — verify the Markdown contains them.
+        # ## Metadata section is written but not parsed back.
         assert "- **quality_score**: 0.85" in md
         assert "- **access_count**: 3" in md
         assert "- **source_type**: user" in md
@@ -493,11 +623,12 @@ class TestRoundTrip:
         """Empty tags list survives the round trip."""
         original = {
             "content": "A memory with no tags.",
-            "content_hash": "hash0001",
+            "content_hash": "hash000100000000",
             "tags": [],
             "memory_type": "note",
             "metadata": {},
             "created_at_iso": "2026-08-03T08:00:00Z",
+            "updated_at_iso": "2026-08-03T08:00:00Z",
         }
         md = memory_to_markdown(original)
         parsed = markdown_to_memory_dict(md)
@@ -511,11 +642,12 @@ class TestRoundTrip:
         """Content with newlines, quotes, and Markdown special characters."""
         original = {
             "content": 'Line 1\nLine 2 with "quotes"\n# Not a heading\n* not a list',
-            "content_hash": "face1234",
+            "content_hash": "face1234face5678",
             "tags": ["test", "special"],
             "memory_type": "note",
             "metadata": {},
             "created_at_iso": "2026-08-03T09:00:00Z",
+            "updated_at_iso": "2026-08-03T09:00:00Z",
         }
         md = memory_to_markdown(original)
         parsed = markdown_to_memory_dict(md)
@@ -523,3 +655,24 @@ class TestRoundTrip:
         assert parsed["content"] == original["content"]
         assert parsed["content_hash"] == original["content_hash"]
         assert parsed["tags"] == original["tags"]
+
+    def test_full_convert_round_trip(self, tmp_path):
+        """Full round-trip: convert() → read file → markdown_to_memory_dict()."""
+        original = {
+            "content": "Round trip via file system.",
+            "content_hash": "roundtrip12345678",
+            "tags": ["round", "trip"],
+            "memory_type": "note",
+            "metadata": {"quality_score": 0.7},
+            "created_at_iso": "2026-06-15T14:30:00Z",
+            "updated_at_iso": "2026-06-15T14:30:00Z",
+        }
+        path = convert(original, tmp_path)
+        md_text = path.read_text(encoding="utf-8")
+        parsed = markdown_to_memory_dict(md_text)
+
+        assert parsed["content"] == original["content"]
+        assert parsed["content_hash"] == original["content_hash"]
+        assert parsed["tags"] == original["tags"]
+        assert parsed["memory_type"] == original["memory_type"]
+        assert parsed["created_at_iso"] == original["created_at_iso"]

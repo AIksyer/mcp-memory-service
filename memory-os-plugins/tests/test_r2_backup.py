@@ -30,6 +30,7 @@ except ImportError:
 
 import pytest
 
+from memory_os_plugins.git_sync.markdown import convert
 from memory_os_plugins.r2_backup import plugin
 from memory_os_plugins.r2_backup.config import (
     R2BackupConfig,
@@ -840,16 +841,23 @@ class TestR2BackupStore:
 
     def test_store_uploads_existing_file(self, tmp_path):
         """_r2_backup_store should upload when the Markdown file exists."""
-        # Create the Markdown file at the expected git_sync path.
+        # Create the Markdown file using convert() (date-based path).
         repo_path = tmp_path / "repo"
-        md_path = repo_path / "memories" / "ab" / "abcdef1234567890.md"
-        md_path.parent.mkdir(parents=True)
-        md_path.write_text("content", encoding="utf-8")
+        memory_dict = {
+            "content": "content",
+            "content_hash": "abcdef1234567890",
+            "tags": [],
+            "memory_type": "note",
+            "metadata": {},
+            "created_at_iso": "2026-08-03T10:00:00Z",
+            "updated_at_iso": "2026-08-03T10:00:00Z",
+        }
+        md_path = convert(memory_dict, repo_path)
 
-        # Mock git_sync config to return our repo_path.
+        # Mock git_sync config to return our base_dir.
         with patch(
             "memory_os_plugins.r2_backup.plugin.load_git_config",
-            return_value=MagicMock(repo_path=str(repo_path)),
+            return_value=MagicMock(base_dir=str(repo_path)),
         ):
             with patch(
                 "memory_os_plugins.r2_backup.plugin.upload_to_r2",
@@ -868,7 +876,7 @@ class TestR2BackupStore:
         """_r2_backup_store should skip when the Markdown file doesn't exist."""
         with patch(
             "memory_os_plugins.r2_backup.plugin.load_git_config",
-            return_value=MagicMock(repo_path=str(tmp_path / "nonexistent")),
+            return_value=MagicMock(base_dir=str(tmp_path / "nonexistent")),
         ):
             with patch(
                 "memory_os_plugins.r2_backup.plugin.upload_to_r2",
@@ -900,13 +908,20 @@ class TestR2BackupStore:
     def test_store_uses_to_thread(self, tmp_path):
         """_r2_backup_store should use asyncio.to_thread for the sync upload."""
         repo_path = tmp_path / "repo"
-        md_path = repo_path / "memories" / "ab" / "abcdef1234567890.md"
-        md_path.parent.mkdir(parents=True)
-        md_path.write_text("content", encoding="utf-8")
+        memory_dict = {
+            "content": "content",
+            "content_hash": "abcdef1234567890",
+            "tags": [],
+            "memory_type": "note",
+            "metadata": {},
+            "created_at_iso": "2026-08-03T10:00:00Z",
+            "updated_at_iso": "2026-08-03T10:00:00Z",
+        }
+        convert(memory_dict, repo_path)
 
         with patch(
             "memory_os_plugins.r2_backup.plugin.load_git_config",
-            return_value=MagicMock(repo_path=str(repo_path)),
+            return_value=MagicMock(base_dir=str(repo_path)),
         ):
             with patch(
                 "memory_os_plugins.r2_backup.plugin.upload_to_r2",
@@ -992,13 +1007,20 @@ class TestHandlerIntegration:
     def test_on_store_handler_uploads_file(self, tmp_path):
         """Full flow: on_store_handler → file exists → upload to R2."""
         repo_path = tmp_path / "repo"
-        md_path = repo_path / "memories" / "ab" / "abcdef1234567890.md"
-        md_path.parent.mkdir(parents=True)
-        md_path.write_text("content", encoding="utf-8")
+        memory_dict = {
+            "content": "content",
+            "content_hash": "abcdef1234567890",
+            "tags": [],
+            "memory_type": "note",
+            "metadata": {},
+            "created_at_iso": "2026-08-03T10:00:00Z",
+            "updated_at_iso": "2026-08-03T10:00:00Z",
+        }
+        md_path = convert(memory_dict, repo_path)
 
         with patch(
             "memory_os_plugins.r2_backup.plugin.load_git_config",
-            return_value=MagicMock(repo_path=str(repo_path)),
+            return_value=MagicMock(base_dir=str(repo_path)),
         ):
             with patch(
                 "memory_os_plugins.r2_backup.plugin.upload_to_r2",
@@ -1047,13 +1069,20 @@ class TestHandlerIntegration:
         import time
 
         repo_path = tmp_path / "repo"
-        md_path = repo_path / "memories" / "a1" / "a1b2c3d4e5f6.md"
-        md_path.parent.mkdir(parents=True)
-        md_path.write_text("content", encoding="utf-8")
+        memory_dict = {
+            "content": "content",
+            "content_hash": "a1b2c3d4e5f67890",
+            "tags": [],
+            "memory_type": "note",
+            "metadata": {},
+            "created_at_iso": "2026-08-03T10:00:00Z",
+            "updated_at_iso": "2026-08-03T10:00:00Z",
+        }
+        convert(memory_dict, repo_path)
 
         with patch(
             "memory_os_plugins.r2_backup.plugin.load_git_config",
-            return_value=MagicMock(repo_path=str(repo_path)),
+            return_value=MagicMock(base_dir=str(repo_path)),
         ):
             with patch(
                 "memory_os_plugins.r2_backup.plugin.upload_to_r2",

@@ -18,7 +18,7 @@ import logging
 from pathlib import Path
 
 from ..git_sync.config import load_config as load_git_config
-from ..git_sync.markdown import get_md_path
+from ..git_sync.markdown import find_md_path
 from .config import R2BackupConfig, load_config
 from .r2_ops import delete_from_r2, upload_to_r2
 
@@ -136,15 +136,15 @@ async def _r2_backup_store(memory_dict: dict) -> None:
         if not content_hash:
             return
 
-        # Compute the Markdown file path (same path git_sync would write).
+        # Find the Markdown file written by git_sync plugin.
         git_config = load_git_config()
-        repo_path = Path(git_config.repo_path).expanduser()
-        md_path = get_md_path(content_hash, repo_path)
+        base_dir = Path(git_config.base_dir).expanduser()
+        md_path = find_md_path(content_hash, base_dir)
 
-        if not md_path.exists():
+        if md_path is None or not md_path.exists():
             logger.debug(
-                "Markdown file %s does not exist yet — skipping R2 upload",
-                md_path,
+                "Markdown file for %s does not exist yet — skipping R2 upload",
+                content_hash[:12],
             )
             return
 

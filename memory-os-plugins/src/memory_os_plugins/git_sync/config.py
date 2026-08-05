@@ -4,6 +4,14 @@ Priority order (highest to lowest):
 1. Environment variables (prefix ``MEMORY_OS_GIT_SYNC_``)
 2. Config file at ``~/.memory-os/config.yml`` (simple key: value, no PyYAML needed)
 3. Built-in defaults
+
+Configuration fields:
+    - ``base_dir`` — base directory for Markdown file tree (alias: ``repo_path``)
+    - ``batch_size`` — commit queue size (flush after N changes)
+    - ``batch_timeout`` — seconds before auto-flush if batch_size not reached
+    - ``auto_push`` — push to remote after each batch commit
+    - ``enabled`` — master switch
+    - ``project_name`` — optional project tag
 """
 
 from __future__ import annotations
@@ -30,19 +38,28 @@ class GitSyncConfig:
 
     Attributes:
         enabled: Whether the plugin is active.
-        repo_path: Path to the git sync repository.
+        base_dir: Base directory for the Markdown file tree.
         auto_push: Whether to push after every batch commit.
-        batch_size: Number of changes before auto-flush.
+        batch_size: Number of changes before auto-flush (commit queue size).
         batch_timeout: Seconds before auto-flush if batch_size not reached.
         project_name: Optional project name tag for this repository.
     """
 
     enabled: bool = True
-    repo_path: str = "~/AgentMemory"
+    base_dir: str = "~/AgentMemory"
     auto_push: bool = False
     batch_size: int = 5
     batch_timeout: int = 30
     project_name: str = ""
+
+    @property
+    def repo_path(self) -> str:
+        """Backward-compat alias for ``base_dir``."""
+        return self.base_dir
+
+    @repo_path.setter
+    def repo_path(self, value: str) -> None:
+        self.base_dir = value
 
 
 # --------------------------------------------------------------------------- #
@@ -91,11 +108,23 @@ def _parse_config_file(path: Path) -> Dict[str, Any]:
 # Mapping: env suffix -> (config attr, type converter)
 _ENV_MAPPINGS: Dict[str, tuple[str, Callable[[str], Any]]] = {
     "ENABLED": ("enabled", _parse_bool),
-    "REPO_PATH": ("repo_path", str),
+    "BASE_DIR": ("base_dir", str),
+    "REPO_PATH": ("base_dir", str),  # backward compat
     "AUTO_PUSH": ("auto_push", _parse_bool),
     "BATCH_SIZE": ("batch_size", int),
     "BATCH_TIMEOUT": ("batch_timeout", int),
     "PROJECT_NAME": ("project_name", str),
+}
+
+# Config file keys recognised by this plugin (both new and legacy).
+_FILE_KEY_ALIASES: Dict[str, str] = {
+    "base_dir": "base_dir",
+    "repo_path": "base_dir",  # backward compat
+    "enabled": "enabled",
+    "auto_push": "auto_push",
+    "batch_size": "batch_size",
+    "batch_timeout": "batch_timeout",
+    "project_name": "project_name",
 }
 
 
@@ -115,8 +144,9 @@ def load_config() -> GitSyncConfig:
         try:
             file_values = _parse_config_file(CONFIG_FILE)
             for key, value in file_values.items():
-                if hasattr(config, key):
-                    setattr(config, key, value)
+                attr = _FILE_KEY_ALIASES.get(key)
+                if attr and hasattr(config, attr):
+                    setattr(config, attr, value)
         except Exception as exc:
             logger.warning("Failed to parse config file %s: %s", CONFIG_FILE, exc)
 
@@ -134,8 +164,8 @@ def load_config() -> GitSyncConfig:
 
 # Keys managed by this plugin (used to filter old lines on save).
 _SAVE_KEYS = frozenset({
-    "enabled", "repo_path", "auto_push", "batch_size", "batch_timeout",
-    "project_name",
+    "enabled", "base_dir", "repo_path", "auto_push", "batch_size",
+    "batch_timeout", "project_name",
 })
 
 
@@ -171,7 +201,7 @@ def save_config(config: GitSyncConfig, path: Path | None = None) -> None:
     git_lines = [
         "# Memory OS Git Sync configuration",
         f"enabled: {'true' if config.enabled else 'false'}",
-        f"repo_path: {config.repo_path}",
+        f"base_dir: {config.base_dir}",
         f"auto_push: {'true' if config.auto_push else 'false'}",
         f"batch_size: {config.batch_size}",
         f"batch_timeout: {config.batch_timeout}",

@@ -71,7 +71,7 @@ def init(repo: str | None, project: str | None, enable_r2_sync: bool) -> None:
     # Build and persist config.
     config = GitSyncConfig(
         enabled=True,
-        repo_path=str(repo_path),
+        base_dir=str(repo_path),
         auto_push=False,
         batch_size=5,
         batch_timeout=30,

@@ -773,7 +773,7 @@ class TestPullCommand:
              patch("memory_os_plugins.git_sync.config.CONFIG_FILE", config_path):
             from memory_os_plugins.git_sync.config import GitSyncConfig
             mock_load.return_value = GitSyncConfig(
-                enabled=True, repo_path="/nonexistent/path"
+                enabled=True, base_dir="/nonexistent/path"
             )
             result = runner.invoke(cli, ["pull"])
 
@@ -794,7 +794,7 @@ class TestPullCommand:
              patch("memory_os_plugins.git_sync.config.CONFIG_FILE", config_path):
             from memory_os_plugins.git_sync.config import GitSyncConfig
             mock_load.return_value = GitSyncConfig(
-                enabled=True, repo_path=str(repo_path)
+                enabled=True, base_dir=str(repo_path)
             )
             result = runner.invoke(cli, ["pull"])
 
@@ -823,7 +823,7 @@ class TestPullCommand:
              patch("memory_os_plugins.git_sync.git_ops.git_pull", return_value=True):
             from memory_os_plugins.git_sync.config import GitSyncConfig
             mock_load.return_value = GitSyncConfig(
-                enabled=True, repo_path=str(repo_path)
+                enabled=True, base_dir=str(repo_path)
             )
             result = runner.invoke(cli, ["pull", "--dry-run"])
 
@@ -862,7 +862,7 @@ class TestPullCommand:
              patch("memory_os_plugins.cli.main._close_storage", new_callable=AsyncMock):
             from memory_os_plugins.git_sync.config import GitSyncConfig
             mock_load.return_value = GitSyncConfig(
-                enabled=True, repo_path=str(repo_path)
+                enabled=True, base_dir=str(repo_path)
             )
             result = runner.invoke(cli, ["pull"])
 
@@ -882,7 +882,7 @@ class TestPullCommand:
              patch("memory_os_plugins.git_sync.git_ops.git_pull", return_value=True):
             from memory_os_plugins.git_sync.config import GitSyncConfig
             mock_load.return_value = GitSyncConfig(
-                enabled=True, repo_path=str(repo_path)
+                enabled=True, base_dir=str(repo_path)
             )
             result = runner.invoke(cli, ["pull"])
 
@@ -1169,7 +1169,7 @@ class TestSwitchCommand:
              patch("memory_os_plugins.cli.main.load_config") as mock_load:
             from memory_os_plugins.git_sync.config import GitSyncConfig
             mock_load.return_value = GitSyncConfig(
-                enabled=True, repo_path=str(repo_path)
+                enabled=True, base_dir=str(repo_path)
             )
             result = runner.invoke(cli, ["switch", "--list"])
 
@@ -1204,7 +1204,7 @@ class TestSwitchCommand:
              patch("memory_os_plugins.cli.main.load_config") as mock_load:
             from memory_os_plugins.git_sync.config import GitSyncConfig
             mock_load.return_value = GitSyncConfig(
-                enabled=True, repo_path=str(repo_path)
+                enabled=True, base_dir=str(repo_path)
             )
             result = runner.invoke(cli, ["switch", "--list"])
 
@@ -1225,7 +1225,7 @@ class TestSwitchCommand:
              patch("memory_os_plugins.cli.main.load_config") as mock_load:
             from memory_os_plugins.git_sync.config import GitSyncConfig
             mock_load.return_value = GitSyncConfig(
-                enabled=True, repo_path=str(repo_path)
+                enabled=True, base_dir=str(repo_path)
             )
             result = runner.invoke(cli, ["switch", "--list"])
 
@@ -1257,7 +1257,7 @@ class TestSwitchCommand:
              patch("memory_os_plugins.cli.main.load_config") as mock_load:
             from memory_os_plugins.git_sync.config import GitSyncConfig
             mock_load.return_value = GitSyncConfig(
-                enabled=True, repo_path=str(repo_path)
+                enabled=True, base_dir=str(repo_path)
             )
             result = runner.invoke(cli, ["switch", "--list"])
 
@@ -1281,7 +1281,7 @@ class TestSwitchCommand:
              patch("memory_os_plugins.cli.main.load_config") as mock_load:
             from memory_os_plugins.git_sync.config import GitSyncConfig
             mock_load.return_value = GitSyncConfig(
-                enabled=True, repo_path=str(repo_path)
+                enabled=True, base_dir=str(repo_path)
             )
             result = runner.invoke(cli, ["switch", "--list"])
 
@@ -1314,7 +1314,7 @@ class TestSwitchCommand:
              patch("memory_os_plugins.cli.main.load_config") as mock_load:
             from memory_os_plugins.git_sync.config import GitSyncConfig
             mock_load.return_value = GitSyncConfig(
-                enabled=True, repo_path=str(repo_path)
+                enabled=True, base_dir=str(repo_path)
             )
             result = runner.invoke(cli, ["switch", "--list"])
 

@@ -23,11 +23,19 @@ class TestGitSyncConfig:
     def test_defaults(self):
         c = GitSyncConfig()
         assert c.enabled is True
-        assert c.repo_path == "~/AgentMemory"
+        assert c.base_dir == "~/AgentMemory"
         assert c.auto_push is False
         assert c.batch_size == 5
         assert c.batch_timeout == 30
         assert c.project_name == ""
+
+    def test_repo_path_alias(self):
+        """repo_path property should be an alias for base_dir."""
+        c = GitSyncConfig(base_dir="/custom/path")
+        assert c.repo_path == "/custom/path"
+
+        c.repo_path = "/another/path"
+        assert c.base_dir == "/another/path"
 
 
 # --------------------------------------------------------------------------- #
@@ -53,7 +61,7 @@ class TestParseConfigFile:
         f = tmp_path / "config.yml"
         f.write_text(
             "enabled: false\n"
-            "repo_path: /custom/path\n"
+            "base_dir: /custom/path\n"
             "auto_push: true\n"
             "batch_size: 10\n"
             "batch_timeout: 60\n"
@@ -62,11 +70,21 @@ class TestParseConfigFile:
         )
         result = _parse_config_file(f)
         assert result["enabled"] is False
-        assert result["repo_path"] == "/custom/path"
+        assert result["base_dir"] == "/custom/path"
         assert result["auto_push"] is True
         assert result["batch_size"] == 10
         assert result["batch_timeout"] == 60
         assert result["project_name"] == "MyProject"
+
+    def test_legacy_repo_path(self, tmp_path):
+        """Legacy repo_path should be parsed and mapped to base_dir."""
+        f = tmp_path / "config.yml"
+        f.write_text(
+            "repo_path: /legacy/path\n",
+            encoding="utf-8",
+        )
+        result = _parse_config_file(f)
+        assert result["repo_path"] == "/legacy/path"
 
     def test_comments_and_blanks(self, tmp_path):
         f = tmp_path / "config.yml"
@@ -107,14 +125,13 @@ class TestLoadConfig:
         monkeypatch.setattr(
             "memory_os_plugins.git_sync.config.CONFIG_FILE", tmp_path / "nonexistent.yml"
         )
-        # Clear any env vars from the test environment.
         for key in list(os.environ):
             if key.startswith("MEMORY_OS_GIT_SYNC_"):
                 monkeypatch.delenv(key, raising=False)
 
         config = load_config()
         assert config.enabled is True
-        assert config.repo_path == "~/AgentMemory"
+        assert config.base_dir == "~/AgentMemory"
         assert config.auto_push is False
         assert config.batch_size == 5
         assert config.batch_timeout == 30
@@ -124,7 +141,7 @@ class TestLoadConfig:
             "memory_os_plugins.git_sync.config.CONFIG_FILE", tmp_path / "config.yml"
         )
         (tmp_path / "config.yml").write_text(
-            "enabled: false\nrepo_path: /from/file\nbatch_size: 99\n",
+            "enabled: false\nbase_dir: /from/file\nbatch_size: 99\n",
             encoding="utf-8",
         )
         for key in list(os.environ):
@@ -133,7 +150,7 @@ class TestLoadConfig:
 
         config = load_config()
         assert config.enabled is False
-        assert config.repo_path == "/from/file"
+        assert config.base_dir == "/from/file"
         assert config.batch_size == 99
 
     def test_env_overrides_file(self, tmp_path, monkeypatch):
@@ -141,15 +158,16 @@ class TestLoadConfig:
             "memory_os_plugins.git_sync.config.CONFIG_FILE", tmp_path / "config.yml"
         )
         (tmp_path / "config.yml").write_text(
-            "enabled: false\nrepo_path: /from/file\n", encoding="utf-8"
+            "enabled: false\nbase_dir: /from/file\n",
+            encoding="utf-8",
         )
         monkeypatch.setenv("MEMORY_OS_GIT_SYNC_ENABLED", "true")
-        monkeypatch.setenv("MEMORY_OS_GIT_SYNC_REPO_PATH", "/from/env")
+        monkeypatch.setenv("MEMORY_OS_GIT_SYNC_BASE_DIR", "/from/env")
         monkeypatch.setenv("MEMORY_OS_GIT_SYNC_BATCH_SIZE", "42")
 
         config = load_config()
         assert config.enabled is True
-        assert config.repo_path == "/from/env"
+        assert config.base_dir == "/from/env"
         assert config.batch_size == 42
 
     def test_env_overrides_defaults_no_file(self, tmp_path, monkeypatch):
@@ -165,6 +183,35 @@ class TestLoadConfig:
         assert config.auto_push is True
         assert config.project_name == "EnvProject"
 
+    def test_legacy_repo_path_env(self, tmp_path, monkeypatch):
+        """MEMORY_OS_GIT_SYNC_REPO_PATH should map to base_dir (backward compat)."""
+        monkeypatch.setattr(
+            "memory_os_plugins.git_sync.config.CONFIG_FILE", tmp_path / "nonexistent.yml"
+        )
+        for key in list(os.environ):
+            if key.startswith("MEMORY_OS_GIT_SYNC_"):
+                monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv("MEMORY_OS_GIT_SYNC_REPO_PATH", "/legacy/env/path")
+
+        config = load_config()
+        assert config.base_dir == "/legacy/env/path"
+
+    def test_legacy_repo_path_in_file(self, tmp_path, monkeypatch):
+        """repo_path in config file should map to base_dir."""
+        monkeypatch.setattr(
+            "memory_os_plugins.git_sync.config.CONFIG_FILE", tmp_path / "config.yml"
+        )
+        (tmp_path / "config.yml").write_text(
+            "repo_path: /legacy/file/path\n",
+            encoding="utf-8",
+        )
+        for key in list(os.environ):
+            if key.startswith("MEMORY_OS_GIT_SYNC_"):
+                monkeypatch.delenv(key, raising=False)
+
+        config = load_config()
+        assert config.base_dir == "/legacy/file/path"
+
     def test_invalid_env_value_falls_back(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
             "memory_os_plugins.git_sync.config.CONFIG_FILE", tmp_path / "nonexistent.yml"
@@ -179,9 +226,7 @@ class TestLoadConfig:
         monkeypatch.setattr(
             "memory_os_plugins.git_sync.config.CONFIG_FILE", tmp_path / "config.yml"
         )
-        # Write a file that will cause _parse_config_file to fail.
-        # Actually _parse_config_file is robust; let's make the file unreadable
-        # by making it a directory.
+        # Make the file unreadable by making it a directory.
         (tmp_path / "config.yml").mkdir()
 
         config = load_config()
@@ -208,7 +253,7 @@ class TestRequestedConfigTests:
 
         config = load_config()
         assert config.enabled is True
-        assert config.repo_path == "~/AgentMemory"
+        assert config.base_dir == "~/AgentMemory"
         assert config.auto_push is False
         assert config.batch_size == 5
         assert config.batch_timeout == 30
@@ -225,7 +270,7 @@ class TestRequestedConfigTests:
                 monkeypatch.delenv(key, raising=False)
 
         monkeypatch.setenv("MEMORY_OS_GIT_SYNC_ENABLED", "false")
-        monkeypatch.setenv("MEMORY_OS_GIT_SYNC_REPO_PATH", "/custom/env/path")
+        monkeypatch.setenv("MEMORY_OS_GIT_SYNC_BASE_DIR", "/custom/env/path")
         monkeypatch.setenv("MEMORY_OS_GIT_SYNC_AUTO_PUSH", "true")
         monkeypatch.setenv("MEMORY_OS_GIT_SYNC_BATCH_SIZE", "20")
         monkeypatch.setenv("MEMORY_OS_GIT_SYNC_BATCH_TIMEOUT", "120")
@@ -233,7 +278,7 @@ class TestRequestedConfigTests:
 
         config = load_config()
         assert config.enabled is False
-        assert config.repo_path == "/custom/env/path"
+        assert config.base_dir == "/custom/env/path"
         assert config.auto_push is True
         assert config.batch_size == 20
         assert config.batch_timeout == 120
@@ -281,7 +326,7 @@ class TestSaveConfig:
         cfg_path = tmp_path / "config.yml"
         original = GitSyncConfig(
             enabled=False,
-            repo_path="/custom",
+            base_dir="/custom",
             auto_push=True,
             batch_size=10,
             batch_timeout=60,
@@ -292,7 +337,7 @@ class TestSaveConfig:
 
         loaded = _parse_config_file(cfg_path)
         assert loaded["enabled"] is False
-        assert loaded["repo_path"] == "/custom"
+        assert loaded["base_dir"] == "/custom"
         assert loaded["auto_push"] is True
         assert loaded["batch_size"] == 10
         assert loaded["batch_timeout"] == 60
@@ -313,11 +358,10 @@ class TestSaveConfig:
     def test_preserves_r2_backup_config(self, tmp_path):
         """save_config should not overwrite r2_backup lines in shared config."""
         cfg_path = tmp_path / "config.yml"
-        # Write a config file that has both git_sync and r2_backup lines.
         cfg_path.write_text(
             "# Memory OS Git Sync configuration\n"
             "enabled: true\n"
-            "repo_path: ~/AgentMemory\n"
+            "base_dir: ~/AgentMemory\n"
             "auto_push: false\n"
             "batch_size: 5\n"
             "batch_timeout: 30\n"
@@ -333,10 +377,9 @@ class TestSaveConfig:
             encoding="utf-8",
         )
 
-        # Re-save git_sync config — should preserve r2_backup lines.
         new_config = GitSyncConfig(
             enabled=False,
-            repo_path="/new/path",
+            base_dir="/new/path",
             auto_push=True,
             batch_size=10,
             batch_timeout=60,
@@ -353,7 +396,29 @@ class TestSaveConfig:
 
         # git_sync lines should be updated.
         assert "enabled: false" in content
-        assert "repo_path: /new/path" in content
+        assert "base_dir: /new/path" in content
         assert "auto_push: true" in content
         assert "batch_size: 10" in content
         assert "batch_timeout: 60" in content
+
+    def test_legacy_repo_path_preserved(self, tmp_path):
+        """Legacy repo_path in old config should be filtered and replaced with base_dir."""
+        cfg_path = tmp_path / "config.yml"
+        cfg_path.write_text(
+            "# Memory OS Git Sync configuration\n"
+            "repo_path: /old/path\n"
+            "enabled: true\n"
+            "\n"
+            "# Other plugin\n"
+            "other_setting: value\n",
+            encoding="utf-8",
+        )
+
+        save_config(GitSyncConfig(base_dir="/new/path"), path=cfg_path)
+        content = cfg_path.read_text(encoding="utf-8")
+
+        # Old repo_path should be gone, new base_dir should be present.
+        assert "repo_path:" not in content
+        assert "base_dir: /new/path" in content
+        # Other plugin's config preserved.
+        assert "other_setting: value" in content

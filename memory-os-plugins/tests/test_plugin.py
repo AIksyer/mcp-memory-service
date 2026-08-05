@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 try:
@@ -30,6 +31,7 @@ except ImportError:
 
 from memory_os_plugins.git_sync import plugin
 from memory_os_plugins.git_sync.config import GitSyncConfig
+from memory_os_plugins.git_sync.markdown import convert
 
 
 # --------------------------------------------------------------------------- #
@@ -67,7 +69,7 @@ class TestRegister:
         for key in list(os.environ):
             if key.startswith("MEMORY_OS_GIT_SYNC_"):
                 monkeypatch.delenv(key, raising=False)
-        monkeypatch.setenv("MEMORY_OS_GIT_SYNC_REPO_PATH", str(tmp_path / "repo"))
+        monkeypatch.setenv("MEMORY_OS_GIT_SYNC_BASE_DIR", str(tmp_path / "repo"))
 
         ctx = FakePluginContext()
         plugin.register(ctx)
@@ -105,7 +107,7 @@ class TestRegister:
 
 class TestHookHandlers:
     def setup_method(self):
-        plugin._config = GitSyncConfig(repo_path="/tmp/test_repo")
+        plugin._config = GitSyncConfig(base_dir="/tmp/test_repo")
         plugin._sync_queue = MagicMock()
 
     def test_on_store_creates_task(self):
@@ -134,14 +136,14 @@ class TestHookHandlers:
 
 class TestGitSyncStore:
     def setup_method(self):
-        plugin._config = GitSyncConfig(repo_path="~/test_repo")
+        plugin._config = GitSyncConfig(base_dir="~/test_repo")
         plugin._sync_queue = MagicMock()
         plugin._sync_queue.enqueue = AsyncMock()
 
     def test_store_writes_markdown_and_enqueues(self, tmp_path):
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
-        plugin._config = GitSyncConfig(repo_path=str(repo_path))
+        plugin._config = GitSyncConfig(base_dir=str(repo_path))
         plugin._sync_queue = MagicMock()
         plugin._sync_queue.enqueue = AsyncMock()
 
@@ -150,18 +152,19 @@ class TestGitSyncStore:
             "content_hash": "abcdef1234567890",
             "tags": ["test"],
             "memory_type": "note",
-            "metadata": {"importance": "high"},
-            "created_at_iso": "2026-08-03T10:00:00",
+            "metadata": {},
+            "created_at_iso": "2026-08-03T10:00:00Z",
+            "updated_at_iso": "2026-08-03T10:00:00Z",
         }
 
         asyncio.run(plugin._git_sync_store(memory_dict))
 
-        # Check Markdown file was written.
-        md_path = repo_path / "memories" / "ab" / "abcdef1234567890.md"
+        # Check Markdown file was written at date-based path.
+        md_path = repo_path / "memories" / "2026" / "08" / "mem-abcdef12.md"
         assert md_path.exists()
         content = md_path.read_text(encoding="utf-8")
         assert "Test memory content" in content
-        assert "abcdef1234567890" in content
+        assert "id: abcdef1234567890" in content
 
         # Check enqueue was called.
         plugin._sync_queue.enqueue.assert_called_once_with("store", "abcdef1234567890")
@@ -173,7 +176,7 @@ class TestGitSyncStore:
     def test_store_exception_does_not_propagate(self):
         """Errors in _git_sync_store should be caught, not raised."""
         with patch(
-            "memory_os_plugins.git_sync.plugin.memory_to_markdown",
+            "memory_os_plugins.git_sync.plugin.convert",
             side_effect=RuntimeError("boom"),
         ):
             # Should not raise.
@@ -187,18 +190,31 @@ class TestGitSyncStore:
 
 class TestGitSyncDelete:
     def setup_method(self):
-        plugin._config = GitSyncConfig(repo_path="~/test_repo")
+        plugin._config = GitSyncConfig(base_dir="~/test_repo")
         plugin._sync_queue = MagicMock()
         plugin._sync_queue.enqueue = AsyncMock()
 
     def test_delete_removes_file_and_enqueues(self, tmp_path):
+        """Delete should find and remove the markdown file."""
         repo_path = tmp_path / "repo"
-        # Create a markdown file to delete.
-        md_path = repo_path / "memories" / "ab" / "abcdef1234567890.md"
-        md_path.parent.mkdir(parents=True)
-        md_path.write_text("content", encoding="utf-8")
 
-        plugin._config = GitSyncConfig(repo_path=str(repo_path))
+        # First, write a memory file using convert().
+        memory_dict = {
+            "content": "Memory to delete",
+            "content_hash": "abcdef1234567890",
+            "tags": ["test"],
+            "memory_type": "note",
+            "metadata": {},
+            "created_at_iso": "2026-08-03T10:00:00Z",
+            "updated_at_iso": "2026-08-03T10:00:00Z",
+        }
+        convert(memory_dict, repo_path)
+
+        # Verify file exists before delete.
+        md_path = repo_path / "memories" / "2026" / "08" / "mem-abcdef12.md"
+        assert md_path.exists()
+
+        plugin._config = GitSyncConfig(base_dir=str(repo_path))
         plugin._sync_queue = MagicMock()
         plugin._sync_queue.enqueue = AsyncMock()
 
@@ -212,7 +228,7 @@ class TestGitSyncDelete:
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
 
-        plugin._config = GitSyncConfig(repo_path=str(repo_path))
+        plugin._config = GitSyncConfig(base_dir=str(repo_path))
         plugin._sync_queue = MagicMock()
         plugin._sync_queue.enqueue = AsyncMock()
 
@@ -223,7 +239,7 @@ class TestGitSyncDelete:
     def test_delete_exception_does_not_propagate(self):
         """Errors in _git_sync_delete should be caught, not raised."""
         with patch(
-            "memory_os_plugins.git_sync.plugin.get_md_path",
+            "memory_os_plugins.git_sync.plugin.find_md_path",
             side_effect=RuntimeError("boom"),
         ):
             asyncio.run(plugin._git_sync_delete("abc123"))
@@ -269,7 +285,7 @@ class TestRequestedPluginTests:
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
 
-        plugin._config = GitSyncConfig(repo_path=str(repo_path))
+        plugin._config = GitSyncConfig(base_dir=str(repo_path))
         plugin._sync_queue = MagicMock()
         plugin._sync_queue.enqueue = AsyncMock()
 
@@ -278,37 +294,50 @@ class TestRequestedPluginTests:
             "content_hash": "abcdef1234567890",
             "tags": ["test"],
             "memory_type": "note",
-            "metadata": {"importance": "high"},
-            "created_at_iso": "2026-08-03T10:00:00",
+            "metadata": {},
+            "created_at_iso": "2026-08-03T10:00:00Z",
+            "updated_at_iso": "2026-08-03T10:00:00Z",
         }
 
         async def _run():
             await plugin.on_store_handler(memory_dict)
-            await asyncio.sleep(0.01)  # let background task complete
+            await asyncio.sleep(0.05)  # let background task complete
 
         asyncio.run(_run())
 
-        md_path = repo_path / "memories" / "ab" / "abcdef1234567890.md"
+        md_path = repo_path / "memories" / "2026" / "08" / "mem-abcdef12.md"
         assert md_path.exists()
         content = md_path.read_text(encoding="utf-8")
         assert "Test memory content" in content
-        assert "abcdef1234567890" in content
+        assert "id: abcdef1234567890" in content
         assert "tags: [test]" in content
 
     def test_on_delete_handler_removes_markdown(self, tmp_path):
         """on_delete_handler should remove the markdown file."""
         repo_path = tmp_path / "repo"
-        md_path = repo_path / "memories" / "ab" / "abcdef1234567890.md"
-        md_path.parent.mkdir(parents=True)
-        md_path.write_text("content to delete", encoding="utf-8")
 
-        plugin._config = GitSyncConfig(repo_path=str(repo_path))
+        # Write a memory file using convert().
+        memory_dict = {
+            "content": "Content to delete",
+            "content_hash": "abcdef1234567890",
+            "tags": ["delete"],
+            "memory_type": "note",
+            "metadata": {},
+            "created_at_iso": "2026-08-03T10:00:00Z",
+            "updated_at_iso": "2026-08-03T10:00:00Z",
+        }
+        convert(memory_dict, repo_path)
+
+        md_path = repo_path / "memories" / "2026" / "08" / "mem-abcdef12.md"
+        assert md_path.exists()
+
+        plugin._config = GitSyncConfig(base_dir=str(repo_path))
         plugin._sync_queue = MagicMock()
         plugin._sync_queue.enqueue = AsyncMock()
 
         async def _run():
             await plugin.on_delete_handler("abcdef1234567890")
-            await asyncio.sleep(0.01)  # let background task complete
+            await asyncio.sleep(0.05)  # let background task complete
 
         asyncio.run(_run())
 
@@ -317,18 +346,18 @@ class TestRequestedPluginTests:
 
     def test_handler_error_isolation(self, tmp_path):
         """Handler exceptions should not propagate to the caller."""
-        plugin._config = GitSyncConfig(repo_path=str(tmp_path))
+        plugin._config = GitSyncConfig(base_dir=str(tmp_path))
         plugin._sync_queue = MagicMock()
         plugin._sync_queue.enqueue = AsyncMock()
 
         with patch(
-            "memory_os_plugins.git_sync.plugin.memory_to_markdown",
+            "memory_os_plugins.git_sync.plugin.convert",
             side_effect=RuntimeError("synthetic failure"),
         ):
             async def _run():
                 # Should not raise — error is caught inside _git_sync_store.
                 await plugin.on_store_handler({"content_hash": "abc123"})
-                await asyncio.sleep(0.01)  # let background task run
+                await asyncio.sleep(0.05)  # let background task run
 
             asyncio.run(_run())  # no exception raised
 
@@ -337,17 +366,18 @@ class TestRequestedPluginTests:
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
 
-        plugin._config = GitSyncConfig(repo_path=str(repo_path))
+        plugin._config = GitSyncConfig(base_dir=str(repo_path))
         plugin._sync_queue = MagicMock()
         plugin._sync_queue.enqueue = AsyncMock()
 
         memory_dict = {
             "content": "Test",
-            "content_hash": "a1b2c3d4e5f6",
+            "content_hash": "a1b2c3d4e5f67890",
             "tags": [],
             "memory_type": "observation",
             "metadata": {},
-            "created_at_iso": "2026-08-03T10:00:00",
+            "created_at_iso": "2026-08-03T10:00:00Z",
+            "updated_at_iso": "2026-08-03T10:00:00Z",
         }
 
         async def _run():
@@ -358,8 +388,8 @@ class TestRequestedPluginTests:
             assert elapsed < 0.1
             # Give the background task time to complete.
             await asyncio.sleep(0.1)
-            # Now the file should exist.
-            md_path = repo_path / "memories" / "a1" / "a1b2c3d4e5f6.md"
+            # Now the file should exist at date-based path.
+            md_path = repo_path / "memories" / "2026" / "08" / "mem-a1b2c3d4.md"
             assert md_path.exists()
 
         asyncio.run(_run())

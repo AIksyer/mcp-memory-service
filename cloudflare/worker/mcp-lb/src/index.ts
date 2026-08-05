@@ -356,17 +356,21 @@ export default {
     }
 
     if (pathname === "/auth/login" && request.method === "POST") {
-      const body = await request.json() as { apiKey?: string };
-      if (!body.apiKey || !env.MCP_API_KEY || body.apiKey !== env.MCP_API_KEY) {
-        return Response.json({ error: "Invalid API key" }, { status: 401 });
+      try {
+        const body = await request.json() as { apiKey?: string };
+        if (!body.apiKey || !env.MCP_API_KEY || body.apiKey !== env.MCP_API_KEY) {
+          return Response.json({ error: "Invalid API key" }, { status: 401 });
+        }
+        const cookieValue = await createSessionCookie(env, body.apiKey);
+        return new Response(JSON.stringify({ ok: true }), {
+          headers: {
+            "Content-Type": "application/json",
+            "Set-Cookie": `${SESSION_COOKIE}=${cookieValue}; HttpOnly; Secure; SameSite=Lax; Max-Age=${SESSION_MAX_AGE}; Path=/`,
+          },
+        });
+      } catch (err) {
+        return Response.json({ error: "Login error" }, { status: 500 });
       }
-      const cookieValue = await createSessionCookie(env, body.apiKey);
-      return new Response(JSON.stringify({ ok: true }), {
-        headers: {
-          "Content-Type": "application/json",
-          "Set-Cookie": `${SESSION_COOKIE}=${cookieValue}; HttpOnly; Secure; SameSite=Lax; Max-Age=${SESSION_MAX_AGE}; Path=/`,
-        },
-      });
     }
 
     if (pathname === "/auth/logout") {

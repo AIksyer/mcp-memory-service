@@ -25,6 +25,7 @@ r2 = [
 [project.entry-points."mcp_memory_service.plugins"]
 git_sync = "memory_os_plugins.git_sync.plugin:register"
 r2_backup = "memory_os_plugins.r2_backup.plugin:register"
+smart_tagger = "memory_os_plugins.smart_tagger.plugin:register"
 
 [project.scripts]
 memory-os = "memory_os_plugins.cli.main:main"

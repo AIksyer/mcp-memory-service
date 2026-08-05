@@ -40,6 +40,9 @@ interface Env {
   HEALTH_CHECK_PATH?: string;
   HEALTHY_STATUS?: string;
   MCP_HA_KV?: KVNamespace;
+  GITHUB_CLIENT_ID?: string;
+  GITHUB_CLIENT_SECRET?: string;
+  GITHUB_ALLOWED_USERS?: string; // comma-separated GitHub usernames, empty = allow all
 }
 
 // ===== Constants =====
@@ -56,7 +59,10 @@ const PUBLIC_PATHS = [
   "/api/health",
   "/auth/login",
   "/auth/logout",
+  "/auth/github",
+  "/auth/github/callback",
   "/.well-known/",
+  "/mcp",
 ];
 
 // ===== Global State =====
@@ -279,7 +285,7 @@ function adminAuth(request: Request, env: Env): boolean {
 
 // ===== Login Page =====
 
-const LOGIN_HTML = (oauthParams: string) => `<!DOCTYPE html>
+const LOGIN_HTML = (oauthParams: string, githubEnabled: boolean) => `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -294,29 +300,33 @@ p.sub { color:#6c7293; margin-bottom:1.5rem; font-size:.9rem; }
 label { display:block; font-size:.85rem; color:#1a1a2e; margin-bottom:.4rem; font-weight:600; }
 input { width:100%; padding:.75rem; border:2px solid #e0e0e0; border-radius:8px; font-size:1rem; transition:border .2s; }
 input:focus { border-color:#667eea; outline:none; }
-button { width:100%; padding:.8rem; background:linear-gradient(135deg,#667eea,#764ba2); color:#fff; border:none; border-radius:8px; font-size:1rem; font-weight:600; cursor:pointer; margin-top:1rem; transition:transform .1s; }
+button { width:100%; padding:.8rem; border:none; border-radius:8px; font-size:1rem; font-weight:600; cursor:pointer; margin-top:1rem; transition:transform .1s; }
 button:active { transform:scale(.98); }
+.btn-primary { background:linear-gradient(135deg,#667eea,#764ba2); color:#fff; }
+.btn-github { background:#24292e; color:#fff; display:flex; align-items:center; justify-content:center; gap:.5rem; }
+.btn-github:hover { background:#2d333b; }
+.btn-github svg { width:20px; height:20px; }
 .error { color:#e74c3c; font-size:.85rem; margin-top:.5rem; display:none; }
 .divider { text-align:center; margin:1.5rem 0; color:#999; font-size:.8rem; position:relative; }
 .divider::before, .divider::after { content:""; position:absolute; top:50%; width:40%; height:1px; background:#e0e0e0; }
 .divider::before { left:0; }
 .divider::after { right:0; }
-.passkey-btn { width:100%; padding:.8rem; background:#1a1a2e; color:#fff; border:none; border-radius:8px; font-size:.9rem; cursor:pointer; }
-.passkey-btn:hover { background:#2d2d4e; }
 </style>
 </head>
 <body>
 <div class="card">
 <h1>🔐 MCP Memory Service</h1>
 <p class="sub">Sign in to access your memory dashboard</p>
+${githubEnabled ? `<button class="btn-github" onclick="window.location.href='/auth/github${oauthParams ? '?' + oauthParams : ''}'">
+<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+Sign in with GitHub</button>
+<div class="divider">OR</div>` : ''}
 <form id="loginForm">
 <label for="apiKey">API Key</label>
 <input type="password" id="apiKey" name="apiKey" placeholder="Enter your API key" autocomplete="current-password" required>
 <div class="error" id="err"></div>
-<button type="submit">Sign In</button>
+<button type="submit" class="btn-primary">Sign In</button>
 </form>
-<div class="divider">OR</div>
-<button class="passkey-btn" id="passkeyBtn">🔑 Sign in with Passkey</button>
 </div>
 <script>
 const form = document.getElementById('loginForm');
@@ -338,17 +348,6 @@ if (resp.ok) {
   err.style.display = 'block';
 }
 });
-document.getElementById('passkeyBtn').addEventListener('click', async () => {
-try {
-const beginResp = await fetch('/api/auth/webauthn/auth/begin', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({}) });
-if (!beginResp.ok) { err.textContent = 'Passkey authentication not available'; err.style.display='block'; return; }
-const beginData = await beginResp.json();
-const credential = await navigator.credentials.get({ publicKey: beginData.publicKey });
-const finishResp = await fetch('/api/auth/webauthn/auth/finish', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ credential: { id: credential.id, rawId: credential.id, type: credential.type, response: { authenticatorData: btoa(String.fromCharCode(...new Uint8Array(credential.response.authenticatorData))), clientDataJSON: btoa(String.fromCharCode(...new Uint8Array(credential.response.clientDataJSON))), signature: btoa(String.fromCharCode(...new Uint8Array(credential.response.signature))), userHandle: credential.response.userHandle ? btoa(String.fromCharCode(...new Uint8Array(credential.response.userHandle))) : null } } }) });
-if (finishResp.ok) { window.location.href = '/'; }
-else { err.textContent = 'Passkey authentication failed'; err.style.display = 'block'; }
-} catch(ex) { err.textContent = 'Passkey error: ' + ex.message; err.style.display = 'block'; }
-});
 </script>
 </body>
 </html>`;
@@ -366,9 +365,9 @@ export default {
     // ===== Auth Routes =====
 
     if (pathname === "/auth/login" && request.method === "GET") {
-      // Capture OAuth params from query string if present (authorization code flow)
       const oauthParams = url.searchParams.toString();
-      return new Response(LOGIN_HTML(oauthParams), { headers: { "Content-Type": "text/html; charset=utf-8" } });
+      const githubEnabled = !!env.GITHUB_CLIENT_ID;
+      return new Response(LOGIN_HTML(oauthParams, githubEnabled), { headers: { "Content-Type": "text/html; charset=utf-8" } });
     }
 
     if (pathname === "/auth/login" && request.method === "POST") {
@@ -508,6 +507,120 @@ export default {
           "Content-Type": "application/json",
           "Set-Cookie": `${SESSION_COOKIE}=; HttpOnly; Secure; SameSite=Lax; Max-Age=0; Path=/`,
         },
+      });
+    }
+
+    // ===== GitHub OAuth =====
+
+    // Initiate GitHub OAuth — redirect to GitHub authorize URL
+    if (pathname === "/auth/github" && request.method === "GET") {
+      if (!env.GITHUB_CLIENT_ID) {
+        return new Response("GitHub OAuth not configured", { status: 503 });
+      }
+      const origin = new URL(request.url).origin;
+      const state = crypto.randomUUID();
+      // Preserve MCP OAuth params (redirect_uri, code_challenge, etc.) in KV
+      // so we can resume the flow after GitHub callback
+      const mcpParams = url.searchParams.toString();
+      if (env.MCP_HA_KV) {
+        await env.MCP_HA_KV.put(`github_state:${state}`, mcpParams, { expirationTtl: 600 });
+      }
+      const ghUrl = new URL("https://github.com/login/oauth/authorize");
+      ghUrl.searchParams.set("client_id", env.GITHUB_CLIENT_ID);
+      ghUrl.searchParams.set("redirect_uri", `${origin}/auth/github/callback`);
+      ghUrl.searchParams.set("scope", "user:email");
+      ghUrl.searchParams.set("state", state);
+      return Response.redirect(ghUrl.toString(), 302);
+    }
+
+    // GitHub OAuth callback — exchange code for token, verify user
+    if (pathname === "/auth/github/callback" && request.method === "GET") {
+      if (!env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET) {
+        return new Response("GitHub OAuth not configured", { status: 503 });
+      }
+      const code = url.searchParams.get("code");
+      const state = url.searchParams.get("state");
+      if (!code || !state) {
+        return new Response("Missing code or state", { status: 400 });
+      }
+
+      // Retrieve stored MCP OAuth params
+      let mcpParams = "";
+      if (env.MCP_HA_KV) {
+        mcpParams = await env.MCP_HA_KV.get(`github_state:${state}`) || "";
+        await env.MCP_HA_KV.delete(`github_state:${state}`);
+      }
+
+      // Exchange code for GitHub access token
+      const tokenResp = await fetch("https://github.com/login/oauth/access_token", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Accept": "application/json",
+        },
+        body: JSON.stringify({
+          client_id: env.GITHUB_CLIENT_ID,
+          client_secret: env.GITHUB_CLIENT_SECRET,
+          code,
+        }),
+      });
+      if (!tokenResp.ok) {
+        return new Response("GitHub token exchange failed", { status: 502 });
+      }
+      const tokenData = await tokenResp.json() as { access_token?: string; error?: string };
+      if (tokenData.error || !tokenData.access_token) {
+        return new Response(`GitHub auth error: ${tokenData.error || "no token"}`, { status: 401 });
+      }
+
+      // Get GitHub user info
+      const userResp = await fetch("https://api.github.com/user", {
+        headers: { Authorization: `Bearer ${tokenData.access_token}`, "User-Agent": "mcp-lb" },
+      });
+      if (!userResp.ok) {
+        return new Response("Failed to get GitHub user info", { status: 502 });
+      }
+      const userInfo = await userResp.json() as { login?: string; id?: number; name?: string };
+
+      // Check allowed users list
+      if (env.GITHUB_ALLOWED_USERS) {
+        const allowed = env.GITHUB_ALLOWED_USERS.split(",").map((s) => s.trim().toLowerCase());
+        if (!allowed.includes(userInfo.login?.toLowerCase() || "")) {
+          return new Response(`User '${userInfo.login}' is not authorized`, { status: 403 });
+        }
+      }
+
+      // Issue session token
+      const sessionToken = await createSessionCookie(env, `github:${userInfo.login}`);
+      const cookieHeader = `${SESSION_COOKIE}=${sessionToken}; HttpOnly; Secure; SameSite=Lax; Max-Age=${SESSION_MAX_AGE}; Path=/`;
+
+      // If there are pending MCP OAuth params, resume the authorization code flow
+      const mcpUrl = new URLSearchParams(mcpParams);
+      const redirectUri = mcpUrl.get("redirect_uri");
+      const mcpState = mcpUrl.get("state");
+      const codeChallenge = mcpUrl.get("code_challenge");
+
+      if (redirectUri && codeChallenge) {
+        const authCode = crypto.randomUUID();
+        if (env.MCP_HA_KV) {
+          await env.MCP_HA_KV.put(`oauth_code:${authCode}`, JSON.stringify({
+            redirect_uri: redirectUri,
+            code_challenge: codeChallenge,
+            api_key: `github:${userInfo.login}`,
+          }), { expirationTtl: 600 });
+        }
+        const cbUrl = new URL(redirectUri);
+        cbUrl.searchParams.set("code", authCode);
+        if (mcpState) cbUrl.searchParams.set("state", mcpState);
+        return new Response(null, {
+          status: 302,
+          headers: { "Set-Cookie": cookieHeader, "Location": cbUrl.toString() },
+        });
+      }
+
+      // No MCP OAuth flow — just set cookie and redirect to dashboard
+      return new Response(null, {
+        status: 302,
+        headers: { "Set-Cookie": cookieHeader, "Location": "/" },
       });
     }
 

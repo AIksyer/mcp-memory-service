@@ -247,6 +247,33 @@ async function validateSession(request: Request, env: Env): Promise<boolean> {
   return valid;
 }
 
+async function validateToken(token: string, env: Env): Promise<boolean> {
+  // Validate a standalone Bearer token (same format as session cookie)
+  if (!env.MCP_COOKIE_SECRET) return false;
+  const parts = token.split(".");
+  if (parts.length !== 2) return false;
+  const [payloadB64, hmac] = parts;
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(env.MCP_COOKIE_SECRET),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["verify"]
+  );
+  // Verify HMAC
+  const valid = await crypto.subtle.verify("HMAC", key, hexToBytes(hmac), encoder.encode(payloadB64));
+  if (!valid) return false;
+  // Check expiry
+  try {
+    const payload = JSON.parse(atob(payloadB64));
+    if (payload.exp && Date.now() > payload.exp) return false;
+  } catch {
+    return false;
+  }
+  return true;
+}
+
 function bytesToHex(bytes: ArrayBuffer): string {
   return [...new Uint8Array(bytes)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
@@ -715,10 +742,28 @@ export default {
     // an Authorization / X-API-Key header from the client.
 
     if (!isPublicPath(pathname)) {
-      const hasAuthHeader = request.headers.get("Authorization") || request.headers.get("X-API-Key");
+      const authHeader = request.headers.get("Authorization");
+      const apiKeyHeader = request.headers.get("X-API-Key");
       const hasValidSession = await validateSession(request, env);
 
-      if (!hasAuthHeader && !hasValidSession) {
+      // Validate Bearer token: must be a valid session token OR the API key itself
+      let validBearer = false;
+      if (authHeader && authHeader.startsWith("Bearer ")) {
+        const token = authHeader.slice(7);
+        // Check if token is the API key itself (direct API key auth)
+        if (env.MCP_API_KEY && token === env.MCP_API_KEY) {
+          validBearer = true;
+        }
+        // Check if token is a valid session token (HMAC-signed)
+        if (!validBearer) {
+          validBearer = await validateToken(token, env);
+        }
+      }
+
+      // Validate X-API-Key header: must match the shared API key
+      const validApiKey = apiKeyHeader && env.MCP_API_KEY && apiKeyHeader === env.MCP_API_KEY;
+
+      if (!validBearer && !validApiKey && !hasValidSession) {
         // For browser requests, redirect to login
         const accept = request.headers.get("Accept") || "";
         if (accept.includes("text/html")) {

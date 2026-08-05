@@ -29,14 +29,6 @@ class TestGitSyncConfig:
         assert c.batch_timeout == 30
         assert c.project_name == ""
 
-    def test_repo_path_alias(self):
-        """repo_path property should be an alias for base_dir."""
-        c = GitSyncConfig(base_dir="/custom/path")
-        assert c.repo_path == "/custom/path"
-
-        c.repo_path = "/another/path"
-        assert c.base_dir == "/another/path"
-
 
 # --------------------------------------------------------------------------- #
 #  _parse_bool
@@ -75,16 +67,6 @@ class TestParseConfigFile:
         assert result["batch_size"] == 10
         assert result["batch_timeout"] == 60
         assert result["project_name"] == "MyProject"
-
-    def test_legacy_repo_path(self, tmp_path):
-        """Legacy repo_path should be parsed and mapped to base_dir."""
-        f = tmp_path / "config.yml"
-        f.write_text(
-            "repo_path: /legacy/path\n",
-            encoding="utf-8",
-        )
-        result = _parse_config_file(f)
-        assert result["repo_path"] == "/legacy/path"
 
     def test_comments_and_blanks(self, tmp_path):
         f = tmp_path / "config.yml"
@@ -182,35 +164,6 @@ class TestLoadConfig:
         assert config.enabled is False
         assert config.auto_push is True
         assert config.project_name == "EnvProject"
-
-    def test_legacy_repo_path_env(self, tmp_path, monkeypatch):
-        """MEMORY_OS_GIT_SYNC_REPO_PATH should map to base_dir (backward compat)."""
-        monkeypatch.setattr(
-            "memory_os_plugins.git_sync.config.CONFIG_FILE", tmp_path / "nonexistent.yml"
-        )
-        for key in list(os.environ):
-            if key.startswith("MEMORY_OS_GIT_SYNC_"):
-                monkeypatch.delenv(key, raising=False)
-        monkeypatch.setenv("MEMORY_OS_GIT_SYNC_REPO_PATH", "/legacy/env/path")
-
-        config = load_config()
-        assert config.base_dir == "/legacy/env/path"
-
-    def test_legacy_repo_path_in_file(self, tmp_path, monkeypatch):
-        """repo_path in config file should map to base_dir."""
-        monkeypatch.setattr(
-            "memory_os_plugins.git_sync.config.CONFIG_FILE", tmp_path / "config.yml"
-        )
-        (tmp_path / "config.yml").write_text(
-            "repo_path: /legacy/file/path\n",
-            encoding="utf-8",
-        )
-        for key in list(os.environ):
-            if key.startswith("MEMORY_OS_GIT_SYNC_"):
-                monkeypatch.delenv(key, raising=False)
-
-        config = load_config()
-        assert config.base_dir == "/legacy/file/path"
 
     def test_invalid_env_value_falls_back(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
@@ -400,25 +353,3 @@ class TestSaveConfig:
         assert "auto_push: true" in content
         assert "batch_size: 10" in content
         assert "batch_timeout: 60" in content
-
-    def test_legacy_repo_path_preserved(self, tmp_path):
-        """Legacy repo_path in old config should be filtered and replaced with base_dir."""
-        cfg_path = tmp_path / "config.yml"
-        cfg_path.write_text(
-            "# Memory OS Git Sync configuration\n"
-            "repo_path: /old/path\n"
-            "enabled: true\n"
-            "\n"
-            "# Other plugin\n"
-            "other_setting: value\n",
-            encoding="utf-8",
-        )
-
-        save_config(GitSyncConfig(base_dir="/new/path"), path=cfg_path)
-        content = cfg_path.read_text(encoding="utf-8")
-
-        # Old repo_path should be gone, new base_dir should be present.
-        assert "repo_path:" not in content
-        assert "base_dir: /new/path" in content
-        # Other plugin's config preserved.
-        assert "other_setting: value" in content

@@ -122,9 +122,9 @@ if [ ! -f "$CONFIG_FILE" ]; then
     exit 1
 fi
 
-REPO_PATH=$(grep 'repo_path:' "$CONFIG_FILE" | head -1 | sed 's/.*repo_path:\s*//')
+REPO_PATH=$(grep 'base_dir:' "$CONFIG_FILE" | head -1 | sed 's/.*base_dir:\s*//')
 if [ -z "$REPO_PATH" ]; then
-    echo "Error: repo_path not set in config"
+    echo "Error: base_dir not set in config"
     exit 1
 fi
 # Expand ~ in path.

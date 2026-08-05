@@ -346,11 +346,9 @@ def markdown_to_memory_dict(md_text: str) -> dict:
     if embedding_hash:
         metadata["embedding_hash"] = embedding_hash
 
-    # Backward compat: accept both new (id, created_at, updated_at)
-    # and legacy (hash, created, updated) front-matter field names.
-    content_hash = front_matter.get("id", "") or front_matter.get("hash", "")
-    created_at = front_matter.get("created_at", "") or front_matter.get("created", "")
-    updated_at = front_matter.get("updated_at", "") or front_matter.get("updated", "")
+    content_hash = front_matter.get("id", "")
+    created_at = front_matter.get("created_at", "")
+    updated_at = front_matter.get("updated_at", "")
 
     # Extract content from body — everything before ## Tags or ## Metadata.
     content = body

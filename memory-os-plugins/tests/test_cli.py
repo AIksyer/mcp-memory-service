@@ -228,7 +228,7 @@ class TestStatusCommand:
 
         config_path = tmp_path / "config.yml"
         config_path.write_text(
-            f"enabled: true\nrepo_path: {repo_path}\nauto_push: false\n"
+            f"enabled: true\nbase_dir: {repo_path}\nauto_push: false\n"
             f"batch_size: 5\nbatch_timeout: 30\nproject_name: TestProj\n",
             encoding="utf-8",
         )
@@ -253,7 +253,7 @@ class TestStatusCommand:
     def test_status_repo_not_found(self, tmp_path):
         config_path = tmp_path / "config.yml"
         config_path.write_text(
-            f"enabled: true\nrepo_path: {tmp_path / 'nonexistent'}\n",
+            f"enabled: true\nbase_dir: {tmp_path / 'nonexistent'}\n",
             encoding="utf-8",
         )
 
@@ -278,7 +278,7 @@ class TestStatusCommand:
 
         config_path = tmp_path / "config.yml"
         config_path.write_text(
-            f"enabled: true\nrepo_path: {repo_path}\n",
+            f"enabled: true\nbase_dir: {repo_path}\n",
             encoding="utf-8",
         )
 
@@ -321,7 +321,7 @@ class TestStatusCommand:
 
         config_path = tmp_path / "config.yml"
         config_path.write_text(
-            f"enabled: true\nrepo_path: {repo_path}\n",
+            f"enabled: true\nbase_dir: {repo_path}\n",
             encoding="utf-8",
         )
 
@@ -765,7 +765,7 @@ class TestPullCommand:
         """pull should error if repo path doesn't exist."""
         config_path = tmp_path / "config.yml"
         config_path.write_text(
-            "enabled: true\nrepo_path: /nonexistent/path\n", encoding="utf-8"
+            "enabled: true\nbase_dir: /nonexistent/path\n", encoding="utf-8"
         )
 
         runner = CliRunner()
@@ -786,7 +786,7 @@ class TestPullCommand:
         repo_path.mkdir()
         config_path = tmp_path / "config.yml"
         config_path.write_text(
-            f"enabled: true\nrepo_path: {repo_path}\n", encoding="utf-8"
+            f"enabled: true\nbase_dir: {repo_path}\n", encoding="utf-8"
         )
 
         runner = CliRunner()
@@ -808,11 +808,11 @@ class TestPullCommand:
         memories_dir.mkdir(parents=True)
         md_content = (
             "---\n"
-            "hash: abc123def456\n"
+            "id: abc123def456\n"
             "type: note\n"
             "tags: [test]\n"
-            "created: 2026-08-03T10:00:00Z\n"
-            "importance: N/A\n"
+            "created_at: 2026-08-03T10:00:00Z\n"
+            
             "---\n\n"
             "Test memory content."
         )
@@ -838,11 +838,11 @@ class TestPullCommand:
         memories_dir.mkdir(parents=True)
         md_content = (
             "---\n"
-            "hash: abc123def456\n"
+            "id: abc123def456\n"
             "type: note\n"
             "tags: [test]\n"
-            "created: 2026-08-03T10:00:00Z\n"
-            "importance: N/A\n"
+            "created_at: 2026-08-03T10:00:00Z\n"
+            
             "---\n\n"
             "Test memory content."
         )
@@ -919,7 +919,7 @@ class TestSwitchCommand:
         config_path.write_text(
             "# Memory OS Git Sync configuration\n"
             "enabled: true\n"
-            "repo_path: ~/AgentMemory\n"
+            "base_dir: ~/AgentMemory\n"
             "\n"
             "# Memory OS Project Scope configuration\n"
             "project_scope_current_project: my-project\n"
@@ -960,7 +960,7 @@ class TestSwitchCommand:
         config_path.write_text(
             "# Memory OS Git Sync configuration\n"
             "enabled: true\n"
-            "repo_path: ~/AgentMemory\n"
+            "base_dir: ~/AgentMemory\n"
             "\n"
             "# Memory OS Project Scope configuration\n"
             "project_scope_current_project: old-project\n"
@@ -981,7 +981,7 @@ class TestSwitchCommand:
         assert "project_scope_user_name: bob" in content
         # git_sync config should be preserved.
         assert "enabled: true" in content
-        assert "repo_path: ~/AgentMemory" in content
+        assert "base_dir: ~/AgentMemory" in content
 
     def test_switch_project_already_on(self, tmp_path):
         """--project with same name should say 'Already on project'."""
@@ -1079,7 +1079,7 @@ class TestSwitchCommand:
         config_path.write_text(
             "# Memory OS Git Sync configuration\n"
             "enabled: true\n"
-            "repo_path: ~/AgentMemory\n"
+            "base_dir: ~/AgentMemory\n"
             "auto_push: false\n"
             "\n"
             "# Memory OS R2 Backup configuration\n"
@@ -1096,7 +1096,7 @@ class TestSwitchCommand:
         content = config_path.read_text(encoding="utf-8")
         # Git sync config preserved.
         assert "enabled: true" in content
-        assert "repo_path: ~/AgentMemory" in content
+        assert "base_dir: ~/AgentMemory" in content
         assert "auto_push: false" in content
         # R2 backup config preserved.
         assert "r2_backup_enabled: false" in content
@@ -1139,11 +1139,11 @@ class TestSwitchCommand:
 
         md_content = (
             "---\n"
-            "hash: abc123\n"
+            "id: abc123\n"
             "type: note\n"
             "tags: [proj:alpha, topic:tech]\n"
-            "created: 2026-08-03T10:00:00Z\n"
-            "importance: N/A\n"
+            "created_at: 2026-08-03T10:00:00Z\n"
+            
             "---\n\n"
             "Memory about alpha project."
         )
@@ -1152,11 +1152,11 @@ class TestSwitchCommand:
         # Second file with a different project.
         md_content2 = (
             "---\n"
-            "hash: def456\n"
+            "id: def456\n"
             "type: note\n"
             "tags: [proj:beta, topic:science]\n"
-            "created: 2026-08-03T11:00:00Z\n"
-            "importance: N/A\n"
+            "created_at: 2026-08-03T11:00:00Z\n"
+            
             "---\n\n"
             "Memory about beta project."
         )
@@ -1187,11 +1187,11 @@ class TestSwitchCommand:
         for i in range(3):
             md_content = (
                 "---\n"
-                f"hash: hash{i}\n"
+                f"id: hash{i}\n"
                 "type: note\n"
                 "tags: [proj:same-project]\n"
-                "created: 2026-08-03T10:00:00Z\n"
-                "importance: N/A\n"
+                "created_at: 2026-08-03T10:00:00Z\n"
+                
                 "---\n\n"
                 f"Memory {i}."
             )
@@ -1240,11 +1240,11 @@ class TestSwitchCommand:
 
         md_content = (
             "---\n"
-            "hash: abc123\n"
+            "id: abc123\n"
             "type: note\n"
             "tags: [topic:tech, user:bob]\n"
-            "created: 2026-08-03T10:00:00Z\n"
-            "importance: N/A\n"
+            "created_at: 2026-08-03T10:00:00Z\n"
+            
             "---\n\n"
             "Memory with no project tag."
         )
@@ -1297,11 +1297,11 @@ class TestSwitchCommand:
         for name in ["zebra", "apple", "mango"]:
             md_content = (
                 "---\n"
-                f"hash: {name}\n"
+                f"id: {name}\n"
                 "type: note\n"
                 f"tags: [proj:{name}]\n"
-                "created: 2026-08-03T10:00:00Z\n"
-                "importance: N/A\n"
+                "created_at: 2026-08-03T10:00:00Z\n"
+                
                 "---\n\n"
                 f"Memory about {name}."
             )

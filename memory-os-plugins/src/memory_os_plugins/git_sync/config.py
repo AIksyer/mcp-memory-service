@@ -6,7 +6,7 @@ Priority order (highest to lowest):
 3. Built-in defaults
 
 Configuration fields:
-    - ``base_dir`` — base directory for Markdown file tree (alias: ``repo_path``)
+    - ``base_dir`` — base directory for Markdown file tree
     - ``batch_size`` — commit queue size (flush after N changes)
     - ``batch_timeout`` — seconds before auto-flush if batch_size not reached
     - ``auto_push`` — push to remote after each batch commit
@@ -51,15 +51,6 @@ class GitSyncConfig:
     batch_size: int = 5
     batch_timeout: int = 30
     project_name: str = ""
-
-    @property
-    def repo_path(self) -> str:
-        """Backward-compat alias for ``base_dir``."""
-        return self.base_dir
-
-    @repo_path.setter
-    def repo_path(self, value: str) -> None:
-        self.base_dir = value
 
 
 # --------------------------------------------------------------------------- #
@@ -109,17 +100,15 @@ def _parse_config_file(path: Path) -> Dict[str, Any]:
 _ENV_MAPPINGS: Dict[str, tuple[str, Callable[[str], Any]]] = {
     "ENABLED": ("enabled", _parse_bool),
     "BASE_DIR": ("base_dir", str),
-    "REPO_PATH": ("base_dir", str),  # backward compat
     "AUTO_PUSH": ("auto_push", _parse_bool),
     "BATCH_SIZE": ("batch_size", int),
     "BATCH_TIMEOUT": ("batch_timeout", int),
     "PROJECT_NAME": ("project_name", str),
 }
 
-# Config file keys recognised by this plugin (both new and legacy).
+# Config file keys recognised by this plugin.
 _FILE_KEY_ALIASES: Dict[str, str] = {
     "base_dir": "base_dir",
-    "repo_path": "base_dir",  # backward compat
     "enabled": "enabled",
     "auto_push": "auto_push",
     "batch_size": "batch_size",
@@ -164,7 +153,7 @@ def load_config() -> GitSyncConfig:
 
 # Keys managed by this plugin (used to filter old lines on save).
 _SAVE_KEYS = frozenset({
-    "enabled", "base_dir", "repo_path", "auto_push", "batch_size",
+    "enabled", "base_dir", "auto_push", "batch_size",
     "batch_timeout", "project_name",
 })
 

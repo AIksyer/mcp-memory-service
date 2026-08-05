@@ -83,11 +83,11 @@ fi
 # ---------------------------------------------------------------------------
 # Read git_sync repo path
 # ---------------------------------------------------------------------------
-REPO_PATH=$(grep 'repo_path:' "$CONFIG_FILE" | head -1 | sed 's/.*repo_path:\s*//')
+REPO_PATH=$(grep 'base_dir:' "$CONFIG_FILE" | head -1 | sed 's/.*base_dir:\s*//')
 REPO_PATH="${REPO_PATH/#\~/$HOME}"
 
 if [ -z "$REPO_PATH" ]; then
-    echo "Error: repo_path not set in config"
+    echo "Error: base_dir not set in config"
     exit 1
 fi
 

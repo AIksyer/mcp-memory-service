@@ -63,6 +63,7 @@ from .api.quality import router as quality_router
 from .api.search import router as search_router
 from .api.server import router as server_router
 from .api.sync import router as sync_router
+from .api.webauthn import router as webauthn_router
 from .dependencies import create_storage_backend, set_storage
 from .sse import sse_manager
 
@@ -446,6 +447,10 @@ def create_app() -> FastAPI:
     # Include session harvest router (Issue #630)
     app.include_router(harvest_router, tags=["harvest"])
     logger.info(f"✓ Included harvest router with {len(harvest_router.routes)} routes")
+
+    # Include WebAuthn (Passkey) authentication endpoints
+    app.include_router(webauthn_router, tags=["webauthn"])
+    logger.info(f"✓ Included WebAuthn router with {len(webauthn_router.routes)} routes")
 
     # Include MCP protocol REST endpoints (tools list, health)
     # The standard Streamable HTTP transport is mounted as an ASGI app below.

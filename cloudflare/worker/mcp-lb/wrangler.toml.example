@@ -2,9 +2,13 @@
 #
 # 1. Copy this file: cp wrangler.toml.example wrangler.toml
 # 2. Update routes to your domain
-# 3. Set BACKENDS secret: npx wrangler secret put BACKENDS
-#    Enter comma-separated backend URLs when prompted
-# 4. Deploy: npx wrangler deploy
+# 3. Create KV namespace: npx wrangler kv namespace create MCP_HA_KV
+# 4. Set secrets (see below):
+#    npx wrangler secret put BACKENDS
+#    npx wrangler secret put MCP_API_KEY
+#    npx wrangler secret put MCP_ADMIN_TOKEN
+#    npx wrangler secret put MCP_COOKIE_SECRET
+# 5. Deploy: npx wrangler deploy
 
 name = "mcp-lb"
 main = "src/index.ts"
@@ -16,10 +20,26 @@ routes = [
   { pattern = "your-domain.com/*", zone_name = "your-domain.com" }
 ]
 
+# KV namespace for HA pin state and session storage
+[[kv_namespaces]]
+binding = "MCP_HA_KV"
+id = "your-kv-namespace-id"  # From: npx wrangler kv namespace create MCP_HA_KV
+
 [vars]
 HEALTH_CHECK_PATH = "/api/health"
 HEALTHY_STATUS = "healthy"
+MCP_HA_HIDDEN = "false"  # Set to "true" to hide all backend info from public APIs
 
-# Set BACKENDS via secret (NOT in this file):
+# Set via secrets (NOT in this file — secrets are encrypted):
+#
 #   npx wrangler secret put BACKENDS
-#   > https://backend1.example.com,https://backend2.example.com
+#   > https://backend1.example.com,https://backend2.example.com,https://backend3.example.com
+#
+#   npx wrangler secret put MCP_API_KEY
+#   > your-shared-api-key  (injected as X-API-Key on all proxied requests)
+#
+#   npx wrangler secret put MCP_ADMIN_TOKEN
+#   > your-admin-token  (required for /api/ha/nodes, /api/ha/pin management)
+#
+#   npx wrangler secret put MCP_COOKIE_SECRET
+#   > your-random-secret  (signs browser session cookies for /auth/login)

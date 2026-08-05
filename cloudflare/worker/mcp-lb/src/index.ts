@@ -51,13 +51,12 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const SESSION_COOKIE = "mcp_session";
 const SESSION_MAX_AGE = 60 * 60 * 24 * 7; // 7 days
 
-// Paths that don't require auth
+// Paths that don't require auth (public endpoints)
 const PUBLIC_PATHS = [
   "/api/health",
   "/auth/login",
   "/auth/logout",
   "/.well-known/",
-  "/mcp",          // MCP transport handles its own auth
 ];
 
 // ===== Global State =====
@@ -174,10 +173,16 @@ async function proxyRequest(request: Request, backend: BackendState, env: Env, b
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
   try {
-    // Build headers — inject API key if configured
     const headers = new Headers(request.headers);
-    if (env.MCP_API_KEY) {
+
+    // If the client authenticated with a Worker-issued Bearer token or session cookie,
+    // translate to X-API-Key for the backend (which doesn't understand Worker tokens).
+    // If the client sent X-API-Key directly, pass it through.
+    const authHeader = request.headers.get("Authorization") || "";
+    if (authHeader.startsWith("Bearer ") && env.MCP_API_KEY) {
+      // Worker-issued Bearer token → inject API key for backend
       headers.set("X-API-Key", env.MCP_API_KEY);
+      headers.delete("Authorization");
     }
 
     const resp = await fetch(targetUrl, {
@@ -361,8 +366,10 @@ export default {
         if (!body.apiKey || !env.MCP_API_KEY || body.apiKey !== env.MCP_API_KEY) {
           return Response.json({ error: "Invalid API key" }, { status: 401 });
         }
+        // Issue a Bearer token (same as cookie but returned in body for MCP clients)
+        const token = await createSessionCookie(env, body.apiKey);
         const cookieValue = await createSessionCookie(env, body.apiKey);
-        return new Response(JSON.stringify({ ok: true }), {
+        return new Response(JSON.stringify({ ok: true, access_token: token, token_type: "Bearer", expires_in: SESSION_MAX_AGE }), {
           headers: {
             "Content-Type": "application/json",
             "Set-Cookie": `${SESSION_COOKIE}=${cookieValue}; HttpOnly; Secure; SameSite=Lax; Max-Age=${SESSION_MAX_AGE}; Path=/`,
@@ -371,6 +378,40 @@ export default {
       } catch (err) {
         return Response.json({ error: "Login error" }, { status: 500 });
       }
+    }
+
+    // OAuth token endpoint — exchanges API key for Bearer token
+    if (pathname === "/auth/token" && request.method === "POST") {
+      try {
+        const body = await request.json() as { grant_type?: string; api_key?: string };
+        // Support client_credentials grant with API key as client secret
+        const apiKey = body.api_key || "";
+        if (!apiKey || !env.MCP_API_KEY || apiKey !== env.MCP_API_KEY) {
+          return Response.json({ error: "invalid_client", error_description: "Invalid API key" }, { status: 401 });
+        }
+        const token = await createSessionCookie(env, apiKey);
+        return Response.json({
+          access_token: token,
+          token_type: "Bearer",
+          expires_in: SESSION_MAX_AGE,
+          scope: "read write",
+        });
+      } catch (err) {
+        return Response.json({ error: "server_error" }, { status: 500 });
+      }
+    }
+
+    // OAuth DCR (Dynamic Client Registration) — allows MCP clients to self-register
+    if (pathname === "/auth/register" && request.method === "POST") {
+      const clientId = crypto.randomUUID();
+      return Response.json({
+        client_id: clientId,
+        client_id_issued_at: Math.floor(Date.now() / 1000),
+        client_secret: null,
+        token_endpoint_auth_method: "none",
+        grant_types: ["client_credentials", "authorization_code"],
+        response_types: ["code"],
+      });
     }
 
     if (pathname === "/auth/logout") {
@@ -439,12 +480,37 @@ export default {
       });
     }
 
-    // ===== Auth Enforcement =====
+    // ===== OAuth Discovery Endpoints (for MCP /mcp auth) =====
+    // These let MCP clients (Codely CLI) discover auth config and authenticate.
 
-    // MCP transport (/mcp) handles its own auth at the backend level
-    // via the ASGI middleware, so it's in PUBLIC_PATHS.
-    // All other paths require either a valid session cookie or the
-    // request already has an Authorization header / X-API-Key (API clients).
+    if (pathname === "/.well-known/oauth-protected-resource") {
+      return Response.json({
+        resource: `${new URL(request.url).origin}/mcp`,
+        authorization_servers: [new URL(request.url).origin],
+        bearer_methods_supported: ["header"],
+        resource_documentation: `${new URL(request.url).origin}/api/docs`,
+      });
+    }
+
+    if (pathname === "/.well-known/oauth-authorization-server") {
+      const origin = new URL(request.url).origin;
+      return Response.json({
+        issuer: origin,
+        authorization_endpoint: `${origin}/auth/login`,
+        token_endpoint: `${origin}/auth/token`,
+        registration_endpoint: `${origin}/auth/register`,
+        response_types_supported: ["code"],
+        grant_types_supported: ["authorization_code", "client_credentials"],
+        token_endpoint_auth_methods_supported: ["none", "client_secret_basic"],
+        code_challenge_methods_supported: ["S256"],
+        scopes_supported: ["read", "write", "admin"],
+      });
+    }
+
+    // ===== Auth Enforcement =====
+    // All non-public paths require either a session cookie or
+    // an Authorization / X-API-Key header from the client.
+
     if (!isPublicPath(pathname)) {
       const hasAuthHeader = request.headers.get("Authorization") || request.headers.get("X-API-Key");
       const hasValidSession = await validateSession(request, env);
@@ -455,7 +521,17 @@ export default {
         if (accept.includes("text/html")) {
           return Response.redirect(new URL("/auth/login", request.url).toString(), 302);
         }
-        return Response.json({ error: "Unauthorized" }, { status: 401 });
+        // For MCP/API requests, return 401 with WWW-Authenticate pointing to OAuth discovery
+        return new Response(
+          JSON.stringify({ error: "invalid_token", error_description: "Authentication required" }),
+          {
+            status: 401,
+            headers: {
+              "Content-Type": "application/json",
+              "WWW-Authenticate": `Bearer resource_metadata="${new URL(request.url).origin}/.well-known/oauth-protected-resource"`,
+            },
+          }
+        );
       }
     }
 

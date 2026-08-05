@@ -400,6 +400,11 @@ class BackupScheduler:
             logger.info("Backups disabled, scheduler not started")
             return
 
+        # Skip backup when no local SQLite database exists (Cloudflare/milvus backends)
+        if not self.backup_service.db_path:
+            logger.info("Backup scheduler skipped — no local SQLite database (non-sqlite backend)")
+            return
+
         self.is_running = True
         self._task = asyncio.create_task(self._schedule_loop())
         logger.info(f"BackupScheduler started with {BACKUP_INTERVAL} interval")

@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 
 from .config import SmartTaggerConfig, load_config
-from .tagger import auto_generate_tags, get_project_name, inject_project_tag
+from .tagger import auto_generate_tags, extract_project_from_content, get_project_name, inject_project_tag
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +73,8 @@ async def before_store_handler(memory_dict: dict) -> dict:
     """
     if _config is None:
         return memory_dict
+    if not _config.enabled:
+        return None
 
     try:
         if _config.auto_tags:
@@ -124,7 +126,28 @@ async def on_retrieve_handler(query: str, results: list[dict]) -> list[dict]:
                 current_score = result.get("similarity", result.get("score", 0.5))
                 result["similarity"] = min(1.0, current_score + _config.mistake_boost)
 
-        # 2. Project filtering: if enabled, partition by project match.
+        # 2. Query-based project filtering: extract project from query string.
+        query_project = extract_project_from_content(query)
+        if query_project:
+            project_tag = f"project:{query_project}"
+            same_project = [r for r in results if project_tag in r.get("tags", [])]
+            other = [r for r in results if project_tag not in r.get("tags", [])]
+            if same_project:
+                same_project.sort(
+                    key=lambda r: r.get("similarity", r.get("score", 0)),
+                    reverse=True,
+                )
+                other.sort(
+                    key=lambda r: r.get("similarity", r.get("score", 0)),
+                    reverse=True,
+                )
+                results = same_project + other
+                logger.debug(
+                    "on_retrieve: query-based project filter (%s)", query_project
+                )
+                return results
+
+        # 3. Config-based project filtering (if enabled).
         if _config.project_filter:
             project = get_project_name(_config.project_name)
             project_tag = f"project:{project}" if project else ""
@@ -139,28 +162,27 @@ async def on_retrieve_handler(query: str, results: list[dict]) -> list[dict]:
                     else:
                         other.append(result)
 
-                # Sort each partition by score, then concatenate.
-                same_project.sort(
-                    key=lambda r: r.get("similarity", r.get("score", 0)),
-                    reverse=True,
-                )
-                other.sort(
-                    key=lambda r: r.get("similarity", r.get("score", 0)),
-                    reverse=True,
-                )
-                results = same_project + other
-            else:
-                # No project tag configured — just sort by score.
-                results.sort(
-                    key=lambda r: r.get("similarity", r.get("score", 0)),
-                    reverse=True,
-                )
-        else:
-            # No project filter — just re-sort by boosted scores.
-            results.sort(
-                key=lambda r: r.get("similarity", r.get("score", 0)),
-                reverse=True,
-            )
+                if same_project:
+                    # Sort each partition by score, then concatenate.
+                    same_project.sort(
+                        key=lambda r: r.get("similarity", r.get("score", 0)),
+                        reverse=True,
+                    )
+                    other.sort(
+                        key=lambda r: r.get("similarity", r.get("score", 0)),
+                        reverse=True,
+                    )
+                    results = same_project + other
+                    logger.debug(
+                        "on_retrieve: config-based project filter (%s)", project
+                    )
+                    return results
+
+        # 4. Sort by boosted scores.
+        results.sort(
+            key=lambda r: r.get("similarity", r.get("score", 0)),
+            reverse=True,
+        )
 
         logger.debug("on_retrieve: re-ranked %d results", len(results))
     except Exception as exc:

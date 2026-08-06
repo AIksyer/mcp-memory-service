@@ -387,8 +387,8 @@ class TestSmartTaggerBeforeStoreE2E:
         assert "existing-tag" in tags
         # Project tag injected.
         assert "project:mcp-memory-service" in tags
-        # Type tag injected.
-        assert "type:bug-fix" in tags
+        # Content-based tag injected (plain tag, not type: prefixed).
+        assert "bug" in tags
         # Date tag injected.
         assert any(t.startswith("date:") for t in tags), f"No date tag in {tags}"
 
@@ -528,10 +528,14 @@ class TestSmartTaggerOnRetrieveE2E:
         ]
 
         result = asyncio.run(smart_tagger_plugin.on_retrieve_handler(query, results))
-        assert result is None  # no reordering
+        # No project in query, no boosting — order preserved (stable sort).
+        assert result is not None
+        assert len(result) == 2
+        assert result[0]["content_hash"] == "h1"
+        assert result[1]["content_hash"] == "h2"
 
     def test_smart_tagger_on_retrieve_no_matching_results(self, tmp_path, monkeypatch):
-        """If no results match the project tag, return None (no reordering)."""
+        """If no results match the project tag, order should be preserved."""
         _clean_env(monkeypatch)
         smart_tagger_plugin._config = SmartTaggerConfig()
 
@@ -542,7 +546,11 @@ class TestSmartTaggerOnRetrieveE2E:
         ]
 
         result = asyncio.run(smart_tagger_plugin.on_retrieve_handler(query, results))
-        assert result is None
+        # Project in query but no results match — order preserved (stable sort).
+        assert result is not None
+        assert len(result) == 2
+        assert result[0]["content_hash"] == "h1"
+        assert result[1]["content_hash"] == "h2"
 
 
 # --------------------------------------------------------------------------- #
@@ -777,7 +785,7 @@ class TestFullPipeline:
         assert md_path.exists()
         md_content = md_path.read_text(encoding="utf-8")
         assert "project:mcp-memory-service" in md_content
-        assert "type:bug-fix" in md_content
+        assert "bug" in md_content
         assert "pipeline-test" in md_content
 
         # Verify git commit was made.

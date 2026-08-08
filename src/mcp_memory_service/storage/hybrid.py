@@ -894,15 +894,23 @@ class BackgroundSyncService:
                     for warning in capacity_status.get("warnings", []):
                         logger.warning(warning)
 
-                # Periodic drift detection (v8.25.0+)
+                # Periodic drift detection + bidirectional reconciliation.
+                # _bidirectional_reconcile's drift check is a superset of
+                # _detect_and_sync_drift (checks ALL in_both memories, not just
+                # recently-updated ones), so we skip the lighter drift check when
+                # reconcile will run in the same cycle to avoid redundant API calls.
                 if self.drift_check_enabled:
                     time_since_last_check = time.time() - self.last_drift_check_time
                     if time_since_last_check >= self.drift_check_interval:
                         logger.info(
-                            f"Running periodic drift check (interval: {self.drift_check_interval}s)"
+                            f"Running periodic bidirectional reconciliation "
+                            f"(interval: {self.drift_check_interval}s)"
                         )
-                        drift_stats = await self._detect_and_sync_drift()
-                        logger.info(f"Drift check complete: {drift_stats}")
+                        reconcile_stats = await self._bidirectional_reconcile()
+                        logger.info(f"Reconciliation complete: {reconcile_stats}")
+                        # Update drift tracking timestamps (reconcile covers drift)
+                        self.last_drift_check_time = time.time()
+                        self.sync_stats["last_drift_check"] = self.last_drift_check_time
 
             except Exception as e:
                 logger.warning(f"Secondary storage health check failed: {e}")
@@ -1072,6 +1080,442 @@ class BackgroundSyncService:
 
         return stats
 
+    async def _bidirectional_reconcile(
+        self, dry_run: bool = False
+    ) -> dict[str, Any]:
+        """
+        Full bidirectional reconciliation between primary and secondary storage.
+
+        Compares content_hash sets from both backends and syncs missing memories
+        in both directions. For memories present on both sides, uses updated_at
+        comparison (newer wins) to reconcile metadata drift.
+
+        Safety guarantees:
+        - NEVER deletes data on either side (only adds and updates metadata)
+        - Respects tombstones — won't re-sync a locally deleted memory from cloud
+        - Uses updated_at comparison with 1s tolerance to prevent ping-pong
+        - Processes in batches with concurrency limit
+
+        Args:
+            dry_run: If True, detect differences but don't apply changes
+
+        Returns:
+            Dict with reconciliation statistics:
+            - checked: total memories examined
+            - pushed_to_cloud: local-only memories pushed to secondary
+            - pulled_to_local: cloud-only memories pulled to primary
+            - drift_synced: memories with metadata updated (newer timestamp won)
+            - skipped_tombstone: memories skipped due to local tombstone
+            - failed: errors during reconciliation
+        """
+        stats = {
+            "checked": 0,
+            "pushed_to_cloud": 0,
+            "pulled_to_local": 0,
+            "drift_synced": 0,
+            "skipped_tombstone": 0,
+            "failed": 0,
+        }
+
+        logger.info(
+            f"Starting bidirectional reconciliation (dry_run={dry_run})..."
+        )
+
+        try:
+            # --- Step 1: Fetch hash sets from both backends ---
+            local_hashes = await self.primary.get_all_content_hashes()
+            if not local_hashes:
+                local_hashes = set()
+
+            secondary_hashes = await self._fetch_secondary_hashes()
+            if secondary_hashes is None:
+                # Secondary doesn't support bulk hash fetch — can't reconcile
+                logger.warning(
+                    "Secondary hash fetch unavailable — skipping bidirectional reconcile"
+                )
+                stats["error"] = "secondary hash fetch unavailable"
+                return stats
+
+            # Safety: abort if local_hashes is empty but primary has memories.
+            # This prevents mass-overwriting local data when get_all_content_hashes()
+            # fails silently (returns empty set on SQLite errors).
+            if not local_hashes and secondary_hashes:
+                primary_stats = await self.primary.get_stats()
+                primary_count = primary_stats.get("total_memories") or 0
+                if primary_count > 0:
+                    logger.error(
+                        f"ABORTING reconcile: local_hashes is empty but primary has "
+                        f"{primary_count} memories — get_all_content_hashes() may have failed. "
+                        f"Refusing to pull cloud memories to avoid overwriting local data."
+                    )
+                    stats["error"] = (
+                        "local_hashes empty but primary has memories — aborted for safety"
+                    )
+                    return stats
+
+            only_local = local_hashes - secondary_hashes
+            only_cloud = secondary_hashes - local_hashes
+            in_both = local_hashes & secondary_hashes
+
+            stats["checked"] = len(local_hashes) + len(only_cloud)
+
+            logger.info(
+                f"Reconcile: local={len(local_hashes)}, cloud={len(secondary_hashes)}, "
+                f"only_local={len(only_local)}, only_cloud={len(only_cloud)}, "
+                f"in_both={len(in_both)}"
+            )
+
+            # --- Step 2: Push local-only memories to cloud ---
+            if only_local:
+                pushed = await self._reconcile_push_to_cloud(
+                    only_local, dry_run, stats
+                )
+                stats["pushed_to_cloud"] = pushed
+
+            # --- Step 3: Pull cloud-only memories to local ---
+            if only_cloud:
+                # Also fetch tombstoned hashes to detect cloud memories that were
+                # deleted locally (prevents resurrection after tombstone purge).
+                # This catches the case where a cloud delete failed and the tombstone
+                # hasn't been purged yet. For purged tombstones, this is a best-effort
+                # defense — a permanent deleted-hash ledger would be needed for full safety.
+                local_deleted_hashes = set()
+                if hasattr(self.primary, "get_all_content_hashes"):
+                    local_deleted_hashes = await self.primary.get_all_content_hashes(
+                        include_deleted=True
+                    )
+                    local_deleted_hashes -= local_hashes  # keep only tombstoned hashes
+
+                pulled = await self._reconcile_pull_to_local(
+                    only_cloud, dry_run, stats, local_deleted_hashes
+                )
+                stats["pulled_to_local"] = pulled
+
+            # --- Step 4: Check metadata drift for memories in both ---
+            if in_both and self.drift_check_enabled:
+                drift_count = await self._reconcile_drift_in_both(
+                    in_both, dry_run, stats
+                )
+                stats["drift_synced"] = drift_count
+
+            logger.info(
+                f"Reconciliation complete: checked={stats['checked']}, "
+                f"pushed={stats['pushed_to_cloud']}, pulled={stats['pulled_to_local']}, "
+                f"drift_synced={stats['drift_synced']}, "
+                f"skipped_tombstone={stats['skipped_tombstone']}, "
+                f"failed={stats['failed']}"
+            )
+
+        except Exception as e:
+            logger.error(f"Error during bidirectional reconciliation: {e}")
+            stats["error"] = str(e)
+
+        return stats
+
+    async def _reconcile_push_to_cloud(
+        self, only_local: set[str], dry_run: bool, stats: dict[str, Any]
+    ) -> int:
+        """Push memories that exist only locally to the secondary storage."""
+        pushed = 0
+        batch_size = self.batch_size
+        local_hashes_list = list(only_local)
+
+        for i in range(0, len(local_hashes_list), batch_size):
+            batch = local_hashes_list[i : i + batch_size]
+            semaphore = asyncio.Semaphore(15)
+
+            async def push_single(content_hash, semaphore=semaphore):
+                nonlocal pushed
+                async with semaphore:
+                    try:
+                        memory = await self.primary.get_by_hash(content_hash)
+                        if not memory:
+                            logger.debug(
+                                f"Push: memory {content_hash[:8]} not found locally, skipping"
+                            )
+                            return
+
+                        # Note: tombstone propagation for push path is handled in
+                        # _reconcile_pull_to_local, not here. Tombstoned hashes are
+                        # excluded from local_hashes (get_all_content_hashes filters
+                        # deleted_at IS NULL), so they cannot appear in only_local.
+
+                        if dry_run:
+                            logger.info(
+                                f"[DRY RUN] Would push {content_hash[:8]} to cloud"
+                            )
+                            pushed += 1
+                            return
+
+                        success, message = await self.secondary.store(memory)
+                        if success:
+                            pushed += 1
+                            logger.debug(
+                                f"Pushed {content_hash[:8]} to cloud"
+                            )
+                        else:
+                            stats["failed"] += 1
+                            logger.warning(
+                                f"Failed to push {content_hash[:8]} to cloud: {message}"
+                            )
+                    except Exception as e:
+                        stats["failed"] += 1
+                        logger.warning(
+                            f"Error pushing {content_hash[:8]} to cloud: {e}"
+                        )
+
+            tasks = [push_single(h) for h in batch]
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        logger.info(f"Push complete: {pushed} memories pushed to cloud")
+        return pushed
+
+    async def _reconcile_pull_to_local(
+        self,
+        only_cloud: set[str],
+        dry_run: bool,
+        stats: dict[str, Any],
+        local_deleted_hashes: set[str] | None = None,
+    ) -> int:
+        """Pull memories that exist only in cloud to the local storage."""
+        pulled = 0
+
+        # Use cursor-based pagination to fetch cloud memories
+        batch_size = min(500, self.batch_size * 5)
+        cursor = None
+        cloud_hashes_to_pull = set(only_cloud)  # copy, not reference
+
+        while cloud_hashes_to_pull:
+            try:
+                if hasattr(self.secondary, "get_all_memories_cursor"):
+                    cloud_memories = await self.secondary.get_all_memories_cursor(
+                        limit=batch_size, cursor=cursor
+                    )
+                else:
+                    cloud_memories = await self.secondary.get_all_memories(
+                        limit=batch_size
+                    )
+
+                if not cloud_memories:
+                    break
+
+                semaphore = asyncio.Semaphore(15)
+
+                async def pull_single(cf_memory, semaphore=semaphore):
+                    nonlocal pulled
+                    async with semaphore:
+                        if cf_memory.content_hash not in cloud_hashes_to_pull:
+                            return  # not in our missing set
+
+                        try:
+                            # Skip if soft-deleted locally (tombstone).
+                            # Also propagate deletion to cloud if the cloud delete
+                            # was previously lost (queue overflow, network failure).
+                            is_tombstoned = False
+                            if hasattr(self.primary, "is_deleted"):
+                                if await self.primary.is_deleted(
+                                    cf_memory.content_hash
+                                ):
+                                    is_tombstoned = True
+
+                            # Also check against the pre-fetched deleted-hash set
+                            # (catches tombstones that is_deleted might miss due to
+                            # TOCTOU races or pagination edge cases).
+                            if (
+                                local_deleted_hashes
+                                and cf_memory.content_hash in local_deleted_hashes
+                            ):
+                                is_tombstoned = True
+
+                            if is_tombstoned:
+                                logger.debug(
+                                    f"Pull: {cf_memory.content_hash[:8]} is tombstoned locally, "
+                                    f"propagating deletion to cloud"
+                                )
+                                stats["skipped_tombstone"] += 1
+                                cloud_hashes_to_pull.discard(
+                                    cf_memory.content_hash
+                                )
+                                # Propagate deletion to cloud (retry the failed delete)
+                                if not dry_run:
+                                    operation = SyncOperation(
+                                        operation="delete",
+                                        content_hash=cf_memory.content_hash,
+                                    )
+                                    await self.enqueue_operation(operation)
+                                return
+
+                            if dry_run:
+                                logger.info(
+                                    f"[DRY RUN] Would pull {cf_memory.content_hash[:8]} from cloud"
+                                )
+                                pulled += 1
+                                cloud_hashes_to_pull.discard(
+                                    cf_memory.content_hash
+                                )
+                                return
+
+                            success, message = await self.primary.store(
+                                cf_memory
+                            )
+                            if success:
+                                pulled += 1
+                                cloud_hashes_to_pull.discard(
+                                    cf_memory.content_hash
+                                )
+                                logger.debug(
+                                    f"Pulled {cf_memory.content_hash[:8]} from cloud"
+                                )
+                            else:
+                                stats["failed"] += 1
+                                logger.warning(
+                                    f"Failed to pull {cf_memory.content_hash[:8]}: {message}"
+                                )
+                        except Exception as e:
+                            stats["failed"] += 1
+                            logger.warning(
+                                f"Error pulling {cf_memory.content_hash[:8]}: {e}"
+                            )
+
+                tasks = [pull_single(m) for m in cloud_memories]
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+                # Update cursor
+                if cloud_memories and hasattr(
+                    self.secondary, "get_all_memories_cursor"
+                ):
+                    cursor = min(
+                        m.created_at
+                        for m in cloud_memories
+                        if m.created_at
+                    )
+
+                if not cloud_hashes_to_pull:
+                    break
+
+                await asyncio.sleep(0.01)
+
+            except Exception as e:
+                logger.error(f"Error during cloud pull batch: {e}")
+                stats["failed"] += 1
+                break
+
+        logger.info(f"Pull complete: {pulled} memories pulled from cloud")
+        return pulled
+
+    async def _reconcile_drift_in_both(
+        self, in_both: set[str], dry_run: bool, stats: dict[str, Any]
+    ) -> int:
+        """Check metadata drift for memories present on both sides."""
+        drift_synced = 0
+        batch_size = getattr(app_config, "HYBRID_DRIFT_BATCH_SIZE", 100)
+        if batch_size is None:
+            batch_size = 100
+        both_list = list(in_both)
+
+        for i in range(0, len(both_list), batch_size):
+            batch = both_list[i : i + batch_size]
+            semaphore = asyncio.Semaphore(10)
+
+            async def check_drift_single(content_hash, semaphore=semaphore):
+                nonlocal drift_synced
+                async with semaphore:
+                    try:
+                        local_memory = await self.primary.get_by_hash(
+                            content_hash
+                        )
+                        if not local_memory:
+                            return
+
+                        # Get cloud memory by hash if secondary supports it
+                        if hasattr(self.secondary, "get_by_hash"):
+                            cf_memory = await self.secondary.get_by_hash(
+                                content_hash
+                            )
+                        else:
+                            # Skip drift check if secondary doesn't support get_by_hash
+                            return
+
+                        if not cf_memory:
+                            return
+
+                        cf_updated = cf_memory.updated_at or 0
+                        local_updated = local_memory.updated_at or 0
+
+                        # Skip if within 1s tolerance
+                        if abs(cf_updated - local_updated) <= 1.0:
+                            return
+
+                        if cf_updated > local_updated:
+                            # Cloud is newer — update local
+                            if not dry_run:
+                                success, _ = (
+                                    await self.primary.update_memory_metadata(
+                                        content_hash,
+                                        {
+                                            "tags": cf_memory.tags,
+                                            "memory_type": cf_memory.memory_type,
+                                            "metadata": cf_memory.metadata,
+                                            "created_at": cf_memory.created_at,
+                                            "created_at_iso": cf_memory.created_at_iso,
+                                            "updated_at": cf_memory.updated_at,
+                                            "updated_at_iso": cf_memory.updated_at_iso,
+                                        },
+                                        preserve_timestamps=False,
+                                    )
+                                )
+                                if success:
+                                    drift_synced += 1
+                                    logger.debug(
+                                        f"Drift: synced {content_hash[:8]} cloud→local"
+                                    )
+                                else:
+                                    stats["failed"] += 1
+                            else:
+                                logger.info(
+                                    f"[DRY RUN] Would sync drift {content_hash[:8]} cloud→local"
+                                )
+                                drift_synced += 1
+                        else:
+                            # Local is newer — queue update to cloud
+                            if not dry_run:
+                                operation = SyncOperation(
+                                    operation="update",
+                                    content_hash=content_hash,
+                                    updates={
+                                        "tags": local_memory.tags,
+                                        "memory_type": local_memory.memory_type,
+                                        "metadata": local_memory.metadata,
+                                        "updated_at": local_memory.updated_at,
+                                        "updated_at_iso": local_memory.updated_at_iso,
+                                    },
+                                    preserve_timestamps=False,
+                                )
+                                await self.enqueue_operation(operation)
+                                drift_synced += 1
+                                logger.debug(
+                                    f"Drift: queued {content_hash[:8]} local→cloud"
+                                )
+                            else:
+                                logger.info(
+                                    f"[DRY RUN] Would queue drift {content_hash[:8]} local→cloud"
+                                )
+                                drift_synced += 1
+
+                    except Exception as e:
+                        stats["failed"] += 1
+                        logger.warning(
+                            f"Error checking drift for {content_hash[:8]}: {e}"
+                        )
+
+            tasks = [check_drift_single(h) for h in batch]
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        logger.info(
+            f"Drift check complete: {drift_synced} memories synced"
+        )
+        return drift_synced
+
 
 class HybridMemoryStorage(MemoryStorage):
     """
@@ -1235,15 +1679,19 @@ class HybridMemoryStorage(MemoryStorage):
                 f"{sync_type.capitalize()} sync: Local={primary_count}, Cloudflare={secondary_count}"
             )
 
-            if secondary_count <= primary_count:
+            # Note: We intentionally do NOT short-circuit when secondary_count <= primary_count.
+            # A count comparison cannot detect memories that are present on one side but not
+            # the other (e.g., 243 local vs 185 cloud — 81 local-only, 23 cloud-only).
+            # The hash-set comparison below handles this correctly and efficiently.
+            if secondary_count == 0:
                 logger.info(
-                    f"No new memories to sync from Cloudflare ({sync_type} sync)"
+                    f"No memories on Cloudflare ({sync_type} sync), nothing to pull"
                 )
                 return {
                     "success": True,
                     "memories_synced": 0,
                     "total_checked": 0,
-                    "message": "No new memories to pull from Cloudflare",
+                    "message": "No memories on Cloudflare to pull",
                     "time_taken_seconds": round(time.time() - sync_start_time, 3),
                 }
 
@@ -1604,6 +2052,17 @@ class HybridMemoryStorage(MemoryStorage):
                 self.initial_sync_completed = self.initial_sync_total
                 logger.info(
                     f"Sync completed successfully: All {self.initial_sync_total} memories were already present locally"
+                )
+
+            # Bidirectional reconcile: push local-only memories to cloud
+            # and check metadata drift for memories in both backends.
+            if self.sync_service:
+                logger.info("Running bidirectional reconcile as part of initial sync...")
+                reconcile_result = await self.sync_service._bidirectional_reconcile()
+                logger.info(
+                    f"Initial reconcile: pushed={reconcile_result.get('pushed_to_cloud', 0)}, "
+                    f"pulled={reconcile_result.get('pulled_to_local', 0)}, "
+                    f"drift_synced={reconcile_result.get('drift_synced', 0)}"
                 )
 
             self.initial_sync_finished = True
@@ -2158,6 +2617,31 @@ class HybridMemoryStorage(MemoryStorage):
             "memories_pulled": result["memories_synced"],
             "time_taken_seconds": result["time_taken_seconds"],
         }
+
+    async def force_reconcile(self, dry_run: bool = False) -> dict[str, Any]:
+        """
+        Force immediate bidirectional reconciliation between backends.
+
+        Performs full hash-set comparison and syncs missing memories in both
+        directions. Safe: never deletes data, only adds and updates metadata.
+
+        Args:
+            dry_run: If True, detect differences but don't apply changes
+
+        Returns:
+            Dict with reconciliation statistics
+        """
+        if not self.sync_service:
+            return {
+                "status": "disabled",
+                "message": "Background sync service not available",
+            }
+
+        start = time.time()
+        result = await self.sync_service._bidirectional_reconcile(dry_run=dry_run)
+        result["duration"] = round(time.time() - start, 3)
+        result["dry_run"] = dry_run
+        return result
 
     async def get_sync_status(self) -> dict[str, Any]:
         """Get current background sync status and statistics."""

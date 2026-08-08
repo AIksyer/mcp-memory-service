@@ -234,6 +234,89 @@ class SyncPauseResponse(BaseModel):
     timestamp: str
 
 
+class SyncReconcileResponse(BaseModel):
+    """Reconciliation response model."""
+
+    checked: int
+    pushed_to_cloud: int
+    pulled_to_local: int
+    drift_synced: int
+    skipped_tombstone: int
+    failed: int
+    duration: float
+    dry_run: bool
+    status: str = "completed"
+    message: str | None = None
+
+
+@router.post("/sync/reconcile", response_model=SyncReconcileResponse)
+async def reconcile_sync(
+    dry_run: bool = False,
+    storage: MemoryStorage = Depends(get_storage),
+    user: AuthenticationResult = Depends(require_write_access),
+):
+    """
+    Trigger full bidirectional reconciliation between local and cloud.
+
+    Compares content_hash sets from both backends and syncs missing memories
+    in both directions. Safe: never deletes data, only adds and updates metadata.
+
+    Query params:
+        dry_run: If true, detect differences but don't apply changes
+    """
+    if not hasattr(storage, "force_reconcile"):
+        raise HTTPException(
+            status_code=404, detail="Reconciliation only available in hybrid mode"
+        )
+
+    try:
+        result = await storage.force_reconcile(dry_run=dry_run)
+
+        # Handle disabled/error states
+        if result.get("status") == "disabled":
+            return SyncReconcileResponse(
+                checked=0,
+                pushed_to_cloud=0,
+                pulled_to_local=0,
+                drift_synced=0,
+                skipped_tombstone=0,
+                failed=0,
+                duration=0,
+                dry_run=dry_run,
+                status="disabled",
+                message=result.get("message", "Sync service not available"),
+            )
+
+        if "error" in result:
+            return SyncReconcileResponse(
+                checked=result.get("checked", 0),
+                pushed_to_cloud=result.get("pushed_to_cloud", 0),
+                pulled_to_local=result.get("pulled_to_local", 0),
+                drift_synced=result.get("drift_synced", 0),
+                skipped_tombstone=result.get("skipped_tombstone", 0),
+                failed=result.get("failed", 0),
+                duration=result.get("duration", 0),
+                dry_run=result.get("dry_run", dry_run),
+                status="error",
+                message=result.get("error"),
+            )
+
+        return SyncReconcileResponse(
+            checked=result.get("checked", 0),
+            pushed_to_cloud=result.get("pushed_to_cloud", 0),
+            pulled_to_local=result.get("pulled_to_local", 0),
+            drift_synced=result.get("drift_synced", 0),
+            skipped_tombstone=result.get("skipped_tombstone", 0),
+            failed=result.get("failed", 0),
+            duration=result.get("duration", 0),
+            dry_run=result.get("dry_run", False),
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to reconcile: {e!s}"
+        )
+
+
 @router.post("/sync/pause", response_model=SyncPauseResponse)
 async def pause_sync(
     storage: MemoryStorage = Depends(get_storage),

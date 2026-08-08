@@ -701,6 +701,71 @@ def logs(lines):
     _logs.main(args=args, prog_name="memory logs", standalone_mode=False)
 
 
+# ─── Setup command ────────────────────────────────────────────────────────────
+
+
+@cli.command()
+@click.option("--non-interactive", is_flag=True, help="Run non-interactively (for agents/scripts)")
+@click.option(
+    "--backend",
+    type=click.Choice(["sqlite_vec", "cloudflare", "hybrid"]),
+    help="Storage backend",
+)
+@click.option("--cf-token", help="Cloudflare API token")
+@click.option("--cf-account", help="Cloudflare account ID")
+@click.option("--cf-d1", help="Cloudflare D1 database ID")
+@click.option("--backup-r2", is_flag=True, help="Enable R2 backup")
+@click.option("--backup-github", is_flag=True, help="Enable GitHub backup")
+@click.option("--github-repo", help="GitHub repo for backup (user/repo)")
+@click.option("--github-token", help="GitHub personal access token")
+@click.option(
+    "--mcp-client",
+    type=click.Choice(["claude-desktop", "claude-code", "cursor", "none"]),
+    help="MCP client to configure",
+)
+@click.option("--http-port", type=int, default=8000, help="HTTP server port")
+def setup(
+    non_interactive,
+    backend,
+    cf_token,
+    cf_account,
+    cf_d1,
+    backup_r2,
+    backup_github,
+    github_repo,
+    github_token,
+    mcp_client,
+    http_port,
+):
+    """Interactive setup wizard for MCP Memory Service.
+
+    Guides you through storage backend selection, backup configuration,
+    and MCP client integration. Generates .env and MCP client config.
+
+    Use --non-interactive for agent-driven deployment.
+    """
+    from .setup import SetupWizard, SetupConfig
+
+    if non_interactive:
+        config = SetupConfig(
+            storage_backend=backend or "sqlite_vec",
+            cf_api_token=cf_token or "",
+            cf_account_id=cf_account or "",
+            cf_d1_database_id=cf_d1 or "",
+            backup_r2=backup_r2,
+            backup_github=backup_github,
+            backup_github_repo=github_repo or "",
+            backup_github_token=github_token or "",
+            mcp_client=mcp_client or "",
+            http_port=http_port,
+        )
+        wizard = SetupWizard(config)
+        wizard.run_non_interactive()
+    else:
+        wizard = SetupWizard()
+        wizard.run_interactive()
+
+
 # ─── Compatibility entry points ───────────────────────────────────────────────
 
 

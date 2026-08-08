@@ -807,6 +807,20 @@ def memory_server_main():
 
 def main():
     """Main entry point for the CLI."""
+    # Ensure Unicode output works on Windows (GBK console can't encode ✓, ⚠️, 🎉, etc.)
+    import io
+
+    if hasattr(sys.stdout, "detach"):
+        try:
+            sys.stdout = io.TextIOWrapper(
+                sys.stdout.buffer, encoding="utf-8", errors="replace"
+            )
+            sys.stderr = io.TextIOWrapper(
+                sys.stderr.buffer, encoding="utf-8", errors="replace"
+            )
+        except (AttributeError, io.UnsupportedOperation):
+            pass  # Already a TextIOWrapper or buffer unavailable
+
     try:
         cli()
     except KeyboardInterrupt:

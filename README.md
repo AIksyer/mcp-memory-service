@@ -1,5 +1,7 @@
 # mcp-memory-service
 
+[English](README.md) | [中文](README.zh-CN.md)
+
 ## Persistent Shared Memory for AI Agent Pipelines
 
 Open-source memory backend for AI agents — **REST API, MCP, OAuth, CLI, dashboard**. One self-hosted service, every transport.

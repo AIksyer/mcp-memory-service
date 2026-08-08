@@ -251,9 +251,70 @@ class SetupWizard:
         if self.config.mcp_client and self.config.mcp_client != "none":
             self._write_mcp_client_config()
 
-        click.echo("\n🎉 Setup complete!")
-        click.echo("  Start the server: memory launch")
-        click.echo("  Check status: memory info")
+        self._print_post_setup_guide()
+
+    def _print_post_setup_guide(self):
+        """Print usage guide after setup completes."""
+        click.echo("\n" + "=" * 60)
+        click.echo("  Setup complete! Here's how to use it:")
+        click.echo("=" * 60)
+
+        click.echo("\n  1. Start the server:")
+        click.echo("     memory launch")
+
+        click.echo("\n  2. Verify it's running:")
+        click.echo("     memory info")
+        click.echo("     curl http://127.0.0.1:8000/api/health")
+
+        click.echo("\n  3. MCP client configuration:")
+
+        if self.config.mcp_client == "claude-code":
+            click.echo("     Claude Code is configured with 'memory' MCP server.")
+            click.echo("     The config was written to: ~/.claude/settings.json")
+            click.echo("     Restart Claude Code to activate memory tools.")
+        elif self.config.mcp_client == "claude-desktop":
+            click.echo("     Claude Desktop is configured with 'memory' MCP server.")
+            click.echo("     The config was written to: claude_desktop_config.json")
+            click.echo("     Restart Claude Desktop to activate memory tools.")
+        elif self.config.mcp_client == "cursor":
+            click.echo("     Cursor is configured with 'memory' MCP server.")
+            click.echo("     The config was written to: mcp.json")
+            click.echo("     Restart Cursor to activate memory tools.")
+        else:
+            click.echo("     No MCP client was configured.")
+            click.echo("     To add memory to your AI client manually:")
+            click.echo('     {"mcpServers":{"memory":{"command":"memory","args":["server"]}}}')
+
+        click.echo("\n  4. Available MCP tools (after restart):")
+        click.echo("     - memory_store: Save a memory")
+        click.echo("     - memory_search: Search memories semantically")
+        click.echo("     - memory_retrieve: Get memories by query")
+        click.echo("     - memory_delete: Delete a memory")
+        click.echo("     - memory_list: List all memories")
+
+        if self.config.storage_backend == "hybrid":
+            click.echo("\n  5. Cloud deployment (optional):")
+            click.echo("     Deploy to Render/Railway/etc for a cloud MCP endpoint.")
+            click.echo("     Then add a second MCP server to your client:")
+            click.echo('     {"mcpServers":{')
+            click.echo('       "memory": {"command":"memory","args":["server"]},')
+            click.echo('       "memory-cloud": {"url":"https://your-cloud-url/mcp"}')
+            click.echo('     }}')
+            click.echo("     The local 'memory' is primary (fast).")
+            click.echo("     The 'memory-cloud' provides fallback when local is offline.")
+
+        if self.config.backup_r2 or self.config.backup_github:
+            click.echo("\n  6. Backup configuration:")
+            if self.config.backup_r2:
+                click.echo(f"     R2 backup: enabled (bucket: {self.config.backup_r2_bucket})")
+            if self.config.backup_github:
+                click.echo(f"     GitHub backup: enabled (repo: {self.config.backup_github_repo})")
+            click.echo("     Backups run automatically on schedule (daily by default).")
+            click.echo("     Trigger manually: POST /api/backup/push-remote")
+
+        click.echo("\n" + "=" * 60)
+        click.echo("  Need help? Check the docs: https://github.com/AIksyer/mcp-memory-service")
+        click.echo("=" * 60)
 
     @staticmethod
     def _parse_env_content(content: str) -> dict:

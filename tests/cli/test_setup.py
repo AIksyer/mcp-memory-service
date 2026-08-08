@@ -291,6 +291,9 @@ class TestSetupCommand:
             assert (tmp_path / ".env").exists()
             content = (tmp_path / ".env").read_text()
             assert "MCP_MEMORY_STORAGE_BACKEND=sqlite_vec" in content
+            # Verify post-setup guide is printed
+            assert "memory launch" in result.output
+            assert "MCP tools" in result.output
 
     def test_non_interactive_hybrid_with_backup(self, tmp_path):
         """Non-interactive setup with hybrid + R2 backup."""

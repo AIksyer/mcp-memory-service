@@ -6,8 +6,10 @@
 
 # Environment files — contain secrets, never commit
 .env
+.env.bak
 .env.local
 .env.*.local
+.env.pre-reconfigure
 
 # Codely CLI project memory — contains deployment URLs and local config
 CODELY.md

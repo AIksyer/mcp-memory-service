@@ -31,15 +31,30 @@ cd mcp-memory-service
 pip install -e .
 ```
 
-### 2. Run setup wizard (non-interactive)
+### 2. Run setup wizard
 
-For SQLite-only (simplest, no cloud):
+**Interactive (recommended for first-time users):**
+
+```bash
+memory setup
+```
+
+The wizard will guide you through:
+1. Storage backend (SQLite / Cloudflare / Hybrid)
+2. Cloudflare credentials (if cloud/hybrid)
+3. Backup targets (local / R2 / GitHub)
+4. MCP client detection and configuration
+5. Review and confirm
+
+**Non-interactive (for agents/scripts):**
+
+SQLite-only (simplest, no cloud):
 
 ```bash
 memory setup --non-interactive --backend sqlite_vec --mcp-client claude-code
 ```
 
-For Hybrid (local + Cloudflare sync):
+Hybrid (local + Cloudflare sync):
 
 ```bash
 memory setup --non-interactive \
@@ -51,7 +66,7 @@ memory setup --non-interactive \
   --mcp-client claude-code
 ```
 
-For Hybrid + R2 + GitHub backup:
+Hybrid + R2 + GitHub backup (triple redundancy):
 
 ```bash
 memory setup --non-interactive \
@@ -79,6 +94,53 @@ memory info
 curl http://127.0.0.1:8000/api/health
 ```
 
+## What Setup Does Automatically
+
+- **Generates `.env`** — all configuration in one file (merged with existing, never overwrites)
+- **Backs up existing `.env`** to `.env.bak` before any changes
+- **Configures MCP client** — writes to the detected client's config file:
+  - Claude Desktop: `claude_desktop_config.json`
+  - Claude Code: `~/.claude/settings.json`
+  - Cursor: `mcp.json`
+- **Prints a usage guide** — shows available MCP tools, backup status, and cloud deployment instructions
+
+## MCP Client Configuration
+
+After setup, your AI client will have a `memory` MCP server entry. This gives the agent access to these tools:
+
+| Tool | Description |
+|------|-------------|
+| `memory_store` | Save a memory with content, tags, and type |
+| `memory_search` | Semantic search across all memories |
+| `memory_retrieve` | Retrieve memories by query |
+| `memory_delete` | Delete a memory by content hash |
+| `memory_list` | List all memories with pagination |
+| `memory_update` | Update memory metadata (tags, type) |
+| `memory_graph` | Knowledge graph operations |
+| `memory_consolidate` | Run memory consolidation |
+
+## Cloud Deployment (Optional)
+
+For high availability, deploy to a cloud platform (Render, Railway, etc.) and configure **dual MCP**:
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "command": "memory",
+      "args": ["server"]
+    },
+    "memory-cloud": {
+      "url": "https://your-cloud-url/mcp"
+    }
+  }
+}
+```
+
+- `memory` (local) — primary, fast (~5ms reads)
+- `memory-cloud` — fallback when local is offline
+- Both share the same Cloudflare D1 + Vectorize backend via hybrid sync
+
 ## Configuration Options
 
 | Flag | Description | Default |
@@ -96,10 +158,18 @@ curl http://127.0.0.1:8000/api/health
 
 ## Post-Setup
 
-After setup, the `.env` file is created at `~/.mcp-memory-service/.env` (or in the project directory if running from source). MCP client config is written to the detected client's config file.
+After setup completes, the wizard prints a guide showing:
+1. How to start the server (`memory launch`)
+2. How to verify it's running (`memory info`, health check)
+3. Which MCP client was configured and where
+4. Available MCP tools
+5. Cloud deployment instructions (if hybrid)
+6. Backup configuration status
 
 ## Troubleshooting
 
 - **"memory: command not found"** — ensure pip install succeeded, or use `python -m mcp_memory_service.cli.main setup`
 - **"CLOUDFLARE_API_TOKEN not set"** — re-run setup with `--cf-token`
 - **"Database is locked"** — ensure WAL mode is enabled (setup wizard adds this automatically)
+- **".env.bak leaked to GitHub"** — `.env` and `.env.bak` are in `.gitignore`; verify with `git status` before pushing
+- **GBK encoding error on Windows** — the CLI forces UTF-8 output; if still failing, run `chcp 65001` before `memory setup`

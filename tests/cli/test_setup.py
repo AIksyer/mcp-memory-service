@@ -336,6 +336,8 @@ class TestSetupCommand:
         ), patch(
             "mcp_memory_service.cli.setup.SetupWizard._detect_mcp_clients",
             return_value=[],
+        ), patch(
+            "mcp_memory_service.cli.setup.HAS_QUESTIONARY", False
         ):
             result = runner.invoke(cli, ["setup"], input=inputs)
             assert result.exit_code == 0

@@ -9,6 +9,12 @@ from pathlib import Path
 
 import click
 
+try:
+    import questionary
+    HAS_QUESTIONARY = True
+except ImportError:
+    HAS_QUESTIONARY = False
+
 
 @dataclass
 class SetupConfig:
@@ -99,84 +105,236 @@ class SetupWizard:
     def _step_storage_backend(self):
         """Step 1: Choose storage backend."""
         click.echo("\n📋 Step 1: Storage Backend")
-        click.echo("  [1] SQLite-vec (local only, fastest, zero config)")
-        click.echo("  [2] Cloudflare (cloud, requires CF account)")
-        click.echo("  [3] Hybrid (local + cloud sync, recommended for multi-device)")
-        choice = click.prompt(
-            "Select backend", default="1", type=click.Choice(["1", "2", "3"])
-        )
-        backends = {"1": "sqlite_vec", "2": "cloudflare", "3": "hybrid"}
-        self.config.storage_backend = backends[choice]
+        if HAS_QUESTIONARY:
+            choice = questionary.select(
+                "Select storage backend:",
+                choices=[
+                    questionary.Choice(
+                        "SQLite-vec (local only, fastest, zero config)",
+                        value="sqlite_vec",
+                    ),
+                    questionary.Choice(
+                        "Cloudflare (cloud, requires CF account)",
+                        value="cloudflare",
+                    ),
+                    questionary.Choice(
+                        "Hybrid (local + cloud sync, recommended)",
+                        value="hybrid",
+                    ),
+                ],
+                default="sqlite_vec",
+            ).ask()
+        else:
+            click.echo("  [1] SQLite-vec (local only, fastest, zero config)")
+            click.echo("  [2] Cloudflare (cloud, requires CF account)")
+            click.echo("  [3] Hybrid (local + cloud sync, recommended)")
+            num = click.prompt("Select", default="1", type=click.Choice(["1", "2", "3"]))
+            choice = {"1": "sqlite_vec", "2": "cloudflare", "3": "hybrid"}[num]
+        self.config.storage_backend = choice
         click.echo(f"  ✓ Selected: {self.config.storage_backend}")
 
     def _step_cloudflare_credentials(self):
-        """Step 2: Collect Cloudflare credentials."""
+        """Step 2: Collect Cloudflare credentials with full token creation guide."""
         click.echo("\n🔑 Step 2: Cloudflare Credentials")
-        click.echo("  Get these from: https://dash.cloudflare.com/profile/api-tokens")
-        self.config.cf_api_token = click.prompt(
-            "  API Token", hide_input=True, default=""
-        )
-        self.config.cf_account_id = click.prompt("  Account ID", default="")
-        self.config.cf_d1_database_id = click.prompt("  D1 Database ID", default="")
-        self.config.cf_vectorize_index = click.prompt(
-            "  Vectorize Index", default="mcp-memory-index"
-        )
+
+        # First: check if existing .env already has CF credentials
+        env_path = self._find_env_path()
+        existing = {}
+        if env_path.exists():
+            existing = self._parse_env_content(env_path.read_text(encoding="utf-8"))
+
+        existing_token = existing.get("CLOUDFLARE_API_TOKEN", "")
+        existing_account = existing.get("CLOUDFLARE_ACCOUNT_ID", "")
+        existing_d1 = existing.get("CLOUDFLARE_D1_DATABASE_ID", "")
+        existing_vectorize = existing.get("CLOUDFLARE_VECTORIZE_INDEX", "mcp-memory-index")
+
+        if existing_token:
+            click.echo("  ✓ Found existing Cloudflare API Token in .env")
+            if HAS_QUESTIONARY:
+                use_existing = questionary.confirm(
+                    "  Reuse existing Cloudflare credentials?", default=True
+                ).ask()
+            else:
+                use_existing = click.confirm("  Reuse existing credentials?", default=True)
+            if use_existing:
+                self.config.cf_api_token = existing_token
+                self.config.cf_account_id = existing_account
+                self.config.cf_d1_database_id = existing_d1
+                self.config.cf_vectorize_index = existing_vectorize
+                click.echo("  ✓ Using existing credentials")
+                return
+
+        # Show full token creation guide
+        self._print_cf_token_guide()
+
+        if HAS_QUESTIONARY:
+            self.config.cf_api_token = questionary.password("  Paste your API Token:").ask()
+        else:
+            self.config.cf_api_token = click.prompt("  API Token", hide_input=True, default="")
+
+        if HAS_QUESTIONARY:
+            self.config.cf_account_id = questionary.text(
+                "  Account ID (from dashboard right sidebar):",
+                default=existing_account,
+            ).ask()
+        else:
+            self.config.cf_account_id = click.prompt("  Account ID", default=existing_account)
+
+        if HAS_QUESTIONARY:
+            self.config.cf_d1_database_id = questionary.text(
+                "  D1 Database ID (from wrangler d1 list):",
+                default=existing_d1,
+            ).ask()
+        else:
+            self.config.cf_d1_database_id = click.prompt("  D1 Database ID", default=existing_d1)
+
+        if HAS_QUESTIONARY:
+            self.config.cf_vectorize_index = questionary.text(
+                "  Vectorize Index name:",
+                default="mcp-memory-index",
+            ).ask()
+        else:
+            self.config.cf_vectorize_index = click.prompt(
+                "  Vectorize Index", default="mcp-memory-index"
+            )
+
         if self.config.cf_api_token:
             click.echo("  ✓ Credentials collected")
         else:
             click.echo("  ⚠️  No token provided — cloud features will not work")
 
+    def _print_cf_token_guide(self):
+        """Print step-by-step guide for creating a Cloudflare API Token."""
+        click.echo()
+        click.echo("  ┌─────────────────────────────────────────────────────────┐")
+        click.echo("  │         How to Create a Cloudflare API Token           │")
+        click.echo("  └─────────────────────────────────────────────────────────┘")
+        click.echo()
+        click.echo("  1. Go to: https://dash.cloudflare.com/profile/api-tokens")
+        click.echo()
+        click.echo("  2. Click 'Create Token' → 'Create Custom Token' (NOT Edit template)")
+        click.echo()
+        click.echo("  3. Add these permissions (click '+ Add more' for each):")
+        click.echo()
+        click.echo("     ┌────────────────┬──────────────┬──────────┐")
+        click.echo("     │ Permission     │ Resource     │ Access   │")
+        click.echo("     ├────────────────┼──────────────┼──────────┤")
+        click.echo("     │ Account │ D1    │ Your account │ Edit     │")
+        click.echo("     │ Account │ Vectorize │ Your account │ Edit  │")
+        click.echo("     │ Account │ Workers AI │ Your account │ Read  │")
+        click.echo("     └────────────────┴──────────────┴──────────┘")
+        click.echo()
+        click.echo("  4. If using R2 backup, also add:")
+        click.echo("     │ Account │ R2    │ Your account │ Edit     │")
+        click.echo()
+        click.echo("  5. Account Resources: select 'Include' → your account")
+        click.echo()
+        click.echo("  6. TTL: leave blank (no expiry) or set 1 year")
+        click.echo()
+        click.echo("  7. Click 'Continue to summary' → 'Create Token'")
+        click.echo()
+        click.echo("  8. COPY the token now — it won't be shown again!")
+        click.echo("     Format: a long string like 'cfat_xxxx...' or similar")
+        click.echo()
+
     def _step_backup_targets(self):
         """Step 3: Choose backup targets."""
         click.echo("\n💾 Step 3: Backup Targets")
-        self.config.backup_local = click.confirm("  Local backup?", default=True)
-        self.config.backup_r2 = click.confirm("  Cloudflare R2 backup?", default=False)
+        if HAS_QUESTIONARY:
+            self.config.backup_local = questionary.confirm(
+                "  Enable local backup?", default=True
+            ).ask()
+            self.config.backup_r2 = questionary.confirm(
+                "  Enable Cloudflare R2 backup?", default=False
+            ).ask()
+        else:
+            self.config.backup_local = click.confirm("  Local backup?", default=True)
+            self.config.backup_r2 = click.confirm("  Cloudflare R2 backup?", default=False)
         if self.config.backup_r2:
-            self.config.backup_r2_bucket = click.prompt(
-                "  R2 bucket name", default="mcp-memory-backup"
+            if HAS_QUESTIONARY:
+                self.config.backup_r2_bucket = questionary.text(
+                    "  R2 bucket name:", default="mcp-memory-backup"
+                ).ask()
+            else:
+                self.config.backup_r2_bucket = click.prompt(
+                    "  R2 bucket name", default="mcp-memory-backup"
+                )
+        if HAS_QUESTIONARY:
+            self.config.backup_github = questionary.confirm(
+                "  Enable GitHub private repo backup?", default=False
+            ).ask()
+        else:
+            self.config.backup_github = click.confirm(
+                "  GitHub private repo backup?", default=False
             )
-        self.config.backup_github = click.confirm(
-            "  GitHub private repo backup?", default=False
-        )
         if self.config.backup_github:
-            self.config.backup_github_repo = click.prompt("  GitHub repo (user/repo)")
-            self.config.backup_github_branch = click.prompt(
-                "  Branch", default="master"
-            )
-            self.config.backup_github_token = click.prompt(
-                "  GitHub token", hide_input=True
-            )
+            if HAS_QUESTIONARY:
+                self.config.backup_github_repo = questionary.text(
+                    "  GitHub repo (user/repo):"
+                ).ask()
+                self.config.backup_github_branch = questionary.text(
+                    "  Branch:", default="master"
+                ).ask()
+                self.config.backup_github_token = questionary.password(
+                    "  GitHub token (ghp_...):"
+                ).ask()
+            else:
+                self.config.backup_github_repo = click.prompt("  GitHub repo (user/repo)")
+                self.config.backup_github_branch = click.prompt("  Branch", default="master")
+                self.config.backup_github_token = click.prompt("  GitHub token", hide_input=True)
         click.echo("  ✓ Backup targets configured")
 
     def _step_http_server(self):
         """Step 3b: HTTP server settings."""
         click.echo("\n🌐 Step 3b: HTTP Server")
-        self.config.http_host = click.prompt("  Host", default="127.0.0.1")
-        self.config.http_port = click.prompt("  Port", default=8000, type=int)
+        if HAS_QUESTIONARY:
+            self.config.http_host = questionary.text(
+                "  Host:", default="127.0.0.1"
+            ).ask()
+            self.config.http_port = int(questionary.text(
+                "  Port:", default="8000"
+            ).ask() or "8000")
+        else:
+            self.config.http_host = click.prompt("  Host", default="127.0.0.1")
+            self.config.http_port = click.prompt("  Port", default=8000, type=int)
 
     def _step_mcp_client(self):
         """Step 4: Detect and configure MCP client."""
         click.echo("\n🔌 Step 4: MCP Client Configuration")
         detected = self._detect_mcp_clients()
         if detected:
-            click.echo(f"  Detected clients: {', '.join(detected)}")
-            for client in detected:
-                if click.confirm(f"  Configure for {client}?", default=True):
-                    self.config.mcp_client = client
-                    break
-            if not self.config.mcp_client:
-                self.config.mcp_client = "none"
+            click.echo(f"  Detected: {', '.join(detected)}")
+            choices = [questionary.Choice(f"Configure for {c}", value=c) for c in detected]
+            choices.append(questionary.Choice("Skip (configure later)", value="none"))
         else:
-            click.echo("  No MCP clients detected")
-            choice = click.prompt(
-                "  Configure for which client?",
-                type=click.Choice(
-                    ["claude-desktop", "claude-code", "cursor", "none"]
-                ),
-                default="none",
-            )
-            self.config.mcp_client = choice
-        if self.config.mcp_client != "none":
+            click.echo("  No clients detected")
+            choices = [
+                questionary.Choice("Claude Desktop", value="claude-desktop"),
+                questionary.Choice("Claude Code", value="claude-code"),
+                questionary.Choice("Cursor", value="cursor"),
+                questionary.Choice("Skip (configure later)", value="none"),
+            ]
+
+        if HAS_QUESTIONARY:
+            self.config.mcp_client = questionary.select(
+                "  Select MCP client:", choices=choices, default="none"
+            ).ask()
+        else:
+            if detected:
+                for client in detected:
+                    if click.confirm(f"  Configure for {client}?", default=True):
+                        self.config.mcp_client = client
+                        break
+                if not self.config.mcp_client:
+                    self.config.mcp_client = "none"
+            else:
+                self.config.mcp_client = click.prompt(
+                    "  Configure for which client?",
+                    type=click.Choice(["claude-desktop", "claude-code", "cursor", "none"]),
+                    default="none",
+                )
+
+        if self.config.mcp_client and self.config.mcp_client != "none":
             self.config.mcp_client_config_path = self._get_client_config_path(
                 self.config.mcp_client
             )
@@ -201,7 +359,14 @@ class SetupWizard:
         click.echo(f"  Backup: {', '.join(backup_parts) or 'none'}")
         click.echo(f"  HTTP: {self.config.http_host}:{self.config.http_port}")
         click.echo(f"  MCP client: {self.config.mcp_client}")
-        if not click.confirm("\n  Apply this configuration?", default=True):
+
+        if HAS_QUESTIONARY:
+            confirmed = questionary.confirm(
+                "\n  Apply this configuration?", default=True
+            ).ask()
+        else:
+            confirmed = click.confirm("\n  Apply this configuration?", default=True)
+        if not confirmed:
             click.echo("  Setup cancelled.")
             raise SystemExit(0)
 

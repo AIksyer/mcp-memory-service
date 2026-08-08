@@ -44,6 +44,7 @@ dependencies = [
     "build>=0.10.0",
     "chardet>=5.0.0",
     "click>=8.0.0",
+    "questionary>=2.0.0",
     "cryptography>=46.0.6",
     "fastapi[standard]>=0.115.5",
     "httpx>=0.24.0",

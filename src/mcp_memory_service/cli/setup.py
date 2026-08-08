@@ -168,26 +168,51 @@ class SetupWizard:
         self._print_cf_token_guide()
 
         if HAS_QUESTIONARY:
-            self.config.cf_api_token = questionary.password("  Paste your API Token:").ask()
+            self.config.cf_api_token = questionary.password(
+                "  Paste your API Token (hidden input):"
+            ).ask()
         else:
             self.config.cf_api_token = click.prompt("  API Token", hide_input=True, default="")
 
+        click.echo()
+        click.echo("  ── Account ID ──")
+        click.echo("  This is a 32-character hex string, NOT your account name.")
+        click.echo("  Find it in: Cloudflare Dashboard → Home → right sidebar 'Account ID'")
+        click.echo("  Or in your dashboard URL: dash.cloudflare.com/<THIS_IS_YOUR_ACCOUNT_ID>/home")
+        click.echo("  Example: a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4")
+        click.echo()
         if HAS_QUESTIONARY:
             self.config.cf_account_id = questionary.text(
-                "  Account ID (from dashboard right sidebar):",
+                "  Account ID (32-char hex):",
                 default=existing_account,
             ).ask()
         else:
             self.config.cf_account_id = click.prompt("  Account ID", default=existing_account)
 
+        click.echo()
+        click.echo("  ── D1 Database ID ──")
+        click.echo("  Create one if you don't have it:")
+        click.echo("    npx wrangler d1 create mcp-memory-database")
+        click.echo("  Or list existing databases:")
+        click.echo("    npx wrangler d1 list")
+        click.echo("  The ID looks like: a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+        click.echo()
         if HAS_QUESTIONARY:
             self.config.cf_d1_database_id = questionary.text(
-                "  D1 Database ID (from wrangler d1 list):",
+                "  D1 Database ID (UUID format):",
                 default=existing_d1,
             ).ask()
         else:
             self.config.cf_d1_database_id = click.prompt("  D1 Database ID", default=existing_d1)
 
+        click.echo()
+        click.echo("  ── Vectorize Index ──")
+        click.echo("  Create one if you don't have it:")
+        click.echo("    npx wrangler vectorize create mcp-memory-index --dimensions=384")
+        click.echo("  Or list existing indexes:")
+        click.echo("    npx wrangler vectorize list")
+        click.echo("  Note: dimensions MUST be 384 (matches the default embedding model)")
+        click.echo()
         if HAS_QUESTIONARY:
             self.config.cf_vectorize_index = questionary.text(
                 "  Vectorize Index name:",
@@ -206,35 +231,43 @@ class SetupWizard:
     def _print_cf_token_guide(self):
         """Print step-by-step guide for creating a Cloudflare API Token."""
         click.echo()
-        click.echo("  ┌─────────────────────────────────────────────────────────┐")
-        click.echo("  │         How to Create a Cloudflare API Token           │")
-        click.echo("  └─────────────────────────────────────────────────────────┘")
+        click.echo("  ┌─────────────────────────────────────────────────────────────┐")
+        click.echo("  │           How to Create a Cloudflare API Token             │")
+        click.echo("  └─────────────────────────────────────────────────────────────┘")
         click.echo()
         click.echo("  1. Go to: https://dash.cloudflare.com/profile/api-tokens")
+        click.echo("     Log in to your Cloudflare account.")
         click.echo()
-        click.echo("  2. Click 'Create Token' → 'Create Custom Token' (NOT Edit template)")
+        click.echo("  2. Click 'Create Token' → 'Create Custom Token'")
+        click.echo("     (Do NOT use a template — choose 'Create Custom Token')")
         click.echo()
-        click.echo("  3. Add these permissions (click '+ Add more' for each):")
+        click.echo("  3. Token name: give it a descriptive name, e.g.:")
+        click.echo("     'mcp-memory-service'")
+        click.echo("     (Helps you identify it later in the token list)")
         click.echo()
-        click.echo("     ┌────────────────┬──────────────┬──────────┐")
-        click.echo("     │ Permission     │ Resource     │ Access   │")
-        click.echo("     ├────────────────┼──────────────┼──────────┤")
-        click.echo("     │ Account │ D1    │ Your account │ Edit     │")
-        click.echo("     │ Account │ Vectorize │ Your account │ Edit  │")
-        click.echo("     │ Account │ Workers AI │ Your account │ Read  │")
-        click.echo("     └────────────────┴──────────────┴──────────┘")
+        click.echo("  4. Add these permissions (click '+ Add more' for each):")
         click.echo()
-        click.echo("  4. If using R2 backup, also add:")
-        click.echo("     │ Account │ R2    │ Your account │ Edit     │")
+        click.echo("     ┌───────────┬──────────────┬──────────────┬──────────┐")
+        click.echo("     │ Type      │ Permission   │ Resource     │ Access   │")
+        click.echo("     ├───────────┼──────────────┼──────────────┼──────────┤")
+        click.echo("     │ Account   │ D1           │ Your account │ Edit     │")
+        click.echo("     │ Account   │ Vectorize    │ Your account │ Edit     │")
+        click.echo("     │ Account   │ Workers AI   │ Your account │ Read     │")
+        click.echo("     └───────────┴──────────────┴──────────────┴──────────┘")
         click.echo()
-        click.echo("  5. Account Resources: select 'Include' → your account")
+        click.echo("  5. If you plan to use R2 backup, also add:")
+        click.echo("     │ Account   │ R2           │ Your account │ Edit     │")
         click.echo()
-        click.echo("  6. TTL: leave blank (no expiry) or set 1 year")
+        click.echo("  6. Account Resources: select 'Include' → your specific account")
+        click.echo("     (Do NOT select 'All accounts' — select YOUR account)")
         click.echo()
-        click.echo("  7. Click 'Continue to summary' → 'Create Token'")
+        click.echo("  7. TTL (expiry): leave blank for no expiry, or set 1 year")
         click.echo()
-        click.echo("  8. COPY the token now — it won't be shown again!")
-        click.echo("     Format: a long string like 'cfat_xxxx...' or similar")
+        click.echo("  8. Click 'Continue to summary' → review → 'Create Token'")
+        click.echo()
+        click.echo("  9. COPY the token string NOW — it will NOT be shown again!")
+        click.echo("     Format: a long string (may or may not start with 'cfat_')")
+        click.echo("     Paste it into the prompt below.")
         click.echo()
 
     def _step_backup_targets(self):
@@ -448,9 +481,24 @@ class SetupWizard:
             click.echo("     The config was written to: mcp.json")
             click.echo("     Restart Cursor to activate memory tools.")
         else:
-            click.echo("     No MCP client was configured.")
-            click.echo("     To add memory to your AI client manually:")
-            click.echo('     {"mcpServers":{"memory":{"command":"memory","args":["server"]}}}')
+            # No client configured — show how to add manually
+            detected = self._detect_mcp_clients()
+            if detected:
+                click.echo(f"     No MCP client configured (detected: {', '.join(detected)}).")
+                click.echo("     To add memory manually:")
+                for client in detected:
+                    if client == "claude-code":
+                        click.echo(f"       {client}: claude mcp add memory -- command memory server")
+                    elif client == "claude-desktop":
+                        click.echo(f"       {client}: add to claude_desktop_config.json:")
+                        click.echo('         {"mcpServers":{"memory":{"command":"memory","args":["server"]}}}')
+                    elif client == "cursor":
+                        click.echo(f"       {client}: add to mcp.json:")
+                        click.echo('         {"mcpServers":{"memory":{"command":"memory","args":["server"]}}}')
+            else:
+                click.echo("     No MCP client was configured.")
+                click.echo("     To add memory to your AI client manually:")
+                click.echo('     {"mcpServers":{"memory":{"command":"memory","args":["server"]}}}')
 
         click.echo("\n  4. Available MCP tools (after restart):")
         click.echo("     - memory_store: Save a memory")

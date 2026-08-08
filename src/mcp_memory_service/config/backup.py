@@ -38,6 +38,31 @@ logger.info(
 # =============================================================================
 
 # =============================================================================
+# Remote Backup Targets
+# =============================================================================
+# Each target is independently enabled. Credentials for R2 reuse
+# CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID from storage config.
+
+BACKUP_R2_ENABLED = safe_get_bool_env("MCP_BACKUP_R2_ENABLED", False)
+BACKUP_R2_BUCKET = os.getenv("MCP_BACKUP_R2_BUCKET", "mcp-memory-backup")
+
+BACKUP_GITHUB_ENABLED = safe_get_bool_env("MCP_BACKUP_GITHUB_ENABLED", False)
+BACKUP_GITHUB_REPO = os.getenv("MCP_BACKUP_GITHUB_REPO", "")
+BACKUP_GITHUB_BRANCH = os.getenv("MCP_BACKUP_GITHUB_BRANCH", "master")
+BACKUP_GITHUB_TOKEN = os.getenv("MCP_BACKUP_GITHUB_TOKEN", "")
+BACKUP_GITHUB_LOCAL_DIR = os.getenv("MCP_BACKUP_GITHUB_LOCAL_DIR", "")
+
+BACKUP_REMOTE_ON_STARTUP = safe_get_bool_env("MCP_BACKUP_REMOTE_ON_STARTUP", True)
+
+logger.info(
+    f"Remote backup targets: R2={BACKUP_R2_ENABLED}, GitHub={BACKUP_GITHUB_ENABLED}"
+)
+
+# =============================================================================
+# End Remote Backup Targets
+# =============================================================================
+
+# =============================================================================
 # Database Integrity Health Monitoring
 # =============================================================================
 # Periodic PRAGMA integrity_check to detect SQLite corruption early.

@@ -19,9 +19,13 @@ Provides scheduled database backups with configurable intervals and retention po
 """
 
 import asyncio
+import hashlib
+import json
 import logging
+import os
 import shutil
 import sqlite3
+import subprocess
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -29,10 +33,20 @@ from typing import Any
 
 from ..config import (
     BACKUP_ENABLED,
+    BACKUP_GITHUB_BRANCH,
+    BACKUP_GITHUB_ENABLED,
+    BACKUP_GITHUB_LOCAL_DIR,
+    BACKUP_GITHUB_REPO,
+    BACKUP_GITHUB_TOKEN,
     BACKUP_INTERVAL,
     BACKUP_MAX_COUNT,
+    BACKUP_R2_BUCKET,
+    BACKUP_R2_ENABLED,
+    BACKUP_REMOTE_ON_STARTUP,
     BACKUP_RETENTION,
     BACKUPS_PATH,
+    CLOUDFLARE_ACCOUNT_ID,
+    CLOUDFLARE_API_TOKEN,
     SQLITE_VEC_PATH,
 )
 
@@ -75,6 +89,221 @@ class BackupService:
             # Get most recent backup time
             latest = backups[0]
             self.last_backup_time = latest.get("created_timestamp", 0)
+
+    def _get_memory_count(self) -> int:
+        """Get memory count from the database."""
+        if not self.db_path or not self.db_path.exists():
+            return 0
+        try:
+            conn = sqlite3.connect(str(self.db_path))
+            count = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+            conn.close()
+            return count
+        except Exception:
+            return 0
+
+    async def _check_integrity(self) -> bool:
+        """Run PRAGMA integrity_check on the database.
+
+        Blue Team C-2 mitigation: prevents pushing corrupted DB to remote targets.
+        """
+        if not self.db_path or not self.db_path.exists():
+            return False
+        try:
+            def _check():
+                conn = sqlite3.connect(str(self.db_path))
+                result = conn.execute("PRAGMA integrity_check").fetchone()[0]
+                conn.close()
+                return result
+            result = await asyncio.to_thread(_check)
+            if result != "ok":
+                logger.error(f"Database integrity check FAILED: {result}")
+                return False
+            logger.debug("Database integrity check passed")
+            return True
+        except Exception as e:
+            logger.error(f"Database integrity check error: {e}")
+            return False
+
+    async def _push_to_r2(self, backup_path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+        """Push backup file to Cloudflare R2.
+
+        Best-effort: returns error dict on failure, never raises.
+        """
+        if not BACKUP_R2_ENABLED:
+            return {"success": True, "skipped": True, "target": "r2"}
+
+        if not CLOUDFLARE_API_TOKEN or not CLOUDFLARE_ACCOUNT_ID:
+            logger.warning("R2 backup enabled but CLOUDFLARE credentials not set")
+            return {"success": False, "error": "Cloudflare credentials not configured", "target": "r2"}
+
+        try:
+            import httpx
+
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            object_key = f"backups/sqlite_vec_{timestamp}.db"
+            url = (
+                f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}"
+                f"/r2/buckets/{BACKUP_R2_BUCKET}/objects/{object_key}"
+            )
+
+            data = await asyncio.to_thread(lambda: backup_path.read_bytes())
+
+            async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
+                response = await client.put(
+                    url,
+                    content=data,
+                    headers={
+                        "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
+                        "Content-Type": "application/octet-stream",
+                    },
+                )
+                response.raise_for_status()
+                result = response.json()
+                if not result.get("success"):
+                    return {"success": False, "error": f"R2 API error: {result}", "target": "r2"}
+
+            file_sha256 = hashlib.sha256(data).hexdigest()
+            logger.info(f"R2 backup uploaded: {object_key} ({len(data)} bytes)")
+
+            return {
+                "success": True,
+                "target": "r2",
+                "object_key": object_key,
+                "size_bytes": len(data),
+                "sha256": file_sha256,
+            }
+        except Exception as e:
+            logger.error(f"R2 backup failed: {e}")
+            return {"success": False, "error": str(e), "target": "r2"}
+
+    async def _push_to_github(self, backup_path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+        """Push backup file + manifest to GitHub repo via git CLI.
+
+        Best-effort: returns error dict on failure, never raises.
+        """
+        if not BACKUP_GITHUB_ENABLED:
+            return {"success": True, "skipped": True, "target": "github"}
+
+        if not BACKUP_GITHUB_REPO:
+            logger.warning("GitHub backup enabled but MCP_BACKUP_GITHUB_REPO not set")
+            return {"success": False, "error": "GitHub repo not configured", "target": "github"}
+
+        try:
+            import tempfile
+
+            repo_dir = BACKUP_GITHUB_LOCAL_DIR
+            if not repo_dir:
+                repo_dir = str(Path(tempfile.gettempdir()) / "mcp-memory-backup-repo")
+            repo_dir = Path(repo_dir)
+
+            def _git_init_or_pull():
+                repo_dir.mkdir(parents=True, exist_ok=True)
+                if not (repo_dir / ".git").exists():
+                    token_url = (
+                        f"https://x-access-token:{BACKUP_GITHUB_TOKEN}"
+                        f"@github.com/{BACKUP_GITHUB_REPO}.git"
+                    )
+                    subprocess.run(
+                        ["git", "clone", token_url, str(repo_dir)],
+                        capture_output=True, text=True, timeout=120,
+                    )
+                else:
+                    subprocess.run(
+                        ["git", "pull", "--rebase"],
+                        cwd=str(repo_dir), capture_output=True, text=True, timeout=60,
+                    )
+                (repo_dir / "data").mkdir(exist_ok=True)
+
+            await asyncio.to_thread(_git_init_or_pull)
+
+            dest_db = repo_dir / "data" / "sqlite_vec.db"
+            await asyncio.to_thread(shutil.copy2, str(backup_path), str(dest_db))
+
+            manifest_path = repo_dir / "data" / "backup_manifest.json"
+            manifest_content = json.dumps(manifest, indent=2)
+            tmp_manifest = manifest_path.with_suffix(".tmp")
+            tmp_manifest.write_text(manifest_content, encoding="utf-8")
+            os.replace(str(tmp_manifest), str(manifest_path))
+
+            def _git_commit_push():
+                subprocess.run(
+                    ["git", "add", "data/"],
+                    cwd=str(repo_dir), capture_output=True, text=True,
+                )
+                diff_result = subprocess.run(
+                    ["git", "diff", "--cached", "--quiet"],
+                    cwd=str(repo_dir), capture_output=True,
+                )
+                if diff_result.returncode == 0:
+                    return "no_changes"
+
+                commit_msg = (
+                    f"backup: {manifest.get('memory_count', '?')} memories, "
+                    f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC"
+                )
+                subprocess.run(
+                    ["git", "commit", "-m", commit_msg],
+                    cwd=str(repo_dir), capture_output=True, text=True,
+                )
+
+                token_url = (
+                    f"https://x-access-token:{BACKUP_GITHUB_TOKEN}"
+                    f"@github.com/{BACKUP_GITHUB_REPO}.git"
+                )
+                push_result = subprocess.run(
+                    ["git", "push", token_url, BACKUP_GITHUB_BRANCH],
+                    cwd=str(repo_dir), capture_output=True, text=True, timeout=120,
+                )
+                if push_result.returncode != 0:
+                    raise RuntimeError(f"Git push failed: {push_result.stderr}")
+                return "pushed"
+
+            push_status = await asyncio.to_thread(_git_commit_push)
+
+            file_sha256 = hashlib.sha256(dest_db.read_bytes()).hexdigest()
+            logger.info(f"GitHub backup {push_status}: {BACKUP_GITHUB_REPO}")
+
+            return {
+                "success": True,
+                "target": "github",
+                "status": push_status,
+                "sha256": file_sha256,
+            }
+        except Exception as e:
+            logger.error(f"GitHub backup failed: {e}")
+            return {"success": False, "error": str(e), "target": "github"}
+
+    async def _push_to_remote(self, backup_path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+        """Push backup to all enabled remote targets.
+
+        Blue Team C-2 mitigation: runs integrity check before pushing.
+        If integrity check fails, aborts remote push to prevent corruption propagation.
+        """
+        results: dict[str, Any] = {"r2": None, "github": None}
+
+        if not await self._check_integrity():
+            logger.error(
+                "Database integrity check failed — aborting remote backup "
+                "to prevent corruption spread"
+            )
+            results["r2"] = {"success": False, "error": "integrity_check_failed", "target": "r2"}
+            results["github"] = {"success": False, "error": "integrity_check_failed", "target": "github"}
+            return results
+
+        manifest["file_sha256"] = hashlib.sha256(
+            await asyncio.to_thread(lambda: backup_path.read_bytes())
+        ).hexdigest()
+        manifest["db_size_bytes"] = backup_path.stat().st_size
+
+        results["r2"] = await self._push_to_r2(backup_path, manifest)
+        results["github"] = await self._push_to_github(backup_path, manifest)
+
+        r2_status = "OK" if results["r2"]["success"] else "FAIL"
+        gh_status = "OK" if results["github"]["success"] else "FAIL"
+        logger.info(f"Remote backup: R2={r2_status}, GitHub={gh_status}")
+
+        return results
 
     def _generate_backup_filename(self) -> str:
         """Generate a timestamped backup filename."""
@@ -136,6 +365,15 @@ class BackupService:
                 # Cleanup old backups (outside of duration calculation)
                 await self.cleanup_old_backups()
 
+                # Push to remote targets (R2, GitHub) if enabled
+                manifest = {
+                    "timestamp": created_at.isoformat(),
+                    "memory_count": self._get_memory_count(),
+                    "db_size_bytes": backup_size,
+                    "filename": backup_filename,
+                }
+                remote_results = await self._push_to_remote(backup_path, manifest)
+
                 return {
                     "success": True,
                     "filename": backup_filename,
@@ -144,6 +382,7 @@ class BackupService:
                     "description": description,
                     "created_at": created_at.isoformat(),
                     "duration_seconds": round(backup_duration, 3),
+                    "remote": remote_results,
                 }
 
             except Exception as e:
@@ -331,6 +570,17 @@ class BackupService:
             "next_backup_at": next_backup.isoformat() if next_backup else None,
             "backups_dir": str(self.backups_dir),
             "db_path": str(self.db_path) if self.db_path else None,
+            "remote_targets": {
+                "r2": {
+                    "enabled": BACKUP_R2_ENABLED,
+                    "bucket": BACKUP_R2_BUCKET if BACKUP_R2_ENABLED else None,
+                },
+                "github": {
+                    "enabled": BACKUP_GITHUB_ENABLED,
+                    "repo": BACKUP_GITHUB_REPO if BACKUP_GITHUB_ENABLED else None,
+                    "branch": BACKUP_GITHUB_BRANCH if BACKUP_GITHUB_ENABLED else None,
+                },
+            },
         }
 
     def _calculate_next_backup_time(self) -> datetime | None:

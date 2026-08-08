@@ -140,6 +140,38 @@ async def trigger_backup(user: AuthenticationResult = Depends(require_write_acce
         raise HTTPException(status_code=500, detail=f"Failed to create backup: {e!s}")
 
 
+@router.post("/backup/push-remote")
+async def push_remote_backup(
+    user: AuthenticationResult = Depends(require_write_access),
+):
+    """
+    Manually trigger a backup with remote push (R2 + GitHub).
+
+    Creates a local backup and pushes to all enabled remote targets.
+    """
+    try:
+        from mcp_memory_service.backup.scheduler import get_backup_service
+
+        backup_service = get_backup_service()
+        result = await backup_service.create_backup(description="Manual remote push")
+
+        if result.get("success"):
+            return {
+                "success": True,
+                "filename": result.get("filename"),
+                "size_bytes": result.get("size_bytes"),
+                "created_at": result.get("created_at"),
+                "remote": result.get("remote", {}),
+            }
+        else:
+            return {
+                "success": False,
+                "error": result.get("error", "Unknown error"),
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to push remote backup: {e!s}")
+
+
 @router.get("/backup/list", response_model=BackupListResponse)
 async def list_backups(user: AuthenticationResult = Depends(require_read_access)):
     """

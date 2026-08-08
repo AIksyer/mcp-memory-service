@@ -272,6 +272,8 @@ class SetupWizard:
             click.echo("     Claude Code is configured with 'memory' MCP server.")
             click.echo("     The config was written to: ~/.claude/settings.json")
             click.echo("     Restart Claude Code to activate memory tools.")
+            click.echo("     Or run this command in a separate terminal to activate now:")
+            click.echo("       claude mcp add memory -- command memory server")
         elif self.config.mcp_client == "claude-desktop":
             click.echo("     Claude Desktop is configured with 'memory' MCP server.")
             click.echo("     The config was written to: claude_desktop_config.json")

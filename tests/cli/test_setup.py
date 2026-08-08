@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import click
 from click.testing import CliRunner
 
 # Add src to path
@@ -97,6 +98,19 @@ class TestEnvGeneration:
         assert "journal_mode" in content
         assert "WAL" in content
 
+    def test_sqlite_pragmas_format(self):
+        """SQLite pragmas use key=value,key=value format, not JSON."""
+        wizard = SetupWizard()
+        content = wizard._generate_env_content()
+        pragmas_line = [
+            line for line in content.splitlines()
+            if line.startswith("MCP_MEMORY_SQLITE_PRAGMAS")
+        ][0]
+        assert "journal_mode=WAL" in pragmas_line
+        assert "synchronous=NORMAL" in pragmas_line
+        assert "{" not in pragmas_line
+        assert "}" not in pragmas_line
+
 
 class TestNonInteractive:
     """Tests for non-interactive mode."""
@@ -128,6 +142,54 @@ class TestNonInteractive:
         wizard._find_env_path = lambda: tmp_path / ".env"
         wizard.run_non_interactive(backend=None, cf_token=None)
         assert wizard.config.storage_backend == "sqlite_vec"
+
+
+class TestEnvMerge:
+    """Tests for .env merge and backup behaviour."""
+
+    def test_merge_preserves_existing_env(self, tmp_path):
+        """Re-running setup preserves unknown keys and managed keys with empty wizard values."""
+        env_path = tmp_path / ".env"
+        env_path.write_text(
+            "CLOUDFLARE_API_TOKEN=real-token\n"
+            "MCP_ALLOW_ANONYMOUS_ACCESS=true\n"
+        )
+        config = SetupConfig(storage_backend="sqlite_vec")
+        wizard = SetupWizard(config)
+        wizard._find_env_path = lambda: env_path
+        wizard.run_non_interactive()
+        content = env_path.read_text()
+        assert "CLOUDFLARE_API_TOKEN=real-token" in content
+        assert "MCP_ALLOW_ANONYMOUS_ACCESS=true" in content
+
+    def test_backup_created(self, tmp_path):
+        """Running setup on an existing .env creates a .env.bak backup."""
+        env_path = tmp_path / ".env"
+        original_content = "EXISTING_KEY=existing_value\n"
+        env_path.write_text(original_content)
+        wizard = SetupWizard(SetupConfig(storage_backend="sqlite_vec"))
+        wizard._find_env_path = lambda: env_path
+        wizard.run_non_interactive()
+        backup_path = tmp_path / ".env.bak"
+        assert backup_path.exists()
+        assert backup_path.read_text() == original_content
+
+    def test_non_interactive_hybrid_without_cf_token_fails(self, tmp_path):
+        """Non-interactive hybrid setup without CF token and no existing .env fails."""
+        wizard = SetupWizard(SetupConfig(storage_backend="hybrid"))
+        wizard._find_env_path = lambda: tmp_path / ".env"
+        with pytest.raises(click.ClickException):
+            wizard.run_non_interactive()
+
+    def test_non_interactive_hybrid_preserves_existing_cf_token(self, tmp_path):
+        """Non-interactive hybrid setup preserves existing CF token from .env."""
+        env_path = tmp_path / ".env"
+        env_path.write_text("CLOUDFLARE_API_TOKEN=existing\n")
+        wizard = SetupWizard(SetupConfig(storage_backend="hybrid"))
+        wizard._find_env_path = lambda: env_path
+        wizard.run_non_interactive()
+        content = env_path.read_text()
+        assert "CLOUDFLARE_API_TOKEN=existing" in content
 
 
 class TestAtomicWrite:

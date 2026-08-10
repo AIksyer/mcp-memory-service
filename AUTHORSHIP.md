@@ -15,11 +15,35 @@ changes are reviewed before they reach `main`.
 - The project has **external contributors** and an active review process;
   contributions are evaluated on their merits and reviewed by the maintainer.
 
+## Fork contributions
+
+This repository is a fork of [doobidoo/mcp-memory-service](https://codeberg.org/doobidoo/mcp-memory-service)
+maintained by **AIksyer** (`@AIksyer` on GitHub). The fork adds the following
+features on top of the upstream project:
+
+- **HA deployment**: multi-backend deployment (Render, Railway, FastAPI Cloud)
+  with Cloudflare Worker load balancer and authentication gateway.
+- **Backup system v1–v4**: R2/GitHub remote backup, staging restore,
+  storage-pressure-triggered cleanup, backup quarantine, sync_version-based
+  conflict detection and resolution.
+- **Bidirectional sync reconcile**: full hash-set reconciliation between local
+  SQLite and Cloudflare D1, replacing incremental-only sync.
+- **Setup wizard**: interactive `memory setup` CLI for deployment-friendly
+  configuration.
+- **Streamable HTTP transport**: standard MCP Streamable HTTP for Codely CLI
+  compatibility.
+
+All modifications are released under the same **Apache License 2.0** as the
+upstream project. Original copyright notices are preserved in all files;
+modified files retain `# Copyright 2024 Heinrich Krupp` with an added
+`# Modifications Copyright 2026 AIksyer` line.
+
 ## Copyright and licensing
 
 - The project is licensed under the **Apache License 2.0** (see [`LICENSE`](LICENSE)).
 - Copyright is held by the author, Heinrich Krupp, and by contributors for their
   respective contributions.
+- Fork modifications are Copyright 2026 AIksyer, under the same Apache 2.0 license.
 - Contributions are accepted under the terms of the project license
   (see [`CONTRIBUTING.md`](CONTRIBUTING.md)). Contributors are expected to have
   the right to license the code they submit.
@@ -48,3 +72,5 @@ specifically to catch insecure or harmful code:
 
 An original, human-authored and human-reviewed open-source project with clear
 Apache-2.0 licensing and layered automated safeguards against harmful code.
+Fork modifications by AIksyer are released under the same license with
+preserved upstream attribution.

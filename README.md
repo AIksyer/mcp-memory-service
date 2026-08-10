@@ -536,6 +536,7 @@ MCP Memory Service is **fully compatible** with the [SHODH Unified Memory API Sp
 - **[Knowledge Graph Dashboard](docs/features/knowledge-graph-dashboard.md)** – Interactive graph visualization guide
 - **[Memory Type Ontology](docs/memory-ontology.md)** – Built-in taxonomy and `MCP_CUSTOM_MEMORY_TYPES` env var
 - **[Migration Guide](docs/MIGRATION.md)** – Upgrading between major versions (v9+ migrations run automatically on restart)
+- **[Backup System](docs/backup-system.md)** – R2 backup, restore, quarantine, sync version, conflict detection (fork)
 - **[Troubleshooting](docs/troubleshooting/)** – Common issues and solutions
 - **[Technical Video Demo (2 min)](https://www.youtube.com/watch?v=veJME5qVu-A)** – Performance, architecture, AI/ML intelligence
 - **[API Reference](https://codeberg.org/doobidoo/mcp-memory-service/wiki)** – Programmatic usage

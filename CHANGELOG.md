@@ -10,6 +10,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added — Backup System (v3 + v4)
+
+- **R2 staging restore** (`POST /api/backup/restore`): restore database from R2 backup via staging with integrity check, schema_version compatibility, and pre-restore backup. Does NOT auto-reconcile to prevent deleted-memory resurrection.
+- **R2 backup listing** (`GET /api/backup/r2/list`): list available R2 backup objects.
+- **Storage-pressure-triggered cleanup**: R2 backups are only deleted when bucket usage exceeds `MCP_BACKUP_R2_STORAGE_PRESSURE_THRESHOLD` (default 8GB), replacing time-based retention.
+- **Backup conflicts table** (migration 013): `backup_conflicts` table for auditing sync version divergence.
+- **Sync version tracking** (migration 014 + Memory dataclass): `sync_version` column (INTEGER, default 1) incremented on every write; `device_id` column (TEXT) identifies which device wrote the memory.
+- **Sync-version-based reconcile**: `_reconcile_drift_in_both()` now compares `sync_version` first (higher wins, no tolerance), falling back to `updated_at` when equal or one side is pre-v4 (sync_version=0).
+- **Conflict detection**: when sync_version diverges between local and cloud, a conflict row is inserted into `backup_conflicts` (deduped by content_hash). Queryable via `GET /api/backup/conflicts`, resolvable via `POST /api/backup/conflicts/resolve`.
+- **Backup quarantine**: new R2 uploads go to `pending/` prefix, promoted to `backups/` after `MCP_BACKUP_R2_QUARANTINE_HOURS` (default 24h) with HTTP success verification.
+- **Device ID config**: `MCP_DEVICE_ID` env var (UUID fallback) for multi-device sync tracking.
+
 ## [11.5.5] - 2026-07-24
 
 PATCH release: standard Docker image now ships tokenizers so the ONNX embedding backend actually loads. Special thanks to @peanutlasko and @stanthewizzard for the reports.

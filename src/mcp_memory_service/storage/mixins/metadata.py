@@ -155,7 +155,8 @@ class MetadataMixin:
                     UPDATE memories SET
                         tags = ?, memory_type = ?, metadata = ?,
                         updated_at = ?, updated_at_iso = ?,
-                        created_at = ?, created_at_iso = ?
+                        created_at = ?, created_at_iso = ?,
+                        sync_version = sync_version + 1
                     WHERE content_hash = ? AND deleted_at IS NULL
                 """,
                     (
@@ -284,7 +285,8 @@ class MetadataMixin:
                             """
                             UPDATE memories SET
                                 tags = ?, memory_type = ?, metadata = ?,
-                                updated_at = ?, updated_at_iso = ?
+                                updated_at = ?, updated_at_iso = ?,
+                                sync_version = sync_version + 1
                             WHERE content_hash = ? AND deleted_at IS NULL
                         """,
                             (

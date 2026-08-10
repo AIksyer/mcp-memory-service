@@ -2,6 +2,7 @@
 
 import logging
 import os
+import uuid
 
 from .base import safe_get_bool_env, safe_get_int_env
 
@@ -58,6 +59,12 @@ BACKUP_R2_STORAGE_PRESSURE_THRESHOLD = safe_get_int_env(
     "MCP_BACKUP_R2_STORAGE_PRESSURE_THRESHOLD", 8, min_value=1, max_value=10
 )
 
+# R2 backup quarantine (v4): new backups go to pending/ prefix, promoted to backups/
+# after this many hours. Ensures backups are stable before being available for restore.
+BACKUP_R2_QUARANTINE_HOURS = safe_get_int_env(
+    "MCP_BACKUP_R2_QUARANTINE_HOURS", 24, min_value=1, max_value=168
+)
+
 BACKUP_GITHUB_ENABLED = safe_get_bool_env("MCP_BACKUP_GITHUB_ENABLED", False)
 BACKUP_GITHUB_REPO = os.getenv("MCP_BACKUP_GITHUB_REPO", "")
 BACKUP_GITHUB_BRANCH = os.getenv("MCP_BACKUP_GITHUB_BRANCH", "master")
@@ -66,8 +73,14 @@ BACKUP_GITHUB_LOCAL_DIR = os.getenv("MCP_BACKUP_GITHUB_LOCAL_DIR", "")
 
 BACKUP_REMOTE_ON_STARTUP = safe_get_bool_env("MCP_BACKUP_REMOTE_ON_STARTUP", True)
 
+# Device identifier (v4): used in sync_version tracking and backup manifests.
+# Set MCP_DEVICE_ID in .env for persistence across restarts.
+# Falls back to a short UUID generated per process if not set.
+DEVICE_ID = os.getenv("MCP_DEVICE_ID") or str(uuid.uuid4())[:8]
+
 logger.info(
-    f"Remote backup targets: R2={BACKUP_R2_ENABLED}, GitHub={BACKUP_GITHUB_ENABLED}"
+    f"Remote backup targets: R2={BACKUP_R2_ENABLED}, GitHub={BACKUP_GITHUB_ENABLED}, "
+    f"device_id={DEVICE_ID}"
 )
 
 # =============================================================================

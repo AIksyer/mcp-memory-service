@@ -400,6 +400,18 @@ class CloudflareStorage(MemoryStorage):
                     "Migration needed: Adding 'deleted_at' column to memories table"
                 )
 
+            # v4: Check for sync_version and device_id columns
+            if "sync_version" not in columns:
+                migrations_needed.append("sync_version")
+                logger.info(
+                    "Migration needed: Adding 'sync_version' column to memories table"
+                )
+            if "device_id" not in columns:
+                migrations_needed.append("device_id")
+                logger.info(
+                    "Migration needed: Adding 'device_id' column to memories table"
+                )
+
             if not migrations_needed:
                 logger.debug(
                     "Schema migration check: All columns present, no migration needed"
@@ -453,6 +465,8 @@ class CloudflareStorage(MemoryStorage):
         column_spec = {
             "tags": "ALTER TABLE memories ADD COLUMN tags TEXT",
             "deleted_at": "ALTER TABLE memories ADD COLUMN deleted_at REAL DEFAULT NULL",
+            "sync_version": "ALTER TABLE memories ADD COLUMN sync_version INTEGER NOT NULL DEFAULT 1",
+            "device_id": "ALTER TABLE memories ADD COLUMN device_id TEXT",
         }
 
         if column not in column_spec:
@@ -1078,6 +1092,8 @@ class CloudflareStorage(MemoryStorage):
                 created_at_iso=row.get("created_at_iso"),
                 updated_at=row.get("updated_at"),
                 updated_at_iso=row.get("updated_at_iso"),
+                sync_version=row.get("sync_version", 1),
+                device_id=row.get("device_id"),
             )
 
             return memory
@@ -1214,6 +1230,8 @@ class CloudflareStorage(MemoryStorage):
                 created_at_iso=row.get("created_at_iso"),
                 updated_at=row.get("updated_at"),
                 updated_at_iso=row.get("updated_at_iso"),
+                sync_version=row.get("sync_version", 1),
+                device_id=row.get("device_id"),
             )
 
             return memory

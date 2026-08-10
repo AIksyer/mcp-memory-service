@@ -550,7 +550,8 @@ class RetrieveMixin:
                 cursor = self.conn.execute(
                     """
                     SELECT content_hash, content, tags, memory_type, metadata,
-                           created_at, updated_at, created_at_iso, updated_at_iso
+                           created_at, updated_at, created_at_iso, updated_at_iso,
+                           sync_version, device_id
                     FROM memories WHERE content_hash = ? AND deleted_at IS NULL
                 """,
                     (content_hash,),
@@ -562,7 +563,9 @@ class RetrieveMixin:
                 return None
 
             content_hash_val, content, tags_str, memory_type, metadata_str = row[:5]
-            created_at, updated_at, created_at_iso, updated_at_iso = row[5:]
+            created_at, updated_at, created_at_iso, updated_at_iso = row[5:9]
+            sync_version = row[9] if len(row) > 9 else 1
+            device_id = row[10] if len(row) > 10 else None
 
             tags_list = (
                 [tag.strip() for tag in tags_str.split(",") if tag.strip()]
@@ -581,6 +584,8 @@ class RetrieveMixin:
                 updated_at=updated_at,
                 created_at_iso=created_at_iso,
                 updated_at_iso=updated_at_iso,
+                sync_version=sync_version,
+                device_id=device_id,
             )
 
             return memory

@@ -160,6 +160,9 @@ asyncio.run(main())
 🏠 **本地质量评分** – 支持任意 OpenAI 兼容端点（Ollama、LiteLLM、vLLM）
 🔗 **实体提取** – 自动链接 @提及、#标签、URL 和文件路径
 💡 **洞察卡片** – 自动检测记忆库中的模式、趋势和知识盲区
+💾 **R2 备份恢复** – 从 Cloudflare R2 经 staging 恢复，含完整性校验
+🔄 **同步版本治理** – `sync_version` 递增 + 冲突检测 + 多设备 `device_id`
+⏳ **备份隔离** – 新备份 24h 隔离期后才可用于恢复
 
 ---
 
@@ -189,6 +192,62 @@ asyncio.run(main())
 ```bash
 curl -X POST http://127.0.0.1:8000/api/backup/push-remote
 ```
+
+### R2 备份恢复（v3）
+
+从 R2 恢复数据库到本地，经过 staging 验证：
+```bash
+# 从最新的 R2 备份恢复
+curl -X POST http://127.0.0.1:8000/api/backup/restore \
+  -H "X-API-Key: $KEY"
+
+# 从指定备份恢复
+curl -X POST "http://127.0.0.1:8000/api/backup/restore?object_key=backups/sqlite_vec_20260810.db" \
+  -H "X-API-Key: $KEY"
+```
+
+恢复流程：R2 下载 → staging 完整性检查 → schema 版本兼容性检查 → 备份当前 DB → 替换。
+**恢复后不会自动同步 D1**（防止已删除记忆复活）。
+
+### 存储压力清理（v3）
+
+R2 旧备份仅在存储用量超过阈值时才删除（默认 8GB），而非基于时间自动清理：
+```bash
+# 自定义阈值（GB）
+MCP_BACKUP_R2_STORAGE_PRESSURE_THRESHOLD=8
+```
+
+### 同步版本治理（v4）
+
+每次写入自动递增 `sync_version`，用于多设备冲突检测：
+
+- `store()` 设置 `sync_version=1`
+- `update_memory_metadata()` 递增 `sync_version+1`
+- `device_id` 标识写入来源设备（`MCP_DEVICE_ID` 环境变量）
+
+双向对账时，`sync_version` 高的一方胜出（无需容差检查），相等时回退到 `updated_at`。
+
+### 冲突检测与解决（v4）
+
+当本地和云端 `sync_version` 不一致时，自动记录到 `backup_conflicts` 表：
+```bash
+# 查看未解决冲突
+curl -H "X-API-Key: $KEY" http://localhost:8000/api/backup/conflicts
+
+# 标记冲突已解决
+curl -X POST "http://localhost:8000/api/backup/conflicts/resolve?conflict_id=1&resolution=manual" \
+  -H "X-API-Key: $KEY"
+```
+
+### 备份隔离（v4）
+
+新 R2 备份先上传到 `pending/` 前缀，经过隔离期（默认 24 小时）后才提升为 `backups/`：
+```bash
+# 自定义隔离时间（小时）
+MCP_BACKUP_R2_QUARANTINE_HOURS=24
+```
+
+> 📖 完整备份系统文档见 [docs/backup-system.md](docs/backup-system.md)
 
 ---
 
@@ -261,6 +320,7 @@ export MCP_EMBEDDING_MODEL=paraphrase-multilingual-MiniLM-L12-v2
 - **[安装指南](docs/setup-guide.md)** – 决策树 + 所有场景的分步指南
 - **[配置指南](docs/mastery/configuration-guide.md)** – 后端选项和自定义配置
 - **[架构概述](docs/architecture.md)** – 底层工作原理
+- **[备份系统](docs/backup-system.md)** – R2 备份、恢复、隔离、同步版本、冲突检测（二开）
 - **[远程 MCP 设置](docs/remote-mcp-setup.md)** – 浏览器集成 via HTTPS + OAuth
 - **[知识图谱面板](docs/features/knowledge-graph-dashboard.md)** – 交互式图谱可视化
 - **[故障排除](docs/troubleshooting/)** – 常见问题和解决方案

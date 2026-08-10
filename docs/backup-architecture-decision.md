@@ -113,3 +113,29 @@ FastAPI Cloud 部署    | HA 子节点（后端）   | 中风险     | FastAPI C
 6. **是否有遗漏的灾难场景？**
 
 请给出具体的改进建议和风险评估。
+
+---
+
+## ChatGPT Architecture Review (2026-08-10)
+
+**Score: 8.5/10 architecture, 7/10 data safety, 7/10 disaster recovery**
+
+### Key Corrections (adopted in v2)
+
+1. **GitHub = Audit Copy, not DB storage** — Git is unsuitable for binary files. GitHub stores only manifest + checksum.txt.
+2. **R2 = Primary Backup Authority** — Full DB snapshots with history retention (7 daily + 4 weekly + 3 monthly).
+3. **Enhanced manifest** — Includes `schema_version`, `device_id`, `backup_type` for version governance.
+4. **R2 history retention** — Not just latest-overwrite; preserves historical snapshots for point-in-time recovery.
+5. **HA nodes stay stateless** — Confirmed correct. Render/Railway/FastAPI don't backup independently.
+
+### Deferred to v3
+
+- `sync_version` field + conflict table (requires DB schema migration)
+- Automated restore via staging (R2 → staging → validate → primary → reconcile → D1)
+- Backup quarantine (pending → verified after 24h)
+- Credential rotation procedure
+
+### Final Decision
+
+v2 implements: R2/GitHub role split, history retention, enhanced manifest.
+v3 will address: sync_version, automated restore, quarantine.

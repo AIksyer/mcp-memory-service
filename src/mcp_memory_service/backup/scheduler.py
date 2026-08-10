@@ -42,6 +42,9 @@ from ..config import (
     BACKUP_MAX_COUNT,
     BACKUP_R2_BUCKET,
     BACKUP_R2_ENABLED,
+    BACKUP_R2_RETENTION_DAILY,
+    BACKUP_R2_RETENTION_MONTHLY,
+    BACKUP_R2_RETENTION_WEEKLY,
     BACKUP_REMOTE_ON_STARTUP,
     BACKUP_RETENTION,
     BACKUPS_PATH,
@@ -166,6 +169,9 @@ class BackupService:
             file_sha256 = hashlib.sha256(data).hexdigest()
             logger.info(f"R2 backup uploaded: {object_key} ({len(data)} bytes)")
 
+            # Clean up old R2 backups after successful upload
+            await self._r2_cleanup_old_backups()
+
             return {
                 "success": True,
                 "target": "r2",
@@ -177,9 +183,105 @@ class BackupService:
             logger.error(f"R2 backup failed: {e}")
             return {"success": False, "error": str(e), "target": "r2"}
 
-    async def _push_to_github(self, backup_path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
-        """Push backup file + manifest to GitHub repo via git CLI.
+    async def _r2_list_objects(self) -> list[dict[str, Any]]:
+        """List all backup objects in R2 bucket."""
+        if not BACKUP_R2_ENABLED or not CLOUDFLARE_API_TOKEN:
+            return []
+        try:
+            import httpx
+            url = (
+                f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}"
+                f"/r2/buckets/{BACKUP_R2_BUCKET}/objects"
+            )
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.get(
+                    url, headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"}
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                return data.get("result", [])
+        except Exception as e:
+            logger.warning(f"R2 list objects failed: {e}")
+            return []
 
+    async def _r2_delete_object(self, key: str) -> bool:
+        """Delete an object from R2 bucket."""
+        try:
+            import httpx
+            url = (
+                f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}"
+                f"/r2/buckets/{BACKUP_R2_BUCKET}/objects/{key}"
+            )
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.delete(
+                    url, headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"}
+                )
+                resp.raise_for_status()
+                return True
+        except Exception as e:
+            logger.warning(f"R2 delete {key} failed: {e}")
+            return False
+
+    async def _r2_cleanup_old_backups(self) -> dict[str, Any]:
+        """Clean up old R2 backups based on retention policy.
+
+        Keeps: N daily + M weekly + K monthly snapshots.
+        """
+        objects = await self._r2_list_objects()
+        if not objects:
+            return {"deleted_count": 0, "kept_count": 0}
+
+        now = datetime.now(timezone.utc)
+        daily_cutoff = now - timedelta(days=BACKUP_R2_RETENTION_DAILY)
+        monthly_window = now - timedelta(days=BACKUP_R2_RETENTION_MONTHLY * 30)
+        max_window = now - timedelta(days=90)
+
+        to_delete = []
+        kept = []
+
+        for obj in objects:
+            key = obj.get("key", "")
+            lm_str = obj.get("last_modified", "")
+            try:
+                lm = datetime.fromisoformat(lm_str.replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                continue
+
+            # Keep everything within daily retention window
+            if lm >= daily_cutoff:
+                kept.append(obj)
+                continue
+
+            # Keep weekly snapshots within monthly window (~every 7 days)
+            if lm >= monthly_window:
+                days_old = (now - lm).days
+                if days_old % 7 < 1:
+                    kept.append(obj)
+                    continue
+
+            # Keep monthly snapshots within 90-day window (~every 30 days)
+            if lm >= max_window:
+                days_old = (now - lm).days
+                if days_old % 30 < 1:
+                    kept.append(obj)
+                    continue
+
+            to_delete.append(key)
+
+        deleted = 0
+        for key in to_delete:
+            if await self._r2_delete_object(key):
+                deleted += 1
+                logger.info(f"R2 cleanup: deleted {key}")
+
+        logger.info(f"R2 cleanup: {deleted} deleted, {len(kept)} kept")
+        return {"deleted_count": deleted, "kept_count": len(kept)}
+
+    async def _push_to_github(self, backup_path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+        """Push backup manifest + checksum to GitHub repo (audit copy, no DB file).
+
+        GitHub stores only metadata for verification, not the binary DB.
+        R2 is the primary backup authority for full DB snapshots.
         Best-effort: returns error dict on failure, never raises.
         """
         if not BACKUP_GITHUB_ENABLED:
@@ -217,14 +319,19 @@ class BackupService:
 
             await asyncio.to_thread(_git_init_or_pull)
 
-            dest_db = repo_dir / "data" / "sqlite_vec.db"
-            await asyncio.to_thread(shutil.copy2, str(backup_path), str(dest_db))
-
+            # Write manifest only (no DB file — GitHub is audit copy)
             manifest_path = repo_dir / "data" / "backup_manifest.json"
             manifest_content = json.dumps(manifest, indent=2)
             tmp_manifest = manifest_path.with_suffix(".tmp")
             tmp_manifest.write_text(manifest_content, encoding="utf-8")
             os.replace(str(tmp_manifest), str(manifest_path))
+
+            # Write checksum file
+            sha = manifest.get("file_sha256", "")
+            checksum_path = repo_dir / "data" / "checksum.txt"
+            tmp_checksum = checksum_path.with_suffix(".tmp")
+            tmp_checksum.write_text(f"{sha}\n", encoding="utf-8")
+            os.replace(str(tmp_checksum), str(checksum_path))
 
             def _git_commit_push():
                 subprocess.run(
@@ -239,7 +346,8 @@ class BackupService:
                     return "no_changes"
 
                 commit_msg = (
-                    f"backup: {manifest.get('memory_count', '?')} memories, "
+                    f"audit: {manifest.get('memory_count', '?')} memories, "
+                    f"sha256={sha[:16]}..., "
                     f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC"
                 )
                 subprocess.run(
@@ -260,18 +368,16 @@ class BackupService:
                 return "pushed"
 
             push_status = await asyncio.to_thread(_git_commit_push)
-
-            file_sha256 = hashlib.sha256(dest_db.read_bytes()).hexdigest()
-            logger.info(f"GitHub backup {push_status}: {BACKUP_GITHUB_REPO}")
+            logger.info(f"GitHub audit backup {push_status}: {BACKUP_GITHUB_REPO}")
 
             return {
                 "success": True,
                 "target": "github",
                 "status": push_status,
-                "sha256": file_sha256,
+                "sha256": sha,
             }
         except Exception as e:
-            logger.error(f"GitHub backup failed: {e}")
+            logger.error(f"GitHub audit backup failed: {e}")
             return {"success": False, "error": str(e), "target": "github"}
 
     async def _push_to_remote(self, backup_path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
@@ -366,11 +472,39 @@ class BackupService:
                 await self.cleanup_old_backups()
 
                 # Push to remote targets (R2, GitHub) if enabled
+                # Get schema version from DB
+                schema_version = "unknown"
+                try:
+                    conn = sqlite3.connect(str(self.db_path))
+                    row = conn.execute(
+                        "SELECT value FROM metadata WHERE key='schema_version'"
+                    ).fetchone()
+                    if row:
+                        schema_version = row[0]
+                    conn.close()
+                except Exception:
+                    pass
+
+                # Get device ID (hostname-based)
+                import socket
+                device_id = socket.gethostname()
+
+                # Determine backup type based on time
+                backup_type = "daily"
+                hour = created_at.hour
+                if hour == 0 and created_at.weekday() == 0:
+                    backup_type = "weekly"
+                if hour == 0 and created_at.day == 1:
+                    backup_type = "monthly"
+
                 manifest = {
                     "timestamp": created_at.isoformat(),
                     "memory_count": self._get_memory_count(),
                     "db_size_bytes": backup_size,
                     "filename": backup_filename,
+                    "schema_version": schema_version,
+                    "device_id": device_id,
+                    "backup_type": backup_type,
                 }
                 remote_results = await self._push_to_remote(backup_path, manifest)
 

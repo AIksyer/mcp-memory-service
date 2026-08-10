@@ -141,7 +141,7 @@ class TestPushToGitHub:
 
     @pytest.mark.asyncio
     async def test_github_success(self, backup_service, tmp_path):
-        """GitHub push commits DB + manifest to repo."""
+        """GitHub push commits manifest + checksum to repo (audit only, no DB file)."""
         backup_file = tmp_path / "backup.db"
         backup_file.write_bytes(b"test db content")
 
@@ -157,7 +157,6 @@ class TestPushToGitHub:
              patch("mcp_memory_service.backup.scheduler.BACKUP_GITHUB_BRANCH", "master"), \
              patch("mcp_memory_service.backup.scheduler.BACKUP_GITHUB_TOKEN", "ghp_test"), \
              patch("mcp_memory_service.backup.scheduler.BACKUP_GITHUB_LOCAL_DIR", str(repo_dir)):
-            # Mock only the git push call (network operation)
             original_run = subprocess.run
 
             def patched_run(args, **kwargs):
@@ -171,11 +170,14 @@ class TestPushToGitHub:
 
             with patch("mcp_memory_service.backup.scheduler.subprocess.run", side_effect=patched_run):
                 result = await backup_service._push_to_github(
-                    backup_file, {"memory_count": 5}
+                    backup_file, {"memory_count": 5, "file_sha256": "abc123def456", "timestamp": "2026-01-01"}
                 )
                 assert result["success"] is True
-                assert (repo_dir / "data" / "sqlite_vec.db").exists()
+                # Manifest + checksum exist
                 assert (repo_dir / "data" / "backup_manifest.json").exists()
+                assert (repo_dir / "data" / "checksum.txt").exists()
+                # DB file does NOT exist (audit only — v2 change)
+                assert not (repo_dir / "data" / "sqlite_vec.db").exists()
 
 
 class TestPushToRemote:

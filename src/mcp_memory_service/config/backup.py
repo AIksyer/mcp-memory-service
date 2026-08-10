@@ -46,6 +46,11 @@ logger.info(
 BACKUP_R2_ENABLED = safe_get_bool_env("MCP_BACKUP_R2_ENABLED", False)
 BACKUP_R2_BUCKET = os.getenv("MCP_BACKUP_R2_BUCKET", "mcp-memory-backup")
 
+# R2 history retention (v2): keep N daily + M weekly + K monthly snapshots
+BACKUP_R2_RETENTION_DAILY = safe_get_int_env("MCP_BACKUP_R2_RETENTION_DAILY", 7, min_value=1, max_value=90)
+BACKUP_R2_RETENTION_WEEKLY = safe_get_int_env("MCP_BACKUP_R2_RETENTION_WEEKLY", 4, min_value=1, max_value=52)
+BACKUP_R2_RETENTION_MONTHLY = safe_get_int_env("MCP_BACKUP_R2_RETENTION_MONTHLY", 3, min_value=1, max_value=12)
+
 BACKUP_GITHUB_ENABLED = safe_get_bool_env("MCP_BACKUP_GITHUB_ENABLED", False)
 BACKUP_GITHUB_REPO = os.getenv("MCP_BACKUP_GITHUB_REPO", "")
 BACKUP_GITHUB_BRANCH = os.getenv("MCP_BACKUP_GITHUB_BRANCH", "master")

@@ -123,6 +123,7 @@ class MetadataMixin:
                 "created_at_iso",
                 "updated_at",
                 "updated_at_iso",
+                "sync_version",
             }
 
             for key, value in updates.items():
@@ -149,14 +150,22 @@ class MetadataMixin:
                 updated_at = now
                 updated_at_iso = now_iso
 
+            # v4: Set sync_version to provided value (reconcile) or increment (normal update)
+            if "sync_version" in updates:
+                sync_version_clause = "?"
+                sync_version_param = updates["sync_version"]
+            else:
+                sync_version_clause = "sync_version + 1"
+                sync_version_param = None
+
             def _do_update():
                 self.conn.execute(
-                    """
+                    f"""
                     UPDATE memories SET
                         tags = ?, memory_type = ?, metadata = ?,
                         updated_at = ?, updated_at_iso = ?,
                         created_at = ?, created_at_iso = ?,
-                        sync_version = sync_version + 1
+                        sync_version = {sync_version_clause}
                     WHERE content_hash = ? AND deleted_at IS NULL
                 """,
                     (
@@ -167,6 +176,7 @@ class MetadataMixin:
                         updated_at_iso,
                         created_at,
                         created_at_iso,
+                        *([] if sync_version_param is None else [sync_version_param]),
                         content_hash,
                     ),
                 )

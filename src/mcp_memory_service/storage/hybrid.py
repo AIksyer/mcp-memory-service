@@ -1450,34 +1450,45 @@ class BackgroundSyncService:
                         if cf_sv != local_sv and cf_sv > 0 and local_sv > 0:
                             # sync_version differs — higher version wins
                             cloud_newer = cf_sv > local_sv
-                            # v4: Log conflict to backup_conflicts table
+                            # v4: Log conflict to backup_conflicts table (dedup: skip if unresolved exists)
                             if not dry_run:
                                 try:
                                     from datetime import datetime as _dt, timezone as _tz
                                     conn = self.primary.conn
-                                    conn.execute(
-                                        """INSERT INTO backup_conflicts (
-                                            content_hash, local_version, remote_version,
-                                            local_device_id, remote_device_id, conflict_type,
-                                            local_updated_at, remote_updated_at, detected_at
-                                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                                        (
-                                            content_hash,
-                                            local_sv,
-                                            cf_sv,
-                                            getattr(local_memory, "device_id", None),
-                                            getattr(cf_memory, "device_id", None),
-                                            "version_divergence",
-                                            local_updated,
-                                            cf_updated,
-                                            _dt.now(_tz.utc).isoformat(),
-                                        ),
-                                    )
-                                    conn.commit()
-                                    logger.info(
-                                        f"Conflict logged: {content_hash[:8]} "
-                                        f"local_sv={local_sv} vs cloud_sv={cf_sv}"
-                                    )
+                                    # Check for existing unresolved conflict for this content_hash
+                                    existing = conn.execute(
+                                        "SELECT id FROM backup_conflicts "
+                                        "WHERE content_hash = ? AND resolved_at IS NULL",
+                                        (content_hash,),
+                                    ).fetchone()
+                                    if existing:
+                                        logger.debug(
+                                            f"Conflict already logged for {content_hash[:8]}, skipping"
+                                        )
+                                    else:
+                                        conn.execute(
+                                            """INSERT INTO backup_conflicts (
+                                                content_hash, local_version, remote_version,
+                                                local_device_id, remote_device_id, conflict_type,
+                                                local_updated_at, remote_updated_at, detected_at
+                                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                            (
+                                                content_hash,
+                                                local_sv,
+                                                cf_sv,
+                                                getattr(local_memory, "device_id", None),
+                                                getattr(cf_memory, "device_id", None),
+                                                "version_divergence",
+                                                local_updated,
+                                                cf_updated,
+                                                _dt.now(_tz.utc).isoformat(),
+                                            ),
+                                        )
+                                        conn.commit()
+                                        logger.info(
+                                            f"Conflict logged: {content_hash[:8]} "
+                                            f"local_sv={local_sv} vs cloud_sv={cf_sv}"
+                                        )
                                 except Exception as conflict_err:
                                     logger.warning(
                                         f"Failed to log conflict for {content_hash[:8]}: {conflict_err}"
@@ -1503,6 +1514,7 @@ class BackgroundSyncService:
                                             "created_at_iso": cf_memory.created_at_iso,
                                             "updated_at": cf_memory.updated_at,
                                             "updated_at_iso": cf_memory.updated_at_iso,
+                                            "sync_version": cf_sv,
                                         },
                                         preserve_timestamps=False,
                                     )
@@ -1531,6 +1543,7 @@ class BackgroundSyncService:
                                         "metadata": local_memory.metadata,
                                         "updated_at": local_memory.updated_at,
                                         "updated_at_iso": local_memory.updated_at_iso,
+                                        "sync_version": local_sv,
                                     },
                                     preserve_timestamps=False,
                                 )

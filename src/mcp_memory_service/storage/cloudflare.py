@@ -768,8 +768,9 @@ class CloudflareStorage(MemoryStorage):
         insert_sql = """
         INSERT INTO memories (
             content_hash, content, memory_type, created_at, created_at_iso,
-            updated_at, updated_at_iso, metadata_json, vector_id, content_size, r2_key, tags
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            updated_at, updated_at_iso, metadata_json, vector_id, content_size, r2_key, tags,
+            sync_version, device_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
 
         now = time.time()
@@ -791,6 +792,8 @@ class CloudflareStorage(MemoryStorage):
             content_size,
             r2_key,
             tags_str,
+            getattr(memory, "sync_version", 1),
+            getattr(memory, "device_id", None),
         ]
 
         payload = {"sql": insert_sql, "params": params}
@@ -1607,6 +1610,9 @@ class CloudflareStorage(MemoryStorage):
                 update_fields.append("updated_at = ?")
                 update_fields.append("updated_at_iso = ?")
                 params.extend([now, now_iso])
+
+            # v4: Always increment sync_version on D1 updates
+            update_fields.append("sync_version = sync_version + 1")
 
             if not update_fields:
                 return True, "No updates needed"

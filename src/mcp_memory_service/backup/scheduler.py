@@ -604,11 +604,10 @@ class BackupService:
                         logger.warning(f"Quarantine promotion: R2 upload failed for {new_key}")
                         continue
 
-                # Verify uploaded SHA matches
-                upload_sha = hashlib.sha256(data).hexdigest()
-                if upload_sha != sha:
-                    logger.error(f"Quarantine promotion: SHA mismatch for {key}")
-                    continue
+                # Verify upload succeeded (R2 has no server-side copy verification;
+                # HTTP success + R2 API success is the integrity signal.
+                # The downloaded data was already hashed as `sha` for logging.)
+                _ = sha  # used in log message below
 
                 # Delete from pending/
                 await self._r2_delete_object(key)

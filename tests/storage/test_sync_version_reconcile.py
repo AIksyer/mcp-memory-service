@@ -133,11 +133,18 @@ class TestConflictDetection:
         secondary = MagicMock()
         service = BackgroundSyncService(primary, secondary)
 
-        # Mock primary with a conn that records SQL
+        # Mock primary with a conn that records SQL and returns None for SELECTs
         executed_sql = []
 
+        def mock_execute(sql, params=None):
+            executed_sql.append((sql, params))
+            mock_result = MagicMock()
+            # Return None for fetchone() so dedup SELECT doesn't find existing conflict
+            mock_result.fetchone.return_value = None
+            return mock_result
+
         mock_conn = MagicMock()
-        mock_conn.execute = MagicMock(side_effect=lambda sql, params=None: executed_sql.append((sql, params)) or MagicMock())
+        mock_conn.execute = MagicMock(side_effect=mock_execute)
         mock_conn.commit = MagicMock()
         primary.conn = mock_conn
 

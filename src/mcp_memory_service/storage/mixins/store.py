@@ -127,6 +127,11 @@ class StoreMixin:
             tags_str = ",".join(memory.tags) if memory.tags else ""
             metadata_str = json.dumps(memory.metadata) if memory.metadata else "{}"
 
+            # v4: Set device_id from config if not already set on the memory
+            if memory.device_id is None:
+                from ...config.backup import DEVICE_ID
+                memory.device_id = DEVICE_ID
+
             _sp_name = f"store_{os.urandom(4).hex()}"
 
             def insert_memory_and_embedding():

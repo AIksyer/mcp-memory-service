@@ -1442,11 +1442,54 @@ class BackgroundSyncService:
                         cf_updated = cf_memory.updated_at or 0
                         local_updated = local_memory.updated_at or 0
 
-                        # Skip if within 1s tolerance
-                        if abs(cf_updated - local_updated) <= 1.0:
-                            return
+                        # v4: Compare sync_version first (higher wins, no tolerance)
+                        cf_sv = getattr(cf_memory, "sync_version", None) or 0
+                        local_sv = getattr(local_memory, "sync_version", None) or 0
 
-                        if cf_updated > local_updated:
+                        # Determine direction: sync_version takes priority
+                        if cf_sv != local_sv and cf_sv > 0 and local_sv > 0:
+                            # sync_version differs — higher version wins
+                            cloud_newer = cf_sv > local_sv
+                            # v4: Log conflict to backup_conflicts table
+                            if not dry_run:
+                                try:
+                                    from datetime import datetime as _dt, timezone as _tz
+                                    conn = self.primary.conn
+                                    conn.execute(
+                                        """INSERT INTO backup_conflicts (
+                                            content_hash, local_version, remote_version,
+                                            local_device_id, remote_device_id, conflict_type,
+                                            local_updated_at, remote_updated_at, detected_at
+                                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                        (
+                                            content_hash,
+                                            local_sv,
+                                            cf_sv,
+                                            getattr(local_memory, "device_id", None),
+                                            getattr(cf_memory, "device_id", None),
+                                            "version_divergence",
+                                            local_updated,
+                                            cf_updated,
+                                            _dt.now(_tz.utc).isoformat(),
+                                        ),
+                                    )
+                                    conn.commit()
+                                    logger.info(
+                                        f"Conflict logged: {content_hash[:8]} "
+                                        f"local_sv={local_sv} vs cloud_sv={cf_sv}"
+                                    )
+                                except Exception as conflict_err:
+                                    logger.warning(
+                                        f"Failed to log conflict for {content_hash[:8]}: {conflict_err}"
+                                    )
+                        elif abs(cf_updated - local_updated) <= 1.0:
+                            # sync_version equal (or one is 0), timestamps within tolerance
+                            return
+                        else:
+                            # Fall back to updated_at comparison (pre-v4 behavior)
+                            cloud_newer = cf_updated > local_updated
+
+                        if cloud_newer:
                             # Cloud is newer — update local
                             if not dry_run:
                                 success, _ = (

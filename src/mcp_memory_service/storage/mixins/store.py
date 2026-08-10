@@ -137,8 +137,9 @@ class StoreMixin:
                         """
                         INSERT INTO memories (
                             content_hash, content, tags, memory_type,
-                            metadata, created_at, updated_at, created_at_iso, updated_at_iso, store
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            metadata, created_at, updated_at, created_at_iso, updated_at_iso, store,
+                            sync_version, device_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                         (
                             memory.content_hash,
@@ -151,6 +152,8 @@ class StoreMixin:
                             memory.created_at_iso,
                             memory.updated_at_iso,
                             store,
+                            memory.sync_version,
+                            memory.device_id,
                         ),
                     )
                     memory_rowid = cursor.lastrowid

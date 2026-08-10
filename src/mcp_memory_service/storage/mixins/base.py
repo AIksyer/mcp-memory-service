@@ -391,6 +391,8 @@ SOLUTIONS:
                 updated_at_iso,
             ) = row[:9]
             embedding_blob = row[9] if len(row) > 9 else None
+            sync_version = row[10] if len(row) > 10 else 1
+            device_id = row[11] if len(row) > 11 else None
 
             tags = (
                 [tag.strip() for tag in tags_str.split(",") if tag.strip()]
@@ -414,6 +416,8 @@ SOLUTIONS:
                 updated_at=updated_at,
                 created_at_iso=created_at_iso,
                 updated_at_iso=updated_at_iso,
+                sync_version=sync_version,
+                device_id=device_id,
             )
 
         except Exception as e:

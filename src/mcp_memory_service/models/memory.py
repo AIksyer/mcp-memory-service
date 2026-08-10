@@ -53,6 +53,10 @@ class Memory:
     updated_at: float | None = None
     updated_at_iso: str | None = None
 
+    # Version tracking (v4): incremented on every write, used for sync conflict resolution
+    sync_version: int = 1
+    device_id: str | None = None
+
     # Legacy timestamp field (maintain for backward compatibility)
     timestamp: datetime = field(default_factory=datetime.now)
 
@@ -410,6 +414,8 @@ class Memory:
             "created_at_iso": self.created_at_iso,
             "updated_at": self.updated_at,
             "updated_at_iso": self.updated_at_iso,
+            "sync_version": self.sync_version,
+            "device_id": self.device_id,
             **self.metadata,
             "tags": self.tags,  # override any leaked metadata["tags"]
         }
@@ -455,6 +461,8 @@ class Memory:
                 "created_at_iso",
                 "updated_at",
                 "updated_at_iso",
+                "sync_version",
+                "device_id",
             ]
         }
 
@@ -470,6 +478,8 @@ class Memory:
             created_at_iso=created_at_iso,
             updated_at=updated_at,
             updated_at_iso=updated_at_iso,
+            sync_version=data.get("sync_version", 1),
+            device_id=data.get("device_id"),
         )
 
 

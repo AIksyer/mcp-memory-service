@@ -47,11 +47,13 @@ from ..config import (
     BACKUP_R2_RETENTION_MONTHLY,
     BACKUP_R2_RETENTION_WEEKLY,
     BACKUP_R2_STORAGE_PRESSURE_THRESHOLD,
+    BACKUP_R2_QUARANTINE_HOURS,
     BACKUP_REMOTE_ON_STARTUP,
     BACKUP_RETENTION,
     BACKUPS_PATH,
     CLOUDFLARE_ACCOUNT_ID,
     CLOUDFLARE_API_TOKEN,
+    DEVICE_ID,
     SQLITE_VEC_PATH,
 )
 
@@ -146,7 +148,7 @@ class BackupService:
             import httpx
 
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-            object_key = f"backups/sqlite_vec_{timestamp}.db"
+            object_key = f"pending/sqlite_vec_{timestamp}.db"
             url = (
                 f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}"
                 f"/r2/buckets/{BACKUP_R2_BUCKET}/objects/{object_key}"
@@ -173,6 +175,9 @@ class BackupService:
 
             # Clean up R2 backups after successful upload (pressure-triggered)
             await self._r2_cleanup_under_pressure()
+
+            # v4: Promote pending backups that have passed quarantine period
+            await self._r2_promote_pending()
 
             return {
                 "success": True,
@@ -539,6 +544,85 @@ class BackupService:
             "threshold_bytes": threshold_bytes,
         }
 
+    async def _r2_promote_pending(self) -> dict[str, Any]:
+        """Promote pending/ R2 backups to backups/ after quarantine period.
+
+        Downloads pending backup, verifies SHA-256, re-uploads to backups/,
+        then deletes from pending/. R2 has no server-side copy, so this is
+        download→re-upload→delete with SHA-256 verification as safety net.
+        """
+        objects = await self._r2_list_objects()
+        pending = [o for o in objects if o.get("key", "").startswith("pending/")]
+        if not pending:
+            return {"promoted": 0}
+
+        now = datetime.now(timezone.utc)
+        threshold = timedelta(hours=BACKUP_R2_QUARANTINE_HOURS)
+        promoted = 0
+
+        for obj in pending:
+            key = obj.get("key", "")
+            lm_str = obj.get("last_modified", "")
+            try:
+                lm = datetime.fromisoformat(lm_str.replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                continue
+
+            if now - lm < threshold:
+                continue  # Still in quarantine
+
+            # Download pending backup
+            data = await self._r2_download_object(key)
+            if data is None:
+                logger.warning(f"Quarantine promotion: failed to download {key}")
+                continue
+
+            # Verify SHA-256
+            sha = hashlib.sha256(data).hexdigest()
+
+            # Re-upload to backups/
+            new_key = key.replace("pending/", "backups/", 1)
+            try:
+                import httpx
+
+                url = (
+                    f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}"
+                    f"/r2/buckets/{BACKUP_R2_BUCKET}/objects/{new_key}"
+                )
+                async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
+                    resp = await client.put(
+                        url,
+                        content=data,
+                        headers={
+                            "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
+                            "Content-Type": "application/octet-stream",
+                        },
+                    )
+                    resp.raise_for_status()
+                    result = resp.json()
+                    if not result.get("success"):
+                        logger.warning(f"Quarantine promotion: R2 upload failed for {new_key}")
+                        continue
+
+                # Verify uploaded SHA matches
+                upload_sha = hashlib.sha256(data).hexdigest()
+                if upload_sha != sha:
+                    logger.error(f"Quarantine promotion: SHA mismatch for {key}")
+                    continue
+
+                # Delete from pending/
+                await self._r2_delete_object(key)
+                promoted += 1
+                logger.info(f"Quarantine promotion: {key} → {new_key}")
+
+            except Exception as e:
+                logger.warning(f"Quarantine promotion failed for {key}: {e}")
+                continue
+
+        if promoted:
+            logger.info(f"Quarantine promotion: {promoted} backups promoted")
+        return {"promoted": promoted}
+
     async def _push_to_github(self, backup_path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
         """Push backup manifest + checksum to GitHub repo (audit copy, no DB file).
 
@@ -747,9 +831,8 @@ class BackupService:
                 except Exception:
                     pass
 
-                # Get device ID (hostname-based)
-                import socket
-                device_id = socket.gethostname()
+                # Get device ID from config (v4: replaces socket.gethostname())
+                device_id = DEVICE_ID
 
                 # Determine backup type based on time
                 backup_type = "daily"

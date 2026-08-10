@@ -254,3 +254,96 @@ async def list_r2_backups(user: AuthenticationResult = Depends(require_read_acce
         raise HTTPException(
             status_code=500, detail=f"Failed to list R2 backups: {e!s}"
         )
+
+
+@router.get("/backup/conflicts")
+async def list_conflicts(user: AuthenticationResult = Depends(require_read_access)):
+    """List unresolved backup sync conflicts."""
+    try:
+        from mcp_memory_service.backup.scheduler import get_backup_service
+
+        backup_service = get_backup_service()
+        if not backup_service.db_path or not backup_service.db_path.exists():
+            return {"conflicts": [], "total_count": 0}
+
+        import sqlite3 as _sqlite3
+
+        def _query_conflicts():
+            conn = _sqlite3.connect(str(backup_service.db_path))
+            cursor = conn.execute(
+                "SELECT id, content_hash, local_version, remote_version, "
+                "local_device_id, remote_device_id, conflict_type, "
+                "local_updated_at, remote_updated_at, detected_at "
+                "FROM backup_conflicts WHERE resolved_at IS NULL "
+                "ORDER BY detected_at DESC"
+            )
+            rows = cursor.fetchall()
+            conn.close()
+            return rows
+
+        rows = await __import__("asyncio").to_thread(_query_conflicts)
+        conflicts = [
+            {
+                "id": r[0],
+                "content_hash": r[1],
+                "local_version": r[2],
+                "remote_version": r[3],
+                "local_device_id": r[4],
+                "remote_device_id": r[5],
+                "conflict_type": r[6],
+                "local_updated_at": r[7],
+                "remote_updated_at": r[8],
+                "detected_at": r[9],
+            }
+            for r in rows
+        ]
+        return {"conflicts": conflicts, "total_count": len(conflicts)}
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to list conflicts: {e!s}"
+        )
+
+
+@router.post("/backup/conflicts/resolve")
+async def resolve_conflict(
+    conflict_id: int,
+    resolution: str = "manual",
+    user: AuthenticationResult = Depends(require_write_access),
+):
+    """Mark a backup conflict as resolved."""
+    try:
+        from mcp_memory_service.backup.scheduler import get_backup_service
+
+        backup_service = get_backup_service()
+        if not backup_service.db_path or not backup_service.db_path.exists():
+            raise HTTPException(status_code=404, detail="Database not found")
+
+        import sqlite3 as _sqlite3
+        from datetime import datetime, timezone as _tz
+
+        def _resolve():
+            conn = _sqlite3.connect(str(backup_service.db_path))
+            now = datetime.now(_tz.utc).isoformat()
+            cursor = conn.execute(
+                "UPDATE backup_conflicts SET resolved_at = ?, resolution = ? "
+                "WHERE id = ? AND resolved_at IS NULL",
+                (now, resolution, conflict_id),
+            )
+            conn.commit()
+            affected = cursor.rowcount
+            conn.close()
+            return affected
+
+        affected = await __import__("asyncio").to_thread(_resolve)
+        if affected == 0:
+            raise HTTPException(status_code=404, detail="Conflict not found or already resolved")
+
+        return {"success": True, "conflict_id": conflict_id, "resolved_at": datetime.now(_tz.utc).isoformat()}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to resolve conflict: {e!s}"
+        )

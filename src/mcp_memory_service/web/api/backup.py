@@ -205,3 +205,52 @@ async def list_backups(user: AuthenticationResult = Depends(require_read_access)
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to list backups: {e!s}")
+
+
+@router.post("/backup/restore")
+async def restore_from_r2(
+    object_key: str | None = None,
+    user: AuthenticationResult = Depends(require_write_access),
+):
+    """
+    Restore database from an R2 backup via staging.
+
+    Downloads the specified R2 backup (or the latest if no key is given),
+    validates integrity and schema version, backs up the current DB, then
+    replaces it. Does NOT touch D1 — user must manually reconcile if desired.
+    """
+    try:
+        from mcp_memory_service.backup.scheduler import get_backup_service
+
+        backup_service = get_backup_service()
+        result = await backup_service.restore_from_r2(object_key)
+        return result
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to restore from R2: {e!s}"
+        )
+
+
+@router.get("/backup/r2/list")
+async def list_r2_backups(user: AuthenticationResult = Depends(require_read_access)):
+    """List available R2 backup objects."""
+    try:
+        from mcp_memory_service.backup.scheduler import get_backup_service
+
+        backup_service = get_backup_service()
+        objects = await backup_service._r2_list_objects()
+        backups = [
+            obj
+            for obj in objects
+            if obj.get("key", "").startswith("backups/")
+        ]
+        return {
+            "backups": backups,
+            "total_count": len(backups),
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to list R2 backups: {e!s}"
+        )

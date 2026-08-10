@@ -19,6 +19,7 @@ Provides scheduled database backups with configurable intervals and retention po
 """
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -45,6 +46,7 @@ from ..config import (
     BACKUP_R2_RETENTION_DAILY,
     BACKUP_R2_RETENTION_MONTHLY,
     BACKUP_R2_RETENTION_WEEKLY,
+    BACKUP_R2_STORAGE_PRESSURE_THRESHOLD,
     BACKUP_REMOTE_ON_STARTUP,
     BACKUP_RETENTION,
     BACKUPS_PATH,
@@ -169,8 +171,8 @@ class BackupService:
             file_sha256 = hashlib.sha256(data).hexdigest()
             logger.info(f"R2 backup uploaded: {object_key} ({len(data)} bytes)")
 
-            # Clean up old R2 backups after successful upload
-            await self._r2_cleanup_old_backups()
+            # Clean up R2 backups after successful upload (pressure-triggered)
+            await self._r2_cleanup_under_pressure()
 
             return {
                 "success": True,
@@ -221,6 +223,173 @@ class BackupService:
         except Exception as e:
             logger.warning(f"R2 delete {key} failed: {e}")
             return False
+
+    async def _r2_download_object(self, key: str) -> bytes | None:
+        """Download an object from R2 bucket.
+
+        Best-effort: returns None on failure.
+        """
+        if not BACKUP_R2_ENABLED or not CLOUDFLARE_API_TOKEN:
+            return None
+        try:
+            import httpx
+
+            url = (
+                f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}"
+                f"/r2/buckets/{BACKUP_R2_BUCKET}/objects/{key}"
+            )
+            async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
+                resp = await client.get(
+                    url,
+                    headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                if not data.get("success"):
+                    logger.warning(f"R2 download {key} failed: {data}")
+                    return None
+                result = data.get("result", {})
+                content_b64 = result.get("content")
+                if content_b64:
+                    return base64.b64decode(content_b64)
+                # Fall back to raw response body if not base64-wrapped
+                return resp.content
+        except Exception as e:
+            logger.warning(f"R2 download {key} failed: {e}")
+            return None
+
+    async def restore_from_r2(self, object_key: str | None = None) -> dict[str, Any]:
+        """Restore database from R2 backup via staging.
+
+        Flow: R2 -> staging -> integrity + schema check -> backup current -> replace.
+        Does NOT touch D1 — user must manually reconcile if desired.
+
+        Blue Team C-2 mitigation: no auto-reconcile after restore.
+        Blue Team M-4 mitigation: checks schema_version compatibility.
+        """
+        if not self.db_path:
+            return {"success": False, "error": "Database path not configured"}
+
+        if not BACKUP_R2_ENABLED or not CLOUDFLARE_API_TOKEN:
+            return {
+                "success": False,
+                "error": "R2 not configured",
+                "target": "r2",
+            }
+
+        # 1. Find the object key to restore
+        if not object_key:
+            objects = await self._r2_list_objects()
+            backups = [o for o in objects if o.get("key", "").startswith("backups/")]
+            if not backups:
+                return {"success": False, "error": "No R2 backups found"}
+            backups.sort(key=lambda o: o.get("last_modified", ""), reverse=True)
+            object_key = backups[0]["key"]
+
+        # 2. Download to staging path
+        data = await self._r2_download_object(object_key)
+        if data is None:
+            return {
+                "success": False,
+                "error": f"Failed to download {object_key}",
+            }
+
+        staging_path = self.backups_dir / (
+            f"r2_staging_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.db"
+        )
+        await asyncio.to_thread(staging_path.write_bytes, data)
+
+        try:
+            # 3. PRAGMA integrity_check on staging
+            def _check_integrity_staging() -> str:
+                conn = None
+                try:
+                    conn = sqlite3.connect(str(staging_path))
+                    result = conn.execute("PRAGMA integrity_check").fetchone()[0]
+                    return result
+                except sqlite3.DatabaseError:
+                    return "not a database"
+                finally:
+                    if conn is not None:
+                        conn.close()
+
+            integrity = await asyncio.to_thread(_check_integrity_staging)
+            if integrity != "ok":
+                staging_path.unlink(missing_ok=True)
+                return {
+                    "success": False,
+                    "error": f"Staging DB integrity check failed: {integrity}",
+                }
+
+            # 4. Check schema_version compatibility
+            def _get_schema_version(path: Path) -> str | None:
+                try:
+                    conn = sqlite3.connect(str(path))
+                    row = conn.execute(
+                        "SELECT value FROM metadata WHERE key='schema_version'"
+                    ).fetchone()
+                    conn.close()
+                    return row[0] if row else None
+                except Exception:
+                    return None
+
+            staging_schema = await asyncio.to_thread(
+                _get_schema_version, staging_path
+            )
+            current_schema = (
+                await asyncio.to_thread(_get_schema_version, self.db_path)
+                if self.db_path.exists()
+                else None
+            )
+
+            if staging_schema is not None and current_schema is not None:
+                try:
+                    if int(staging_schema) < int(current_schema):
+                        staging_path.unlink(missing_ok=True)
+                        return {
+                            "success": False,
+                            "error": (
+                                f"Schema mismatch: backup schema={staging_schema}, "
+                                f"current schema={current_schema}. "
+                                "Refusing to restore older schema."
+                            ),
+                        }
+                except (ValueError, TypeError):
+                    pass  # Non-numeric schema versions — skip check
+
+            # 5. Backup current DB before replacing
+            if self.db_path.exists():
+                pre_restore_path = self.db_path.with_suffix(".db.pre_r2_restore")
+                await asyncio.to_thread(
+                    shutil.copy2, str(self.db_path), str(pre_restore_path)
+                )
+                logger.info(f"R2 restore: backed up current DB to {pre_restore_path}")
+
+            # 6. Replace primary DB
+            await asyncio.to_thread(
+                shutil.copy2, str(staging_path), str(self.db_path)
+            )
+
+            # 7. Clean up staging
+            staging_path.unlink(missing_ok=True)
+
+            logger.info(f"Restored database from R2 backup: {object_key}")
+            return {
+                "success": True,
+                "object_key": object_key,
+                "restored_at": datetime.now(timezone.utc).isoformat(),
+                "warning": (
+                    "Restore complete. Do NOT run reconcile automatically — "
+                    "reconcile may resurrect deleted memories and overwrite D1 "
+                    "with older data. Reconcile only if you are certain this "
+                    "backup is the correct source of truth."
+                ),
+            }
+        except Exception as e:
+            logger.error(f"R2 restore failed: {e}")
+            if staging_path.exists():
+                staging_path.unlink(missing_ok=True)
+            return {"success": False, "error": str(e)}
 
     async def _r2_cleanup_old_backups(self) -> dict[str, Any]:
         """Clean up old R2 backups based on retention policy.
@@ -276,6 +445,99 @@ class BackupService:
 
         logger.info(f"R2 cleanup: {deleted} deleted, {len(kept)} kept")
         return {"deleted_count": deleted, "kept_count": len(kept)}
+
+    async def _r2_get_usage_bytes(self) -> int:
+        """Get current R2 bucket usage in bytes."""
+        if not BACKUP_R2_ENABLED or not CLOUDFLARE_API_TOKEN:
+            return 0
+        try:
+            import httpx
+
+            url = (
+                f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}"
+                f"/r2/buckets/{BACKUP_R2_BUCKET}"
+            )
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.get(
+                    url,
+                    headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                if not data.get("success"):
+                    return 0
+                result = data.get("result", {})
+                usage = result.get("usage", {})
+                if isinstance(usage, dict):
+                    return usage.get("size", 0)
+                return result.get("size", 0)
+        except Exception as e:
+            logger.warning(f"R2 get usage failed: {e}")
+            return 0
+
+    async def _r2_cleanup_under_pressure(self) -> dict[str, Any]:
+        """Delete oldest R2 backups ONLY when storage pressure exceeds threshold.
+
+        Replaces v2 time-based retention. User explicitly requested: don't delete
+        old backups unless storage is tight (R2 free tier 10GB, threshold default 8GB).
+        """
+        threshold_bytes = BACKUP_R2_STORAGE_PRESSURE_THRESHOLD * 1024 * 1024 * 1024
+        usage_bytes = await self._r2_get_usage_bytes()
+
+        if usage_bytes < threshold_bytes:
+            logger.debug(
+                f"R2 cleanup: usage={usage_bytes / 1024 / 1024:.1f}MB, "
+                f"threshold={BACKUP_R2_STORAGE_PRESSURE_THRESHOLD}GB — no cleanup needed"
+            )
+            return {
+                "action": "no_cleanup_needed",
+                "usage_bytes": usage_bytes,
+                "threshold_bytes": threshold_bytes,
+            }
+
+        objects = await self._r2_list_objects()
+        if not objects:
+            return {
+                "action": "no_cleanup_needed",
+                "usage_bytes": usage_bytes,
+                "threshold_bytes": threshold_bytes,
+            }
+
+        # Sort oldest first (by last_modified)
+        def get_lm(obj):
+            lm_str = obj.get("last_modified", "")
+            try:
+                return datetime.fromisoformat(lm_str.replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                return datetime.min.replace(tzinfo=timezone.utc)
+
+        objects.sort(key=get_lm)
+
+        deleted = 0
+        for obj in objects:
+            if usage_bytes < threshold_bytes:
+                break
+            key = obj.get("key", "")
+            if not key.startswith("backups/"):
+                continue  # Only delete backup objects
+            if await self._r2_delete_object(key):
+                deleted += 1
+                size = obj.get("size", 0)
+                usage_bytes -= size
+                logger.info(
+                    f"R2 cleanup under pressure: deleted {key} ({size} bytes)"
+                )
+
+        logger.info(
+            f"R2 cleanup under pressure: {deleted} deleted, "
+            f"usage now ~{max(usage_bytes, 0) / 1024 / 1024:.1f}MB"
+        )
+        return {
+            "action": "cleanup_performed",
+            "deleted_count": deleted,
+            "usage_bytes_after": max(usage_bytes, 0),
+            "threshold_bytes": threshold_bytes,
+        }
 
     async def _push_to_github(self, backup_path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
         """Push backup manifest + checksum to GitHub repo (audit copy, no DB file).
